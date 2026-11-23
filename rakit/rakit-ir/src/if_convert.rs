@@ -309,6 +309,7 @@ fn clone_inst(
         Inst::Fcmp(_, cc, ty, x, y) => {
             Inst::Fcmp(new, *cc, *ty, remap(*x, map), remap(*y, map))
         }
+        Inst::Call(..) => return None,
         Inst::Select(_, ty, c, x, y) => Inst::Select(
             new,
             *ty,

@@ -148,6 +148,13 @@ RIR juga mendukung memori 16 byte lewat `Type::I128` (load/store 16 byte,
 forwarding, DSE, dan SROA). Operasi aritmetika `I128` tidak didukung di RIR;
 hanya pemindahan nilai dan memori.
 
+RIR juga mendukung direct external call lewat `Inst::Call` dan tabel
+`externals` (namespace/index plus signature). Bridge mempertahankan target dan
+signature saat import/export. Call adalah barrier untuk DCE; slot yang
+alamatnya dikirim ke call dianggap escape sehingga tidak di-forward atau
+dipromosikan. Karena setiap `StackAddr` hanya menunjuk satu slot, slot-slot RIR
+selalu disjoint dan tidak ada alias antarslot.
+
 Pipeline RIR sekarang:
 `simplify → optimize → mem_forward → optimize → sroa → optimize → div_test → if_convert → gvn → licm → optimize`.
 

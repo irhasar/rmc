@@ -130,6 +130,18 @@ impl Builder {
         self.push(b, Inst::Brif(cond, then_block, then_args, else_block, else_args));
     }
 
+    pub fn call(
+        &mut self,
+        b: Block,
+        target: u32,
+        args: Vec<Value>,
+        ret: Option<Type>,
+    ) -> Option<Value> {
+        let result = ret.map(|ty| self.new_value(ty));
+        self.push(b, Inst::Call(result, target, args));
+        result
+    }
+
     pub fn ret(&mut self, b: Block, args: Vec<Value>) {
         self.push(b, Inst::Return(args));
     }

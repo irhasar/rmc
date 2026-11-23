@@ -203,6 +203,7 @@ fn eval(
         Inst::F32const(_, v) => Ok(Val::F32(*v)),
         Inst::F64const(_, v) => Ok(Val::F64(*v)),
         Inst::Copy(_, _, x) => get(env, *x),
+        Inst::Call(..) => Err("external call is not supported by the interpreter".to_string()),
         Inst::Bin(_, op, ty, x, y) => {
             eval_bin(*op, *ty, get(env, *x)?, get(env, *y)?)
         }

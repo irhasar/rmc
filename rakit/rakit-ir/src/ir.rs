@@ -36,6 +36,14 @@ pub enum Type {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct StackSlot(pub u32);
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct External {
+    pub namespace: u32,
+    pub index: u32,
+    pub params: Vec<Type>,
+    pub ret: Option<Type>,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct StackSlotData {
     pub size: u32,
@@ -130,6 +138,8 @@ pub enum Inst {
     Load(Value, Type, Value, i32),
     /// Store a scalar to `addr + offset`.
     Store(Type, Value, i32, Value),
+    /// Direct external call: optional result, external index, arguments.
+    Call(Option<Value>, u32, Vec<Value>),
     Jump(Block, Vec<Value>),
     Brif(Value, Block, Vec<Value>, Block, Vec<Value>),
     Return(Vec<Value>),
@@ -149,6 +159,7 @@ impl Inst {
             | Inst::Select(v, _, _, _, _)
             | Inst::StackAddr(v, _, _)
             | Inst::Load(v, _, _, _) => Some(*v),
+            Inst::Call(r, _, _) => *r,
             Inst::Store(..) | Inst::Jump(..) | Inst::Brif(..) | Inst::Return(..) => None,
         }
     }
@@ -171,6 +182,7 @@ impl Inst {
             Inst::Select(_, _, c, x, y) => vec![*c, *x, *y],
             Inst::Load(_, _, a, _) => vec![*a],
             Inst::Store(_, a, _, v) => vec![*a, *v],
+            Inst::Call(_, _, args) => args.clone(),
             Inst::Jump(_, args) | Inst::Return(args) => args.clone(),
             Inst::Brif(cond, _, targs, _, fargs) => {
                 let mut v = Vec::with_capacity(targs.len() + fargs.len() + 1);
@@ -206,6 +218,8 @@ pub struct Function {
     pub entry: Block,
     /// Fixed-size stack slots addressed by `StackAddr`.
     pub stack_slots: Vec<StackSlotData>,
+    /// Direct external functions referenced by `Call`.
+    pub externals: Vec<External>,
 }
 
 impl Function {
@@ -225,6 +239,7 @@ impl Function {
             ret,
             entry: Block(0),
             stack_slots: Vec::new(),
+            externals: Vec::new(),
         }
     }
 

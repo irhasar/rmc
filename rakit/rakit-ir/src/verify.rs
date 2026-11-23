@@ -188,6 +188,30 @@ pub fn verify(func: &Function) -> Result<(), Vec<String>> {
                         errs.push(format!("load result {r:?} type mismatch"));
                     }
                 }
+                Inst::Call(result, target, args) => {
+                    let Some(ext) = func.externals.get(*target as usize) else {
+                        errs.push(format!("call target {target} out of range"));
+                        continue;
+                    };
+                    if args.len() != ext.params.len() {
+                        errs.push("call argument arity mismatch".to_string());
+                    } else {
+                        for (arg, ty) in args.iter().zip(&ext.params) {
+                            if ty_of(*arg) != Some(*ty) {
+                                errs.push(format!("call argument {arg:?} type mismatch"));
+                            }
+                        }
+                    }
+                    match (result, ext.ret) {
+                        (Some(r), Some(ty)) => {
+                            if ty_of(*r) != Some(ty) {
+                                errs.push(format!("call result {r:?} type mismatch"));
+                            }
+                        }
+                        (None, None) => {}
+                        _ => errs.push("call result arity mismatch".to_string()),
+                    }
+                }
                 Inst::Store(ty, addr, _, value) => {
                     if !ty_of(*addr).map(|t| t.is_int()).unwrap_or(false) {
                         errs.push(format!("store address {addr:?} is not an integer pointer"));

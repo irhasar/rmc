@@ -1,5 +1,16 @@
 # AGENTS.md
 
+## Session (2026-11-23, Fase 2 step 19) — calls
+- `Inst::Call(Option<Value>, u32, Vec<Value>)` plus `Function.externals`
+  (`External { namespace, index, params, ret }`). Builder `call`.
+- Bridge imports/exports CLIF `Call` for `ExternalName::User` with 0/1 returns;
+  other external kinds or multi-returns are refused.
+- DCE keeps calls; verifier checks target/arity/types; interpreter reports
+  external calls as unsupported. Addresses passed to calls escape, so
+  `mem_forward`/SROA leave those slots alone.
+- Tests: 75 RIR (2 call) + 9 bridge; h23 (`f -> g`) prints 42 with RIR;
+  h20-h22 unchanged; `./y.sh build` exit 0.
+
 ## Session (2026-11-23, Fase 2 step 18) — I128 memory
 - `Type::I128` and `Val::I128(u128)` added. Interpreter reads/writes 16 bytes;
   `int_sem` rejects I128 arithmetic (no i64 representation).

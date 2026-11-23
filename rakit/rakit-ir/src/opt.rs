@@ -222,7 +222,7 @@ fn dce(func: &mut Function) -> bool {
     for bi in 0..func.blocks.len() {
         for ii in 0..func.blocks[bi].insts.len() {
             let inst = &func.blocks[bi].insts[ii];
-            if matches!(inst, Inst::Load(..) | Inst::Store(..)) {
+            if matches!(inst, Inst::Load(..) | Inst::Store(..) | Inst::Call(..)) {
                 continue;
             }
             if let Some(r) = inst.result_value() {

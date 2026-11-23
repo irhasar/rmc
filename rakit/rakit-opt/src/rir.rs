@@ -10,18 +10,19 @@ use std::collections::HashMap;
 
 use rakit_codegen::ir::{
     Block as ClifBlock, BlockArg, BlockCall, Function as ClifFunction, Inst as ClifInst,
-    InstructionData, MemFlagsData, Opcode, Signature, StackSlot as ClifStackSlot,
-    StackSlotData as ClifStackSlotData, StackSlotKind, Type as ClifType, Value as ClifValue,
-    ValueList,
+    AbiParam, ExternalName, ExtFuncData, InstructionData, MemFlagsData, Opcode, Signature,
+    StackSlot as ClifStackSlot, StackSlotData as ClifStackSlotData, StackSlotKind,
+    Type as ClifType, UserExternalName, Value as ClifValue, ValueList,
     condcodes::{FloatCC as ClifFloatCC, IntCC as ClifIntCC},
     immediates::{Ieee32, Ieee64, Imm64},
     types,
 };
 
+use rakit_codegen::isa::CallConv;
 use rakit_ir::{
-    BinOp, Block as RirBlock, Builder, FloatCc as RirFloatCc, Function as RirFunction,
-    Inst as RirInst, IntCc as RirIntCc, StackSlot as RirStackSlot, Type as RirType,
-    Value as RirValue,
+    BinOp, Block as RirBlock, Builder, External as RirExternal, FloatCc as RirFloatCc,
+    Function as RirFunction, Inst as RirInst, IntCc as RirIntCc,
+    StackSlot as RirStackSlot, Type as RirType, Value as RirValue,
 };
 
 /// Import a CLIF function into RIR, or `None` if it uses anything outside the
@@ -58,6 +59,7 @@ pub fn import(func: &ClifFunction) -> Option<RirFunction> {
     }
 
     let mut builder = Builder::new(ret, entry_params);
+    let mut externals: Vec<RirExternal> = Vec::new();
     let mut slot_map: HashMap<ClifStackSlot, RirStackSlot> = HashMap::new();
     for (cs, data) in func.sized_stack_slots.iter() {
         if !matches!(data.kind, StackSlotKind::ExplicitSlot) {
@@ -199,6 +201,54 @@ pub fn import(func: &ClifFunction) -> Option<RirFunction> {
                     let ty = map_type_to_rir(func.dfg.value_type(args[0]))?;
                     builder.store(rb, ty, addr, 0, value);
                 }
+                InstructionData::Call { func_ref, args, .. } => {
+                    let ext_data = &func.dfg.ext_funcs[func_ref];
+                    let callee = &func.dfg.signatures[ext_data.signature];
+                    let params = callee
+                        .params
+                        .iter()
+                        .map(|p| map_type_to_rir(p.value_type))
+                        .collect::<Option<Vec<_>>>()?;
+                    let ret = match callee.returns.as_slice() {
+                        [] => None,
+                        [p] => Some(map_type_to_rir(p.value_type)?),
+                        _ => return None,
+                    };
+                    let (namespace, index) = match ext_data.name {
+                        ExternalName::User(name_ref) => {
+                            let name = &func.params.user_named_funcs()[name_ref];
+                            (name.namespace, name.index)
+                        }
+                        _ => return None,
+                    };
+                    let external = RirExternal { namespace, index, params, ret };
+                    let target = match externals.iter().position(|e| *e == external) {
+                        Some(i) => i as u32,
+                        None => {
+                            externals.push(external);
+                            (externals.len() - 1) as u32
+                        }
+                    };
+                    let args = args
+                        .as_slice(&func.dfg.value_lists)
+                        .iter()
+                        .map(|v| lookup(func, &vmap, *v))
+                        .collect::<Option<Vec<_>>>()?;
+                    let results: Vec<_> = func.dfg.inst_results(inst).to_vec();
+                    if results.len() > 1 {
+                        return None;
+                    }
+                    let result_ty = match results.first() {
+                        Some(r) => Some(map_type_to_rir(func.dfg.value_type(*r))?),
+                        None => None,
+                    };
+                    let result = builder.call(rb, target, args, result_ty);
+                    match (results.first(), result) {
+                        (Some(clif), Some(rir)) => map_value(func, &mut vmap, *clif, rir),
+                        (None, None) => {}
+                        _ => return None,
+                    }
+                }
                 InstructionData::Jump { destination, .. } => {
                     let target = *block_map.get(&destination.block(&func.dfg.value_lists))?;
                     let args = block_args(func, &destination, &vmap)?;
@@ -226,7 +276,8 @@ pub fn import(func: &ClifFunction) -> Option<RirFunction> {
         }
     }
 
-    let out = builder.into_func();
+    let mut out = builder.into_func();
+    out.externals = externals;
     rakit_ir::verify(&out).ok()?;
     Some(out)
 }
@@ -251,6 +302,28 @@ pub fn export(rir: &RirFunction, sig: &Signature) -> Option<ClifFunction> {
 
     let mut func = ClifFunction::new();
     func.signature = sig.clone();
+
+    let mut call_refs = Vec::with_capacity(rir.externals.len());
+    for ext in &rir.externals {
+        let mut callee = Signature::new(CallConv::SystemV);
+        for ty in &ext.params {
+            callee.params.push(AbiParam::new(map_type_to_clif(*ty)?));
+        }
+        if let Some(ty) = ext.ret {
+            callee.returns.push(AbiParam::new(map_type_to_clif(ty)?));
+        }
+        let sig_ref = func.import_signature(callee);
+        let name_ref = func
+            .params
+            .ensure_user_func_name(UserExternalName::new(ext.namespace, ext.index));
+        let data = ExtFuncData {
+            name: ExternalName::User(name_ref),
+            signature: sig_ref,
+            colocated: false,
+            patchable: false,
+        };
+        call_refs.push(func.import_function(data));
+    }
 
     let mut slot_map: Vec<ClifStackSlot> = Vec::with_capacity(rir.stack_slots.len());
     for slot in &rir.stack_slots {
@@ -424,6 +497,35 @@ pub fn export(rir: &RirFunction, sig: &Signature) -> Option<ClifFunction> {
                         offset: (*offset).into(),
                     });
                     func.layout.append_inst(ci, cb);
+                }
+                RirInst::Call(result, target, args) => {
+                    let func_ref = *call_refs.get(*target as usize)?;
+                    let mut list = ValueList::default();
+                    for v in args {
+                        list.push(*vmap.get(v)?, &mut func.dfg.value_lists);
+                    }
+                    let ci = func.dfg.make_inst(InstructionData::Call {
+                        opcode: Opcode::Call,
+                        func_ref,
+                        args: list,
+                    });
+                    let ext = &rir.externals[*target as usize];
+                    let ctrl = match ext.ret {
+                        Some(ty) => map_type_to_clif(ty)?,
+                        None => types::I8,
+                    };
+                    let count = func.dfg.make_inst_results(ci, ctrl);
+                    if count != ext.ret.is_some() as usize {
+                        return None;
+                    }
+                    func.layout.append_inst(ci, cb);
+                    match (result, count) {
+                        (Some(r), 1) => {
+                            vmap.insert(*r, func.dfg.first_result(ci));
+                        }
+                        (None, 0) => {}
+                        _ => return None,
+                    }
                 }
                 RirInst::Jump(target, args) => {
                     let bc = make_block_call(&mut func, block_map[target.0 as usize], args, &vmap)?;
@@ -921,5 +1023,72 @@ mod tests {
         let r = f.dfg.inst_results(inst)[0];
         ret(&mut f, e, &[r]);
         assert!(import(&f).is_none());
+    }
+}
+
+#[cfg(test)]
+mod call_tests {
+    use super::*;
+    use rakit_codegen::ir::{
+        AbiParam, ExternalName, ExtFuncData, InstructionData, Opcode, Signature, UserExternalName,
+        ValueList, types,
+    };
+
+    fn new_func(params: &[ClifType], rets: &[ClifType]) -> (ClifFunction, ClifBlock) {
+        let mut func = ClifFunction::new();
+        func.signature.params = params.iter().map(|t| AbiParam::new(*t)).collect();
+        func.signature.returns = rets.iter().map(|t| AbiParam::new(*t)).collect();
+        let entry = func.dfg.make_block();
+        func.layout.append_block(entry);
+        for t in params {
+            func.dfg.append_block_param(entry, *t);
+        }
+        (func, entry)
+    }
+
+    #[test]
+    fn import_export_call() {
+        let (mut func, entry) = new_func(&[types::I64], &[types::I64]);
+        let param = func.dfg.block_params(entry)[0];
+
+        let mut callee = Signature::new(CallConv::SystemV);
+        callee.params.push(AbiParam::new(types::I64));
+        callee.returns.push(AbiParam::new(types::I64));
+        let sig_ref = func.import_signature(callee);
+        let name_ref = func.params.ensure_user_func_name(UserExternalName::new(0, 7));
+        let func_ref = func.import_function(ExtFuncData {
+            name: ExternalName::User(name_ref),
+            signature: sig_ref,
+            colocated: false,
+            patchable: false,
+        });
+        let mut args = ValueList::default();
+        args.push(param, &mut func.dfg.value_lists);
+        let call = func.dfg.make_inst(InstructionData::Call {
+            opcode: Opcode::Call,
+            func_ref,
+            args,
+        });
+        assert_eq!(func.dfg.make_inst_results(call, types::I64), 1);
+        func.layout.append_inst(call, entry);
+        let result = func.dfg.first_result(call);
+        let mut ret_args = ValueList::default();
+        ret_args.push(result, &mut func.dfg.value_lists);
+        let ret = func.dfg.make_inst(InstructionData::MultiAry {
+            opcode: Opcode::Return,
+            args: ret_args,
+        });
+        func.layout.append_inst(ret, entry);
+
+        let rir = import(&func).expect("import call");
+        assert_eq!(rir.externals.len(), 1);
+        assert!(rir.blocks[0]
+            .insts
+            .iter()
+            .any(|i| matches!(i, RirInst::Call(..))));
+
+        let out = export(&rir, &func.signature).expect("export call");
+        let rir2 = import(&out).expect("re-import call");
+        assert_eq!(rir2.externals, rir.externals);
     }
 }
