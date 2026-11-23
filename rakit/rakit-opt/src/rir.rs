@@ -535,6 +535,8 @@ fn map_type_to_rir(t: ClifType) -> Option<RirType> {
         RirType::I32
     } else if t == types::I64 {
         RirType::I64
+    } else if t == types::I128 {
+        RirType::I128
     } else if t == types::F32 {
         RirType::F32
     } else if t == types::F64 {
@@ -550,6 +552,7 @@ fn map_type_to_clif(t: RirType) -> Option<ClifType> {
         RirType::I16 => types::I16,
         RirType::I32 => types::I32,
         RirType::I64 => types::I64,
+        RirType::I128 => types::I128,
         RirType::F32 => types::F32,
         RirType::F64 => types::F64,
         RirType::Bool => types::I8,

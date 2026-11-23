@@ -167,3 +167,22 @@ fn does_not_promote_overlapping_accesses() {
     assert_eq!(f.stack_slots.len(), 1);
     assert_eq!(run(&f, &[Val::I(42)]).unwrap(), vec![Val::I(7)]);
 }
+
+#[test]
+fn promotes_i128_slot() {
+    let mut b = Builder::new(vec![Type::I128], vec![Type::I128]);
+    let e = b.func().entry;
+    let x = b.func().block(e).params[0];
+    let slot = b.add_stack_slot(16, 16);
+    let addr = b.stack_addr(e, slot, 0);
+    b.store(e, Type::I128, addr, 0, x);
+    let y = b.load(e, Type::I128, addr, 0);
+    b.ret(e, vec![y]);
+
+    let mut f = b.into_func();
+    assert!(sroa::run(&mut f));
+    assert!(verify(&f).is_ok(), "{:?}", verify(&f).err());
+    assert!(f.stack_slots.is_empty());
+    let value = 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210u128;
+    assert_eq!(run(&f, &[Val::I128(value)]).unwrap(), vec![Val::I128(value)]);
+}

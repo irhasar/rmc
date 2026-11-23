@@ -54,6 +54,9 @@ pub fn shift_amount(ty: Type, n: i64) -> u32 {
 /// Evaluate an integer binary op with the type's width and signedness.
 /// Returns `None` for division by zero or a non-integer opcode.
 pub fn eval_bin(op: BinOp, ty: Type, a: i64, b: i64) -> Option<i64> {
+    if ty == Type::I128 {
+        return None;
+    }
     let x = wrap(ty, a);
     let y = wrap(ty, b);
     let r = match op {

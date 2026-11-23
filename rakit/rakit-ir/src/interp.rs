@@ -7,6 +7,7 @@ use crate::ir::{BinOp, Block, FloatCc, Function, Inst, Type, Value};
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Val {
     I(i64),
+    I128(u128),
     F32(f32),
     F64(f64),
     B(bool),
@@ -17,6 +18,7 @@ impl Val {
     fn as_i(self) -> i64 {
         match self {
             Val::I(v) => v,
+            Val::I128(v) => v as i64,
             Val::P(v) => v as i64,
             Val::B(b) => b as i64,
             Val::F32(f) => f as i64,
@@ -27,13 +29,22 @@ impl Val {
     fn as_u64(self) -> u64 {
         match self {
             Val::P(v) => v,
+            Val::I128(v) => v as u64,
             _ => self.as_i() as u64,
+        }
+    }
+
+    fn as_u128(self) -> u128 {
+        match self {
+            Val::I128(v) => v,
+            _ => self.as_u64() as u128,
         }
     }
 
     fn as_f(self) -> f64 {
         match self {
             Val::I(v) => v as f64,
+            Val::I128(v) => v as f64,
             Val::P(v) => v as f64,
             Val::B(b) => b as i64 as f64,
             Val::F32(f) => f as f64,
@@ -45,6 +56,7 @@ impl Val {
         match self {
             Val::B(b) => b,
             Val::I(v) => v != 0,
+            Val::I128(v) => v != 0,
             Val::P(v) => v != 0,
             Val::F32(f) => f != 0.0,
             Val::F64(f) => f != 0.0,
@@ -58,6 +70,7 @@ fn default_val(ty: Type) -> Val {
         Type::F64 => Val::F64(0.0),
         Type::Bool => Val::B(false),
         Type::Ptr => Val::P(0),
+        Type::I128 => Val::I128(0),
         _ => Val::I(0),
     }
 }
@@ -105,6 +118,7 @@ fn size_of(ty: Type) -> usize {
         Type::I16 => 2,
         Type::I32 | Type::F32 => 4,
         Type::I64 | Type::F64 | Type::Ptr => 8,
+        Type::I128 => 16,
     }
 }
 
@@ -136,17 +150,18 @@ fn read_scalar(mem: &[u8], addr: usize, ty: Type) -> Result<Val, String> {
     if end > mem.len() {
         return Err(format!("load at {addr} (+{size}) is out of bounds"));
     }
-    let mut buf = [0u8; 8];
+    let mut buf = [0u8; 16];
     buf[..size].copy_from_slice(&mem[addr..end]);
     Ok(match ty {
         Type::I8 => Val::I(i8::from_le_bytes([buf[0]]) as i64),
         Type::I16 => Val::I(i16::from_le_bytes(buf[..2].try_into().unwrap()) as i64),
         Type::I32 => Val::I(i32::from_le_bytes(buf[..4].try_into().unwrap()) as i64),
-        Type::I64 => Val::I(i64::from_le_bytes(buf)),
+        Type::I64 => Val::I(i64::from_le_bytes(buf[..8].try_into().unwrap())),
+        Type::I128 => Val::I128(u128::from_le_bytes(buf)),
         Type::F32 => Val::F32(f32::from_le_bytes(buf[..4].try_into().unwrap())),
-        Type::F64 => Val::F64(f64::from_le_bytes(buf)),
+        Type::F64 => Val::F64(f64::from_le_bytes(buf[..8].try_into().unwrap())),
         Type::Bool => Val::B(buf[0] != 0),
-        Type::Ptr => Val::P(u64::from_le_bytes(buf)),
+        Type::Ptr => Val::P(u64::from_le_bytes(buf[..8].try_into().unwrap())),
     })
 }
 
@@ -158,14 +173,15 @@ fn write_scalar(mem: &mut [u8], addr: usize, ty: Type, val: Val) -> Result<(), S
     if end > mem.len() {
         return Err(format!("store at {addr} (+{size}) is out of bounds"));
     }
-    let mut buf = [0u8; 8];
+    let mut buf = [0u8; 16];
     match ty {
         Type::I8 | Type::Bool => buf[0] = val.as_i() as u8,
         Type::I16 => buf[..2].copy_from_slice(&(val.as_i() as i16).to_le_bytes()),
         Type::I32 => buf[..4].copy_from_slice(&(val.as_i() as i32).to_le_bytes()),
-        Type::I64 | Type::Ptr => buf = (val.as_u64() as i64).to_le_bytes(),
+        Type::I64 | Type::Ptr => buf[..8].copy_from_slice(&(val.as_u64() as i64).to_le_bytes()),
+        Type::I128 => buf = val.as_u128().to_le_bytes(),
         Type::F32 => buf[..4].copy_from_slice(&(val.as_f() as f32).to_le_bytes()),
-        Type::F64 => buf = val.as_f().to_le_bytes(),
+        Type::F64 => buf[..8].copy_from_slice(&val.as_f().to_le_bytes()),
     }
     mem[addr..end].copy_from_slice(&buf[..size]);
     Ok(())

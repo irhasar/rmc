@@ -48,6 +48,7 @@ pub(crate) fn size_of(ty: Type) -> u32 {
         Type::I16 => 2,
         Type::I32 | Type::F32 => 4,
         Type::I64 | Type::F64 | Type::Ptr => 8,
+        Type::I128 => 16,
     }
 }
 

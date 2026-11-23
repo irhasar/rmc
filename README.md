@@ -144,6 +144,10 @@ load dengan nilai SSA saat ini dan membuang store. Slot dengan alamat dinamis,
 load sebelum store, atau akses yang saling tumpang tindih tidak dipromosikan.
 Slot yang tidak lagi punya `StackAddr` dihapus dan slot lain dinomori ulang.
 
+RIR juga mendukung memori 16 byte lewat `Type::I128` (load/store 16 byte,
+forwarding, DSE, dan SROA). Operasi aritmetika `I128` tidak didukung di RIR;
+hanya pemindahan nilai dan memori.
+
 Pipeline RIR sekarang:
 `simplify → optimize → mem_forward → optimize → sroa → optimize → div_test → if_convert → gvn → licm → optimize`.
 

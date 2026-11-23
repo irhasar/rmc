@@ -1,5 +1,12 @@
 # AGENTS.md
 
+## Session (2026-11-23, Fase 2 step 18) — I128 memory
+- `Type::I128` and `Val::I128(u128)` added. Interpreter reads/writes 16 bytes;
+  `int_sem` rejects I128 arithmetic (no i64 representation).
+- `mem_forward`/`sroa` use 16-byte size; bridge maps CLIF `I128`.
+- Tests: 73 RIR (4 memory, 8 sroa) + 8 bridge; `./y.sh build` exit 0; h22
+  (`u128` array) prints 42 with `sroa fired`; h20/h21 unchanged.
+
 ## Session (2026-11-23, Fase 2 step 17) — SROA
 - New `rakit-ir/src/sroa.rs`: promote non-escaping scalar slots with constant
   load/store keys. Phi nodes are added as block params at dominance-frontier

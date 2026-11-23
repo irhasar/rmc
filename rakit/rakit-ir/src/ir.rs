@@ -26,6 +26,7 @@ pub enum Type {
     I16,
     I32,
     I64,
+    I128,
     F32,
     F64,
     Bool,
@@ -43,7 +44,10 @@ pub struct StackSlotData {
 
 impl Type {
     pub fn is_int(self) -> bool {
-        matches!(self, Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::Ptr)
+        matches!(
+            self,
+            Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::I128 | Type::Ptr
+        )
     }
 
     pub fn is_float(self) -> bool {
