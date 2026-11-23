@@ -1,5 +1,22 @@
 # AGENTS.md
 
+## Session (2026-11-23, Fase 2 step 12) — LICM
+- New `rakit-ir/src/licm.rs`: finds natural loops from back edges + dominators,
+  requires a unique outside predecessor ending in `jump` to the header, and
+  hoists pure instructions whose operands are defined outside the loop and
+  dominate the preheader.
+- Skips div/rem/fdiv (speculation), loops without a preheader, and loops whose
+  preheader does not dominate the whole body. Runs to a fixpoint so invariant
+  chains hoist in successive rounds.
+- Shared `predecessors/rpo/dominators/dominates` moved into `cfg_util`; `gvn`
+  and `simplify` now use them.
+- `RirPass` order:
+  `simplify -> optimize -> div_test -> if_convert -> gvn -> licm -> optimize`.
+- Tests: 50/50 (6 div_test + 7 gvn + 7 if_convert + 15 ir + 4 licm +
+  11 simplify).
+- End-to-end: `k` (x*y only inside a loop) logs `licm fired` and prints 24;
+  `h` logs `gvn fired` + `licm fired` and prints 30, both identical.
+
 ## Session (2026-11-23, Fase 2 step 11) — block merging in simplify
 - `simplify` now also merges a parameterless block with a single predecessor
   when the predecessor ends in `jump` with no args: the block body is appended

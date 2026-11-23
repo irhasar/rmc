@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 
-use crate::cfg_util::{remove_blocks, remove_values};
+use crate::cfg_util::{predecessors, remove_blocks, remove_values};
 use crate::ir::{Function, Inst, Value};
 
 pub fn run(func: &mut Function) -> bool {
@@ -100,24 +100,6 @@ fn values_dead_outside(func: &Function, block: usize, defined: &HashSet<Value>) 
         }
     }
     true
-}
-
-fn predecessors(func: &Function) -> Vec<Vec<usize>> {
-    let mut preds = vec![Vec::new(); func.blocks.len()];
-    for (bi, block) in func.blocks.iter().enumerate() {
-        let Some(term) = block.insts.last() else {
-            continue;
-        };
-        match term {
-            Inst::Jump(t, _) => preds[t.0 as usize].push(bi),
-            Inst::Brif(_, t, _, f, _) => {
-                preds[t.0 as usize].push(bi);
-                preds[f.0 as usize].push(bi);
-            }
-            _ => {}
-        }
-    }
-    preds
 }
 
 fn find_merge(func: &Function) -> Option<(usize, usize)> {

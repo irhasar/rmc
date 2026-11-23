@@ -70,6 +70,14 @@ impl Pass for RirPass {
         if debug && gvn_changed {
             eprintln!("[rir] gvn fired");
         }
+        let licm_changed = rakit_ir::licm::run(&mut rir_func);
+        if licm_changed {
+            rakit_ir::optimize(&mut rir_func);
+            changed = true;
+        }
+        if debug && licm_changed {
+            eprintln!("[rir] licm fired");
+        }
         if !changed && std::env::var_os("RAKIT_RIR_FORCE").is_none() {
             if debug {
                 eprintln!("[rir] no-change {:?}", pctx.ctx.func.name);

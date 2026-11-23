@@ -65,6 +65,118 @@ pub(crate) fn remove_values(func: &mut Function, removed: &HashSet<Value>) {
     }
 }
 
+pub(crate) fn predecessors(func: &Function) -> Vec<Vec<usize>> {
+    let mut preds = vec![Vec::new(); func.blocks.len()];
+    for (bi, block) in func.blocks.iter().enumerate() {
+        let Some(term) = block.insts.last() else {
+            continue;
+        };
+        match term {
+            Inst::Jump(t, _) => preds[t.0 as usize].push(bi),
+            Inst::Brif(_, t, _, f, _) => {
+                preds[t.0 as usize].push(bi);
+                preds[f.0 as usize].push(bi);
+            }
+            _ => {}
+        }
+    }
+    preds
+}
+
+pub(crate) fn rpo(func: &Function) -> Vec<usize> {
+    let mut seen = vec![false; func.blocks.len()];
+    let mut post = Vec::new();
+    dfs(func.entry.0 as usize, func, &mut seen, &mut post);
+    post.reverse();
+    post
+}
+
+fn dfs(b: usize, func: &Function, seen: &mut [bool], post: &mut Vec<usize>) {
+    if seen[b] {
+        return;
+    }
+    seen[b] = true;
+    if let Some(term) = func.blocks[b].insts.last() {
+        match term {
+            Inst::Jump(t, _) => dfs(t.0 as usize, func, seen, post),
+            Inst::Brif(_, t, _, f, _) => {
+                dfs(t.0 as usize, func, seen, post);
+                dfs(f.0 as usize, func, seen, post);
+            }
+            _ => {}
+        }
+    }
+    post.push(b);
+}
+
+pub(crate) fn dominators(
+    func: &Function,
+    preds: &[Vec<usize>],
+    order: &[usize],
+) -> Vec<Option<usize>> {
+    let n = func.blocks.len();
+    let mut rpo_index = vec![usize::MAX; n];
+    for (i, &b) in order.iter().enumerate() {
+        rpo_index[b] = i;
+    }
+    let entry = func.entry.0 as usize;
+    let mut idom = vec![None; n];
+    idom[entry] = Some(entry);
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &b in order {
+            if b == entry {
+                continue;
+            }
+            let mut new_idom = None;
+            for &p in &preds[b] {
+                if idom[p].is_none() {
+                    continue;
+                }
+                new_idom = Some(match new_idom {
+                    None => p,
+                    Some(cur) => intersect(p, cur, &idom, &rpo_index),
+                });
+            }
+            if let Some(new) = new_idom {
+                if idom[b] != Some(new) {
+                    idom[b] = Some(new);
+                    changed = true;
+                }
+            }
+        }
+    }
+    idom
+}
+
+fn intersect(a: usize, b: usize, idom: &[Option<usize>], rpo_index: &[usize]) -> usize {
+    let mut a = a;
+    let mut b = b;
+    while a != b {
+        while rpo_index[a] > rpo_index[b] {
+            a = idom[a].expect("dominator");
+        }
+        while rpo_index[b] > rpo_index[a] {
+            b = idom[b].expect("dominator");
+        }
+    }
+    a
+}
+
+pub(crate) fn dominates(a: usize, b: usize, idom: &[Option<usize>]) -> bool {
+    let mut cur = b;
+    loop {
+        if cur == a {
+            return true;
+        }
+        match idom[cur] {
+            Some(d) if d != cur => cur = d,
+            _ => return false,
+        }
+    }
+}
+
 fn remap_inst_values(inst: &mut Inst, map: &[Option<Value>]) {
     fn r(map: &[Option<Value>], v: &mut Value) {
         *v = map[v.0 as usize].expect("value removed but still used");

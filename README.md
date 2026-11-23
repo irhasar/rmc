@@ -110,8 +110,15 @@ predecessor tersebut bila predecessor berakhir `jump` tanpa arg; isi blok
 dipindahkan dan bloknya dihapus. Penggabungan tidak dilakukan melewati edge
 `brif`, blok berparameter, atau blok dengan banyak predecessor.
 
+Pass `licm` (`rakit-ir/src/licm.rs`) memindahkan instruksi murni yang
+operandnya didefinisikan di luar loop ke preheader loop, sehingga komputasi
+loop-invariant hanya dihitung sekali. Loop dengan lebih dari satu predecessor
+luar atau tanpa preheader dilewati; instruksi yang bergantung pada nilai loop
+tidak dipindahkan. Pass berjalan sampai fixpoint agar rantai invariant ikut
+terangkat.
+
 Pipeline RIR sekarang:
-`simplify → optimize → div_test → if_convert → gvn → optimize`.
+`simplify → optimize → div_test → if_convert → gvn → licm → optimize`.
 
 ## Build
 

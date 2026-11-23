@@ -22,6 +22,7 @@ pub mod builder;
 pub mod div_test;
 pub mod gvn;
 pub mod if_convert;
+pub mod licm;
 pub mod int_sem;
 pub mod interp;
 pub mod ir;
