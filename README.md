@@ -56,9 +56,15 @@ urutan pipeline terpusat di satu tempat (bukan rangkaian pemanggilan ad-hoc di
 `rakit-ir` (`rakit/rakit-ir/`) adalah fondasi IR mid-level milik Rakit: IR SSA
 mandiri (tanpa dependensi ke backend), verifier (definisi tunggal, dominasi,
 tipe), optimizer pertama (constant folding, branch folding, DCE), dan
-interpreter referensi untuk tes. Crate ini belum dihubungkan ke pipeline
-kompilasi; langkah berikutnya adalah jembatan CLIF↔RIR lalu memindahkan pass
-satu per satu ke IR ini.
+interpreter referensi untuk tes.
+
+Jembatan CLIF↔RIR ada di `rakit-opt/src/rir.rs`. Jembatan ini menerima subset
+scalar (konstanta, aritmetika int/float, `icmp`/`fcmp`, `select`, parameter
+blok, `jump`/`brif`, `return`; tanpa call/memori/stack slot/global) dan menolak
+sisanya, sehingga fungsi yang tidak didukung dibiarkan apa adanya. Pass
+`RirPass` menjalankan round-trip ini dan nonaktif secara default; aktifkan
+dengan `RAKIT_RIR=1`. `RAKIT_RIR_FORCE=1` memaksa export ulang tanpa perubahan
+(untuk validasi), `RAKIT_RIR_DEBUG=1` mencetak keputusan per fungsi.
 
 ## Build
 

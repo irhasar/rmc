@@ -11,6 +11,57 @@ pub mod unroll;
 use crate::passtime;
 use crate::pass::{Pass, PassCtx};
 
+/// Optional round trip through the Rakit mid-level IR. It only fires for
+/// functions the CLIF<->RIR bridge supports (scalar, no memory/calls) and only
+/// when `RAKIT_RIR` is set, so it cannot affect a normal build.
+pub struct RirPass;
+
+impl Pass for RirPass {
+    fn name(&self) -> &'static str {
+        "rir"
+    }
+
+    fn run(&mut self, pctx: &mut PassCtx<'_>) -> bool {
+        if !crate::tunables::rir_enabled() {
+            return false;
+        }
+        let debug = std::env::var_os("RAKIT_RIR_DEBUG").is_some();
+        let Some(mut rir_func) = crate::rir::import(&pctx.ctx.func) else {
+            if debug {
+                eprintln!(
+                    "[rir] skip {:?}: globals={} sized={} dyn={} stack_limit={}",
+                    pctx.ctx.func.name,
+                    pctx.ctx.func.global_values.len(),
+                    pctx.ctx.func.sized_stack_slots.len(),
+                    pctx.ctx.func.dynamic_stack_slots.len(),
+                    pctx.ctx.func.stack_limit.is_some(),
+                );
+                eprintln!("{}", pctx.ctx.func.display());
+            }
+            return false;
+        };
+        let changed = rakit_ir::optimize(&mut rir_func);
+        if !changed && std::env::var_os("RAKIT_RIR_FORCE").is_none() {
+            if debug {
+                eprintln!("[rir] no-change {:?}", pctx.ctx.func.name);
+            }
+            return false;
+        }
+        let sig = pctx.ctx.func.signature.clone();
+        let Some(mut new_func) = crate::rir::export(&rir_func, &sig) else {
+            return false;
+        };
+        new_func.name = pctx.ctx.func.name.clone();
+        new_func.params = pctx.ctx.func.params.clone();
+        if std::env::var_os("RAKIT_RIR_DEBUG").is_some() {
+            let what = if changed { "optimized" } else { "roundtrip" };
+            eprintln!("[rir] {} {:?}", what, pctx.ctx.func.name);
+        }
+        pctx.ctx.func = new_func;
+        true
+    }
+}
+
 pub struct RecLoopPass;
 
 impl Pass for RecLoopPass {

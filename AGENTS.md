@@ -1,5 +1,31 @@
 # AGENTS.md
 
+## Session (2026-11-23, Fase 2 step 2) — CLIF<->RIR bridge + optional `RirPass`
+- `rakit-opt/src/rir.rs`: `import(&Function) -> Option<rakit_ir::Function>` and
+  `export(&rir, &Signature) -> Option<Function>` for a conservative scalar
+  subset (constants, int/float binops, icmp/fcmp, select, block params,
+  jump/brif/return). Calls, memory, stack slots, globals and multi-result
+  instructions are refused, so unsupported functions are left untouched.
+- **Aliases are the first blocker**: cg_clif emits `vN -> vM` heavily. Without
+  `dfg.resolve_aliases` every real function fails to import (a value used in
+  `return` has no defining instruction). `lookup`/`map_value` resolve both ways.
+- **CLIF bools are `i8`**; RIR has a distinct `Bool`. `as_bool` inserts
+  `icmp ne c, 0` for `brif`/`select` conditions, so functions with `i8`
+  parameters import. A function *returning* a bool still fails the RIR verifier
+  (Bool vs I8) and is skipped.
+- `RirPass` runs first in the pipeline but is a no-op unless `RAKIT_RIR=1`.
+  `RAKIT_RIR_FORCE=1` re-exports even when the optimizer changes nothing (this
+  is how the export path is validated on real CLIF), `RAKIT_RIR_DEBUG=1` logs
+  per-function skip/no-change/roundtrip decisions.
+- Tests: `cargo test --manifest-path rakit-opt/Cargo.toml` -> 7/7 (5 bridge
+  tests: add round-trip, branch folding, block params, floats, unsupported
+  rejection). End-to-end: `RAKIT_RIR=1 RAKIT_RIR_FORCE=1` on a `while` loop and
+  a bool-parameter `if` gives output identical to the normal build.
+- The RIR optimizer only does constant folding, algebraic identities, branch
+  folding and DCE -- all already done by Cranelift's egraph -- so `RirPass`
+  usually reports `no-change`. This step delivers the bridge and the plumbing,
+  not a speedup.
+
 ## Session (2026-11-23, Fase 2 step 1) — `rakit-ir` mid-level IR foundation
 - New pure crate `rakit/rakit-ir` (no dependencies): SSA IR (`ir.rs`), builder,
   verifier (single definition, dominance, types), optimizer (`opt.rs`:

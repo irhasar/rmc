@@ -197,6 +197,7 @@ pub(crate) fn compile_fn(
     // analysis rejects any loop that still contains a call or touches memory.
     let mut pipeline = rakit_opt::PassManager::new();
     pipeline
+        .push(Box::new(rakit_opt::RirPass))
         .push(Box::new(rakit_opt::RecLoopPass))
         .push(Box::new(rakit_opt::StoreForwardPass))
         .push(Box::new(rakit_opt::DivTestPass))

@@ -5,4 +5,5 @@ edition = "2024"
 
 [dependencies]
 rakit-codegen = { path = "../vendor/rakit-codegen", version = "0.137.0", default-features = false, features = ["std"] }
+rakit-ir = { path = "../rakit-ir" }
 rakit-module = { path = "../vendor/rakit-module", version = "0.137.0" }

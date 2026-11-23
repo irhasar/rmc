@@ -16,3 +16,4 @@ extbench/crateworks/
 rakit/rakit-ir/target/
 rakit/rakit-ir/Cargo.lock
 rakit/rakit-opt/target/
+rakit/rakit-opt/Cargo.lock

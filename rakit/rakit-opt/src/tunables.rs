@@ -21,6 +21,13 @@ pub fn store_forward_enabled() -> bool {
     *V.get_or_init(|| !flag("RAKIT_NO_STORE_FWD"))
 }
 
+/// Whether the experimental RIR round-trip pass runs (`RAKIT_RIR` on). Off by
+/// default until the bridge covers enough of the instruction set.
+pub fn rir_enabled() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| flag("RAKIT_RIR"))
+}
+
 /// Whether the divisibility-test pass runs at all (`RAKIT_NO_DIVTEST` off).
 pub fn div_test_enabled() -> bool {
     static V: OnceLock<bool> = OnceLock::new();

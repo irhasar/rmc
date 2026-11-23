@@ -10,10 +10,12 @@ pub mod analyses;
 pub mod pass;
 pub mod passtime;
 pub mod passes;
+pub mod rir;
 pub mod tunables;
 
 pub use analyses::Analyses;
 pub use pass::{Pass, PassCtx, PassManager};
 pub use passes::{
-    DivTestPass, IfConvertPass, RecLoopPass, SincosPass, StoreForwardPass, UnrollPass,
+    DivTestPass, IfConvertPass, RecLoopPass, RirPass, SincosPass, StoreForwardPass, UnrollPass,
 };
+pub use rir::{export, import};
