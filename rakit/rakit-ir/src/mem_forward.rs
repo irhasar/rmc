@@ -311,11 +311,138 @@ fn forward(func: &mut Function) -> bool {
     changed
 }
 
+type SlotRanges = BTreeMap<u32, Vec<(i64, i64)>>;
+
+fn add_range(ranges: &mut Vec<(i64, i64)>, start: i64, end: i64) {
+    if start >= end {
+        return;
+    }
+    ranges.push((start, end));
+    ranges.sort_unstable();
+    let mut merged: Vec<(i64, i64)> = Vec::with_capacity(ranges.len());
+    for &(s, e) in ranges.iter() {
+        if let Some(last) = merged.last_mut() {
+            if s <= last.1 {
+                if e > last.1 {
+                    last.1 = e;
+                }
+                continue;
+            }
+        }
+        merged.push((s, e));
+    }
+    *ranges = merged;
+}
+
+fn add_slot(map: &mut SlotRanges, slot: u32, start: i64, end: i64) {
+    add_range(map.entry(slot).or_default(), start, end);
+}
+
+fn sub_range(ranges: &[(i64, i64)], start: i64, end: i64) -> Vec<(i64, i64)> {
+    let mut out = Vec::new();
+    for &(s, e) in ranges {
+        if e <= start || s >= end {
+            out.push((s, e));
+        } else {
+            if s < start {
+                out.push((s, start));
+            }
+            if e > end {
+                out.push((end, e));
+            }
+        }
+    }
+    out
+}
+
+fn sub_slot(map: &mut SlotRanges, slot: u32, start: i64, end: i64) {
+    if let Some(ranges) = map.get_mut(&slot) {
+        *ranges = sub_range(ranges, start, end);
+        if ranges.is_empty() {
+            map.remove(&slot);
+        }
+    }
+}
+
+fn union(a: &SlotRanges, b: &SlotRanges) -> SlotRanges {
+    let mut out = a.clone();
+    for (&slot, ranges) in b {
+        for &(s, e) in ranges {
+            add_slot(&mut out, slot, s, e);
+        }
+    }
+    out
+}
+
+fn subtract(a: &SlotRanges, b: &SlotRanges) -> SlotRanges {
+    let mut out = a.clone();
+    for (&slot, ranges) in b {
+        for &(s, e) in ranges {
+            sub_slot(&mut out, slot, s, e);
+        }
+    }
+    out
+}
+
+fn intersects(ranges: &[(i64, i64)], start: i64, end: i64) -> bool {
+    ranges.iter().any(|&(s, e)| s < end && start < e)
+}
+
+fn whole_slot(func: &Function, slot: u32) -> (i64, i64) {
+    (0, func.stack_slots[slot as usize].size as i64)
+}
+
+fn key_range(func: &Function, key: Key, ty: Type) -> (i64, i64) {
+    match key {
+        Key::Const { offset, .. } => (offset, offset + size_of(ty) as i64),
+        Key::Dyn { slot, .. } => whole_slot(func, slot),
+    }
+}
+
+struct Effects {
+    used: SlotRanges,
+    defined: SlotRanges,
+}
+
+fn block_effects(func: &Function, defs: &HashMap<Value, Inst>, bi: usize) -> Effects {
+    let mut used = SlotRanges::new();
+    let mut defined = SlotRanges::new();
+    for inst in &func.blocks[bi].insts {
+        match inst {
+            Inst::Load(_, ty, addr, offset) => {
+                if let Some(key) = key_of(defs, func, *addr, *offset, *ty) {
+                    let slot = key.slot();
+                    let (start, end) = key_range(func, key, *ty);
+                    let exposed = match defined.get(&slot) {
+                        Some(killed) => {
+                            let mut ranges = vec![(start, end)];
+                            for &(s, e) in killed {
+                                ranges = sub_range(&ranges, s, e);
+                            }
+                            ranges
+                        }
+                        None => vec![(start, end)],
+                    };
+                    for (s, e) in exposed {
+                        add_slot(&mut used, slot, s, e);
+                    }
+                }
+            }
+            Inst::Store(ty, addr, offset, _) => {
+                if let Some(key) = key_of(defs, func, *addr, *offset, *ty) {
+                    let (start, end) = key_range(func, key, *ty);
+                    add_slot(&mut defined, key.slot(), start, end);
+                }
+            }
+            _ => {}
+        }
+    }
+    Effects { used, defined }
+}
+
 fn dse(func: &mut Function) -> bool {
     let defs = definitions(func);
     let escaping = escaping_slots(func, &defs);
-    let mut loads: HashMap<u32, Vec<(i64, i64)>> = HashMap::new();
-    let mut dynamic_load = vec![false; func.stack_slots.len()];
 
     for blk in &func.blocks {
         for inst in &blk.insts {
@@ -324,18 +451,8 @@ fn dse(func: &mut Function) -> bool {
                     let Some(key) = key_of(&defs, func, *addr, *offset, *ty) else {
                         return false;
                     };
-                    let slot = key.slot();
-                    if escaping[slot as usize] {
+                    if escaping[key.slot() as usize] {
                         return false;
-                    }
-                    match key {
-                        Key::Const { offset, .. } => {
-                            loads
-                                .entry(slot)
-                                .or_default()
-                                .push((offset, offset + size_of(*ty) as i64));
-                        }
-                        Key::Dyn { .. } => dynamic_load[slot as usize] = true,
                     }
                 }
                 Inst::Store(ty, addr, offset, _) => {
@@ -351,43 +468,70 @@ fn dse(func: &mut Function) -> bool {
         }
     }
 
+    let preds = predecessors(func);
+    let order = rpo(func);
+    let mut succ = vec![Vec::new(); func.blocks.len()];
+    for (b, ps) in preds.iter().enumerate() {
+        for &p in ps {
+            succ[p].push(b);
+        }
+    }
+
+    let effects: Vec<Effects> = (0..func.blocks.len())
+        .map(|bi| block_effects(func, &defs, bi))
+        .collect();
+    let mut live_in = vec![SlotRanges::new(); func.blocks.len()];
+    let mut live_out = vec![SlotRanges::new(); func.blocks.len()];
+
+    loop {
+        let mut changed = false;
+        for &bi in order.iter().rev() {
+            let mut out = SlotRanges::new();
+            for &s in &succ[bi] {
+                out = union(&out, &live_in[s]);
+            }
+            let in_ = union(&effects[bi].used, &subtract(&out, &effects[bi].defined));
+            if out != live_out[bi] || in_ != live_in[bi] {
+                live_out[bi] = out;
+                live_in[bi] = in_;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
     let mut changed = false;
     for bi in 0..func.blocks.len() {
-        let mut ii = 0;
-        while ii < func.blocks[bi].insts.len() {
-            let dead = match &func.blocks[bi].insts[ii] {
+        let mut live = live_out[bi].clone();
+        let mut ii = func.blocks[bi].insts.len();
+        while ii > 0 {
+            ii -= 1;
+            match &func.blocks[bi].insts[ii] {
+                Inst::Load(_, ty, addr, offset) => {
+                    if let Some(key) = key_of(&defs, func, *addr, *offset, *ty) {
+                        let (start, end) = key_range(func, key, *ty);
+                        add_slot(&mut live, key.slot(), start, end);
+                    }
+                }
                 Inst::Store(ty, addr, offset, _) => {
-                    let Some(key) = key_of(&defs, func, *addr, *offset, *ty) else {
-                        return false;
-                    };
-                    let slot = key.slot();
-                    match key {
-                        Key::Const { offset, .. } => {
-                            if dynamic_load[slot as usize] {
-                                false
-                            } else {
-                                let end = offset + size_of(*ty) as i64;
-                                !loads
-                                    .get(&slot)
-                                    .map(|ranges| {
-                                        ranges.iter().any(|&(a, b)| a < end && offset < b)
-                                    })
-                                    .unwrap_or(false)
-                            }
-                        }
-                        Key::Dyn { .. } => {
-                            !loads.get(&slot).map(|r| !r.is_empty()).unwrap_or(false)
-                                && !dynamic_load[slot as usize]
+                    if let Some(key) = key_of(&defs, func, *addr, *offset, *ty) {
+                        let (start, end) = key_range(func, key, *ty);
+                        let slot = key.slot();
+                        let needed = live
+                            .get(&slot)
+                            .map(|ranges| intersects(ranges, start, end))
+                            .unwrap_or(false);
+                        if needed {
+                            sub_slot(&mut live, slot, start, end);
+                        } else {
+                            func.blocks[bi].insts.remove(ii);
+                            changed = true;
                         }
                     }
                 }
-                _ => false,
-            };
-            if dead {
-                func.blocks[bi].insts.remove(ii);
-                changed = true;
-            } else {
-                ii += 1;
+                _ => {}
             }
         }
     }

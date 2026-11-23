@@ -164,3 +164,69 @@ fn constant_store_not_forwarded_to_dynamic_load() {
     assert!(f.blocks[0].insts.iter().any(|i| matches!(i, Inst::Store(..))));
     assert_eq!(run(&f, &[Val::I(42), Val::I(0)]).unwrap(), vec![Val::I(42)]);
 }
+
+#[test]
+fn removes_overwritten_store() {
+    let mut b = Builder::new(vec![Type::I32], vec![Type::I64, Type::I64]);
+    let e = b.func().entry;
+    let x = b.func().block(e).params[0];
+    let y = b.func().block(e).params[1];
+    let slot = b.add_stack_slot(8, 8);
+    let addr = b.stack_addr(e, slot, 0);
+    b.store(e, Type::I64, addr, 0, x);
+    b.store(e, Type::I64, addr, 0, y);
+    let z = b.load(e, Type::I32, addr, 0);
+    b.ret(e, vec![z]);
+
+    let mut f = b.into_func();
+    assert!(mem_forward::run(&mut f));
+    assert_eq!(
+        f.blocks[0]
+            .insts
+            .iter()
+            .filter(|i| matches!(i, Inst::Store(..)))
+            .count(),
+        1
+    );
+    assert_eq!(run(&f, &[Val::I(1), Val::I(2)]).unwrap(), vec![Val::I(2)]);
+}
+
+#[test]
+fn removes_store_overwritten_across_blocks() {
+    let mut b = Builder::new(vec![Type::I64], vec![Type::I64, Type::I64]);
+    let e = b.func().entry;
+    let x = b.func().block(e).params[0];
+    let y = b.func().block(e).params[1];
+    let slot = b.add_stack_slot(8, 8);
+    let addr = b.stack_addr(e, slot, 0);
+    b.store(e, Type::I64, addr, 0, x);
+    let body = b.add_block(vec![]);
+    b.jump(e, body, vec![]);
+    b.store(body, Type::I64, addr, 0, y);
+    let zero = b.iconst(body, Type::I64, 0);
+    b.ret(body, vec![zero]);
+
+    let mut f = b.into_func();
+    assert!(mem_forward::run(&mut f));
+    assert!(!f.blocks.iter().any(|blk| blk.insts.iter().any(|i| matches!(i, Inst::Store(..)))));
+    assert_eq!(run(&f, &[Val::I(1), Val::I(2)]).unwrap(), vec![Val::I(0)]);
+}
+
+#[test]
+fn keeps_store_read_in_successor() {
+    let mut b = Builder::new(vec![Type::I32], vec![Type::I64]);
+    let e = b.func().entry;
+    let x = b.func().block(e).params[0];
+    let slot = b.add_stack_slot(8, 8);
+    let addr = b.stack_addr(e, slot, 0);
+    b.store(e, Type::I64, addr, 0, x);
+    let body = b.add_block(vec![]);
+    b.jump(e, body, vec![]);
+    let z = b.load(body, Type::I32, addr, 0);
+    b.ret(body, vec![z]);
+
+    let mut f = b.into_func();
+    assert!(!mem_forward::run(&mut f));
+    assert!(f.blocks[0].insts.iter().any(|i| matches!(i, Inst::Store(..))));
+    assert_eq!(run(&f, &[Val::I(42)]).unwrap(), vec![Val::I(42)]);
+}

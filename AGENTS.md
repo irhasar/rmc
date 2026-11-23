@@ -1,5 +1,14 @@
 # AGENTS.md
 
+## Session (2026-11-23, Fase 2 step 16) — liveness DSE
+- `mem_forward::dse` now uses byte-range liveness across the CFG:
+  per-block `used`/`defined`, `live-in`/`live-out` fixed point, then a
+  backward scan removes stores whose bytes are not live after them.
+- Dynamic store/load covers the whole slot. Stores overwritten later in the
+  same block or a successor are now removed; stores read in a successor stay.
+- Tests: 64 RIR (11 mem_forward) + 8 bridge; `./y.sh build` exit 0; h20/h21
+  unchanged (`11`/`42`).
+
 ## Session (2026-11-23, Fase 2 step 15) — dynamic addresses
 - `mem_forward` now recognizes `Copy`, `Add` with constants, `Select`, and
   `StackAddr + dynamic index`. `Const` and `Dyn` keys are matched separately.
