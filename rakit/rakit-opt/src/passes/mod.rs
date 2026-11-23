@@ -46,6 +46,14 @@ impl Pass for RirPass {
         if debug && simplify_changed {
             eprintln!("[rir] simplify fired");
         }
+        let mem_changed = rakit_ir::mem_forward::run(&mut rir_func);
+        if mem_changed {
+            rakit_ir::optimize(&mut rir_func);
+            changed = true;
+        }
+        if debug && mem_changed {
+            eprintln!("[rir] mem_forward fired");
+        }
         let div_changed = rakit_ir::div_test::run(&mut rir_func);
         if div_changed {
             rakit_ir::optimize(&mut rir_func);

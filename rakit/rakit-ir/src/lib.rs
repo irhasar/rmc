@@ -23,6 +23,7 @@ pub mod div_test;
 pub mod gvn;
 pub mod if_convert;
 pub mod licm;
+pub mod mem_forward;
 pub mod int_sem;
 pub mod interp;
 pub mod ir;

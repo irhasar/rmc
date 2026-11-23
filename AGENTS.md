@@ -1,5 +1,18 @@
 # AGENTS.md
 
+## Session (2026-11-23, Fase 2 step 14) — store forwarding + DSE
+- New `rakit-ir/src/mem_forward.rs`: track direct `StackAddr` values and
+  `Copy` aliases, require non-escaping private slots and in-bounds accesses.
+- Forward `store` -> later `load` within and across blocks using a
+  must-analysis over predecessors; replace loads with `Copy`.
+- Remove stores whose byte ranges are never loaded anywhere (conservative
+  global DSE), then let `optimize` clean up.
+- Wire into `RirPass` after `simplify`/`optimize`:
+  `simplify -> optimize -> mem_forward -> optimize -> div_test -> if_convert
+  -> gvn -> licm -> optimize`.
+- Tests: 58 RIR (5 mem_forward) + 8 bridge; `./y.sh build` exit 0; h20/h19
+  print 11 and log `mem_forward fired`.
+
 ## Session (2026-11-23, Fase 2 step 13) — memory bridge
 - RIR: `StackSlot`/`StackSlotData`, `Function.stack_slots`, `Inst::StackAddr`,
   `Inst::Load`, `Inst::Store` (scalar, constant offset); builder helpers.

@@ -124,8 +124,15 @@ direpresentasikan sebagai `I64`. Pass yang ada tetap konservatif: `gvn` dan
 load/store, dan DCE tidak membuang load/store. Interpreter memakai arena stack
 sederhana dengan pemeriksaan batas untuk menguji round-trip memori.
 
+Pass `mem_forward` (`rakit-ir/src/mem_forward.rs`) meneruskan `store` ke `load`
+berikutnya untuk stack slot privat yang alamatnya tidak escape, baik di dalam
+blok maupun lintas blok lewat must-analysis predecessor. Setelah itu pass
+menghapus store yang byte-nya tidak pernah dibaca. Pass dilewati seluruhnya
+bila ada alamat yang escape, store ke alamat tak dikenal, atau akses di luar
+batas slot.
+
 Pipeline RIR sekarang:
-`simplify → optimize → div_test → if_convert → gvn → licm → optimize`.
+`simplify → optimize → mem_forward → optimize → div_test → if_convert → gvn → licm → optimize`.
 
 ## Build
 
