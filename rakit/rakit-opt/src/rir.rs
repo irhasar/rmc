@@ -543,7 +543,7 @@ pub fn import(func: &CgFunction) -> Option<RirFunction> {
                 eprintln!("[rir] import verify failed in {:?}: {errors:?}", func.name);
             }
             if std::env::var_os("RAKIT_RIR_IMPORT_DUMP").is_some() {
-                eprintln!("[rir] CLIF\n{}", func.display());
+                eprintln!("[rir] backend IR\n{}", func.display());
                 eprintln!("[rir] RIR\n{out:?}");
             }
             return None;

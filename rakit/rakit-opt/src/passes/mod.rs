@@ -233,7 +233,7 @@ impl Pass for RirPass<'_> {
             match selector.select(&rir_func) {
                 Ok(prealloc) if prealloc.is_fallback() => {
                     // The selector could not represent this function.  Keep the
-                    // existing RIR/CLIF body; re-exporting a copied RIR body is
+                    // existing RIR/codegen body; re-exporting a copied RIR body is
                     // not a production emitter and can lose bridge-only details.
                     if debug || stats_mode {
                         eprintln!("[rir] custom isel fallback");
