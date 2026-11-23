@@ -16,6 +16,8 @@
 //! A later step will add the CLIF bridge (import/export) and move existing
 //! passes onto this IR.
 
+pub(crate) mod cfg_util;
+
 pub mod builder;
 pub mod div_test;
 pub mod gvn;
@@ -24,6 +26,7 @@ pub mod int_sem;
 pub mod interp;
 pub mod ir;
 pub mod opt;
+pub mod simplify;
 pub mod verify;
 
 pub use builder::Builder;

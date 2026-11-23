@@ -1,5 +1,19 @@
 # AGENTS.md
 
+## Session (2026-11-23, Fase 2 step 9) — CFG simplify
+- New `rakit-ir/src/simplify.rs`: removes blocks unreachable from entry and
+  collapses empty forwarding blocks (`nop*; jump target` with no params),
+  redirecting both `jump` and `brif` edges; blocks/values are renumbered.
+- Forwarders whose `nop` result is used outside are left alone. The entry block
+  is never collapsed.
+- Shared `cfg_util::{remove_blocks, remove_values}` moved out of `if_convert`.
+- `RirPass` order:
+  `simplify -> optimize -> div_test -> if_convert -> gvn -> optimize`.
+- Tests: 41/41 (6 div_test + 5 gvn + 7 if_convert + 15 ir + 8 simplify).
+- End-to-end: `pick` with `RAKIT_RIR=1 RAKIT_RIR_DEBUG=1` logs
+  `simplify fired` (dead block removed) then `if_convert fired`; output
+  `11 12 1`, identical to normal.
+
 ## Session (2026-11-23, Fase 2 step 8) — multi-value if_convert + local GVN
 - `if_convert` now handles joins/returns carrying any number of values
   (including zero), not just one. Two identical `if`s compile to a two-param

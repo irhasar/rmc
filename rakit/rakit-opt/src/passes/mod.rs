@@ -40,7 +40,12 @@ impl Pass for RirPass {
             }
             return false;
         };
-        let mut changed = rakit_ir::optimize(&mut rir_func);
+        let simplify_changed = rakit_ir::simplify::run(&mut rir_func);
+        let opt_changed = rakit_ir::optimize(&mut rir_func);
+        let mut changed = simplify_changed || opt_changed;
+        if debug && simplify_changed {
+            eprintln!("[rir] simplify fired");
+        }
         let div_changed = rakit_ir::div_test::run(&mut rir_func);
         if div_changed {
             rakit_ir::optimize(&mut rir_func);

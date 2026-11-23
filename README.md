@@ -95,8 +95,16 @@ RIR dan output tetap sama.
 Pass `gvn` (`rakit-ir/src/gvn.rs`) melakukan value numbering lokal: instruksi
 murni duplikat dalam satu blok diganti `Copy` ke hasil pertama. Key-nya adalah
 opcode + tipe + operand, sehingga tipe atau operand berbeda tidak pernah
-digabung. Pipeline RIR sekarang:
-`optimize → div_test → if_convert → gvn → optimize`.
+digabung.
+
+Pass `simplify` (`rakit-ir/src/simplify.rs`) membuang blok yang tidak
+terjangkau dari entry dan menggabungkan blok forwarder kosong
+(`nop*; jump target` tanpa parameter), dengan mengarahkan ulang edge `jump`
+maupun `brif`; blok dan nilai di-renumber. Forwarder yang hasil `nop`-nya
+dipakai di luar blok dibiarkan, dan blok entry tidak pernah dihapus.
+
+Pipeline RIR sekarang:
+`simplify → optimize → div_test → if_convert → gvn → optimize`.
 
 ## Build
 

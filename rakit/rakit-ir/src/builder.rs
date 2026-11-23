@@ -60,6 +60,12 @@ impl Builder {
         r
     }
 
+    pub fn nop(&mut self, b: Block, ty: Type) -> Value {
+        let r = self.new_value(ty);
+        self.push(b, Inst::Nop(r, ty));
+        r
+    }
+
     pub fn bin(&mut self, b: Block, op: BinOp, ty: Type, x: Value, y: Value) -> Value {
         let r = self.new_value(ty);
         self.push(b, Inst::Bin(r, op, ty, x, y));
