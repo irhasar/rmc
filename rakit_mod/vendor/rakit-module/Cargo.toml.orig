@@ -1,0 +1,32 @@
+[package]
+name = "rakit-module"
+version = "0.137.0"
+authors = ["The Rakit Project Developers"]
+description = "Support for linking functions and data with Rakit"
+repository = "https://github.com/bytecodealliance/wasmtime"
+documentation = "https://docs.rs/rakit-module"
+categories = ["no-std"]
+license = "Apache-2.0 WITH LLVM-exception"
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rakit-codegen = { workspace = true }
+rakit-control = { workspace = true }
+hashbrown = { workspace = true }
+anyhow = { workspace = true, features = ['std'] }
+serde = { workspace = true, optional = true }
+serde_derive = { workspace = true, optional = true }
+
+[features]
+default = ["std"]
+std = ["rakit-codegen/std"]
+# The "core" feature no longer does anything here either: hashbrown is now an
+# unconditional dependency. Kept, empty, for backward compatibility.
+core = []
+
+# For dependent crates that want to serialize some parts of rakit
+enable-serde = ["serde", "serde_derive", "rakit-codegen/enable-serde"]

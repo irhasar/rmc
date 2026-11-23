@@ -1,7 +1,8 @@
 #!/bin/bash
 set -u
-EXT=/workspace/project/extbench; BENCH=/workspace/project/bench
-M=/workspace/project/cg_clif_mod/dist/bin/rustc-clif
+EXT=$(cd "$(dirname "$0")" && pwd); ROOT=$(cd "$EXT/.." && pwd)
+BENCH=$ROOT/bench
+M=$ROOT/rakit_mod/dist/bin/rustc-rakit
 CRATES=$EXT/crateworks/crates; DRV=$EXT/drivers; OUT=$EXT/out_leafab; mkdir -p "$OUT"
 export PATH="$HOME/.cargo/bin:$PATH"
 cm(){ python3 "$BENCH/measure.py" --reps 5 --warmup 1 --json -- "$@" | python3 -c "import sys,json;d=json.load(sys.stdin);print('%.0f'%(d['wall_med']*1000))"; }
@@ -12,7 +13,7 @@ for spec in "${SPECS[@]}"; do
   IFS='|' read -r pkg dir cname drv args <<<"$spec"
   srcdir="$CRATES/$dir"; od="$OUT/$pkg"; rm -rf "$od"; mkdir -p "$od"
   echo "=== $pkg ==="
-  for cfg in "leaf_off|CG_CLIF_INLINE_LEAF_MAX=0" "leaf_on|"; do
+  for cfg in "leaf_off|RAKIT_INLINE_LEAF_MAX=0" "leaf_on|"; do
     lab=${cfg%%|*}; envs=${cfg#*|}
     cat > "$od/b.sh" <<EOF
 set -e

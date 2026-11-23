@@ -1,10 +1,10 @@
 #!/bin/bash
-# Build the modified cg_clif (binary + Cranelift-compiled std sysroot).
+# Build the modified Rakit backend (binary + Rakit-compiled std sysroot).
 #
-# Prerequisites: rustup toolchain nightly-2026-11-17 with rust-src and
-# llvm-tools, plus the build deps listed in cg_clif_mod/README.md.
+# Prerequisites: rustup toolchain nightly-2026-11-17 with rust-src, rustc-dev
+# and llvm-tools, plus the build deps listed in rakit_mod/Readme.md.
 set -eu
-cd "$(dirname "$0")/cg_clif_mod"
+cd "$(dirname "$0")/rakit_mod"
 export PATH="$HOME/.cargo/bin:$PATH"
-./y.sh build --sysroot clif
-echo "Done. Use dist/bin/rustc-clif (and its own sysroot) for the modified backend."
+./y.sh build --sysroot rakit
+echo "Done. Use dist/bin/rustc-rakit (and its own sysroot) for the modified backend."

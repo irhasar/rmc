@@ -1,12 +1,12 @@
 #!/bin/bash
-# 3-way runtime + size + compile comparison: LLVM vs upstream cg_clif vs modified.
+# 3-way runtime + size + compile comparison: LLVM vs cg_clif upstream vs modified.
 set -u
 BENCH=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(dirname "$BENCH")
 N=nightly-2026-11-17
 L="rustc +$N"
 U="$ROOT/cg_clif_upstream/dist/bin/rustc-clif"
-M="$ROOT/cg_clif_mod/dist/bin/rustc-clif"
+M="$ROOT/rakit_mod/dist/bin/rustc-rakit"
 P="$BENCH/progs"
 D=/tmp/cmp3; mkdir -p $D
 printf "%-10s %8s %8s %8s | %8s %8s %8s | %8s %8s %8s\n" prog Lrun Urun Mrun Lsz Usz Msz Lcpl Ucpl Mcpl

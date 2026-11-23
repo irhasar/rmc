@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build + run 3 real crates from github.com/cipansor/crateworks with three
-# backends: L = rustc+LLVM, U = cg_clif upstream, M = cg_clif modified.
+# backends: L = rustc+LLVM, U = cg_clif upstream, M = Rakit modified.
 #
 # Each crate is built as a lib, then a small driver is linked against it and run.
 # Measures compile (wall/cpu/peakRSS), artifact size, and run (wall/cpu/RSS).
@@ -10,7 +10,7 @@ BENCH=${BENCH_DIR:-$EXT/../bench}
 N=nightly-2026-11-17
 RUSTC_L="rustc +$N"
 RUSTC_U=${RUSTC_U:-$EXT/../cg_clif_upstream/dist/bin/rustc-clif}
-RUSTC_M=${RUSTC_M:-$EXT/../cg_clif_mod/dist/bin/rustc-clif}
+RUSTC_M=${RUSTC_M:-$EXT/../rakit_mod/dist/bin/rustc-rakit}
 CRATES=${CRATEWORKS:-$EXT/crateworks}/crates
 DRV=$EXT/drivers
 OUT=$EXT/out; mkdir -p "$OUT"
@@ -28,7 +28,7 @@ SPECS=(
 
 declare -A RUSTC=( [L]="$RUSTC_L" [U]="$RUSTC_U" [M]="$RUSTC_M" )
 
-echo "backend: L=rustc+LLVM  U=cg_clif upstream  M=cg_clif modified"
+echo "backend: L=rustc+LLVM  U=cg_clif upstream  M=Rakit modified"
 printf '%-18s %-2s | %6s %6s %7s %10s | %7s %7s %7s | %s\n' \
   crate bk Cwall Ccpu Crss "size(rlib+bin)" Rwall Rcpu Rrss out
 printf '%s\n' "-----------------------------------------------------------------------------------------------------"

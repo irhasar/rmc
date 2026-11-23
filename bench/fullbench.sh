@@ -3,7 +3,7 @@
 set -u
 BENCH=$(cd "$(dirname "$0")" && pwd); ROOT=$(dirname "$BENCH")
 N=nightly-2026-11-17
-L="rustc +$N"; U="$ROOT/cg_clif_upstream/dist/bin/rustc-clif"; M="$ROOT/cg_clif_mod/dist/bin/rustc-clif"
+L="rustc +$N"; U="$ROOT/cg_clif_upstream/dist/bin/rustc-clif"; M="$ROOT/rakit_mod/dist/bin/rustc-rakit"
 P="$BENCH/progs"; D=/tmp/fb; mkdir -p $D
 RC=${RC:-7}; RR=${RR:-9}
 jf() { python3 -c "import sys,json;d=json.load(sys.stdin);print('%.1f %.1f %d'%(d['wall_med']*1000,d['cpu_med']*1000,d['maxrss_med_kb']/1024))"; }

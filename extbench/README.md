@@ -30,15 +30,15 @@ CREPS=3 RREPS=5 ./extbench.sh     # compile + run, tiga backend
 
 Backend: `L` = `rustc +nightly-2026-11-17` (LLVM), `U` = cg_clif upstream
 (`../cg_clif_upstream/dist/bin/rustc-clif`), `M` = fork modifikasi
-(`../cg_clif_mod/dist/bin/rustc-clif`).
+(`../rakit_mod/dist/bin/rustc-rakit`).
 
 Direktori `dist/` tidak ikut masuk repo (hasil build). Bangun dulu lewat
-`../build.sh` (untuk `cg_clif_mod`) dan build yang sama untuk `cg_clif_upstream`,
+`../build.sh` (untuk `rakit_mod`) dan build yang sama untuk `cg_clif_upstream`,
 atau arahkan lewat variabel lingkungan:
 
 ```
 RUSTC_U=/path/ke/cg_clif_upstream/dist/bin/rustc-clif \
-RUSTC_M=/path/ke/cg_clif_mod/dist/bin/rustc-clif \
+RUSTC_M=/path/ke/rakit_mod/dist/bin/rustc-rakit \
 CRATEWORKS=/path/ke/crateworks \
 BENCH_DIR=/path/ke/bench \
   ./extbench.sh

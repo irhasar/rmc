@@ -1,7 +1,7 @@
 #!/bin/bash
 # Three-way benchmark on a real dependency-heavy crate.
 #
-#   L = rustc + LLVM          U = cg_clif upstream          M = cg_clif modified
+#   L = rustc + LLVM          U = cg_clif upstream          M = Rakit modified
 #
 # Build cost is measured over the whole cargo process tree (treemeasure.py):
 # cargo's rustc children are where the time and memory actually go, and a
@@ -11,7 +11,7 @@
 # outside the timed region; measuring a warm dir reports cargo's cache hit
 # (~0.1s), not the backend.
 #
-# LTO is forced off for every backend: cg_clif rejects it outright, so leaving
+# LTO is forced off for every backend: rakit rejects it outright, so leaving
 # it on for L would compare two different builds, not two backends.
 #
 # Usage: ./cratebench.sh <srcdir> [workload-file] [bin-name]
@@ -28,8 +28,8 @@ export CARGO_PROFILE_RELEASE_LTO=false
 
 declare -A BIN=(
   [L]="$HOME/.cargo/bin/cargo"
-  [U]="/workspace/project/cg_clif_upstream/dist/bin/cargo-clif"
-  [M]="/workspace/project/cg_clif_mod/dist/bin/cargo-clif"
+  [U]="$EXT/../cg_clif_upstream/dist/bin/cargo-clif"
+  [M]="$EXT/../rakit_mod/dist/bin/cargo-rakit"
 )
 declare -A TDIR=( [L]=target-bL [U]=target-bU [M]=target-bM )
 
@@ -44,7 +44,7 @@ printf '%s\n' "-----------------------------------------------------------------
 
 for bk in L U M; do
   t="$SRC/${TDIR[$bk]}"
-  sub=$( [ "$bk" = L ] && echo "build" || echo "clif build" )
+  sub=$( [ "$bk" = L ] && echo "build" || echo "rakit build" )
   walls=(); cpus=(); rsss=()
   for _ in $(seq "$CREPS"); do
     rm -rf "$t"

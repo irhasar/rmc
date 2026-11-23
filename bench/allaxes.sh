@@ -1,5 +1,5 @@
 #!/bin/bash
-# All-axes 3-way comparison: LLVM vs cg_clif upstream vs cg_clif modified.
+# All-axes 3-way comparison: LLVM vs cg_clif upstream vs Rakit modified.
 #
 # Axes measured:
 #   compile : wall, cpu (user+sys), peak RSS, artifact size
@@ -14,7 +14,7 @@ OUT="$BENCH/out/allaxes"; mkdir -p "$OUT"
 N=nightly-2026-11-17
 RUSTC_LLVM="rustc +$N"
 CG_UP="$ROOT/cg_clif_upstream/dist/bin/rustc-clif"
-CG_MOD="$ROOT/cg_clif_mod/dist/bin/rustc-clif"
+CG_MOD="$ROOT/rakit_mod/dist/bin/rustc-rakit"
 CREPS=${CREPS:-3}
 RREPS=${RREPS:-5}
 

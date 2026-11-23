@@ -1,5 +1,5 @@
 #!/bin/bash
-# Three-way comparison: LLVM backend vs upstream cg_clif vs modified cg_clif.
+# Three-way comparison: LLVM backend vs cg_clif upstream vs modified Rakit.
 #
 # For each (backend, program) pair we measure:
 #   * compile wall / cpu / peak RSS
@@ -8,7 +8,7 @@
 #
 # Two sysroot configurations are exercised so that the backend can be isolated
 # from the standard library it links against:
-#   - "own":  the cg_clif build's own Cranelift-compiled std
+#   - "own":  the backend's own compiled std
 #   - "llvm": the stock LLVM-compiled std, via --sysroot
 set -u
 
@@ -20,7 +20,7 @@ mkdir -p "$OUT"
 NIGHTLY=nightly-2026-11-17
 RUSTC_LLVM="rustc +$NIGHTLY"
 CG_UP="$(cd "$(dirname "$0")/.." && pwd)/cg_clif_upstream/dist/bin/rustc-clif"
-CG_MOD="$(cd "$(dirname "$0")/.." && pwd)/cg_clif_mod/dist/bin/rustc-clif"
+CG_MOD="$(cd "$(dirname "$0")/.." && pwd)/rakit_mod/dist/bin/rustc-rakit"
 LLVM_SYSROOT=$(rustc +$NIGHTLY --print sysroot)
 
 REPS_COMPILE=${REPS_COMPILE:-3}
@@ -65,9 +65,9 @@ echo "### LLVM (stock rustc $NIGHTLY)"
 run_backend llvm "" $RUSTC_LLVM
 echo "### cg_clif upstream (own Cranelift std)"
 run_backend cgclif_up "" $CG_UP
-echo "### cg_clif modified (own Cranelift std)"
-run_backend cgclif_mod "" $CG_MOD
+echo "### Rakit modified (own Rakit std)"
+run_backend rakit_mod "" $CG_MOD
 echo "### cg_clif upstream + LLVM std (isolates backend)"
 run_backend cgclif_up_llvmstd "$LLVM_SYSROOT" $CG_UP
-echo "### cg_clif modified + LLVM std (isolates backend)"
-run_backend cgclif_mod_llvmstd "$LLVM_SYSROOT" $CG_MOD
+echo "### Rakit modified + LLVM std (isolates backend)"
+run_backend rakit_mod_llvmstd "$LLVM_SYSROOT" $CG_MOD

@@ -1,38 +1,38 @@
-# Cranelift vs LLVM: Ukuran, Waktu Compile, dan Performa Runtime
+# Rakit vs LLVM: Ukuran, Waktu Compile, dan Performa Runtime
 
 Ringkasan eksperimen membandingkan tiga backend codegen Rust pada
 `nightly-2026-11-17`, x86_64-unknown-linux-gnu, opt-level=3, debuginfo=0:
 
 1. **LLVM** — `rustc` bawaan
 2. **cg_clif upstream** — commit `42ac63e`
-3. **cg_clif modifikasi** — fork dengan patch di direktori ini
+3. **rakit modifikasi** — fork dengan patch di direktori ini
 
 Semua output program identik di ketiga backend (diverifikasi), jadi
 perbandingan mengukur kualitas codegen saja, bukan semantik.
 
 ## 1. Fakta lisensi
 
-Cranelift dilisensikan **Apache-2.0 WITH LLVM-exception**
-(`cranelift-object-0.137.0/Cargo.toml`: `license = "Apache-2.0 WITH LLVM-exception"`).
+Rakit dilisensikan **Apache-2.0 WITH LLVM-exception**
+(`rakit-object-0.137.0/Cargo.toml`: `license = "Apache-2.0 WITH LLVM-exception"`).
 Artinya:
 
 - Bebas dipakai, dimodifikasi, dan didistribusikan, termasuk untuk komersial.
 - Klausa *LLVM-exception* menghapus kewajiban menyingkap source code saat
   didistribusikan sebagai bagian dari binary.
-- Karena itu rombak total / restruktur / refaktor Cranelift **boleh** dilakukan.
+- Karena itu rombak total / restruktur / refaktor Rakit **boleh** dilakukan.
   Satu-satunya kewajiban praktis: pertahankan notice lisensi dan cantumkan
   perubahan bila mendistribusikan source yang dimodifikasi.
 
-cg_clif sendiri memakai lisensi MIT/Apache-2.0 (`LICENSE-MIT`, `LICENSE-APACHE`),
+rakit sendiri memakai lisensi MIT/Apache-2.0 (`LICENSE-MIT`, `LICENSE-APACHE`),
 dan merupakan proyek *experimental*, jadi API internalnya bebas diubah.
 
 ## 2. Modifikasi yang diterapkan
 
-Dua akar masalah ukuran berasal dari `cranelift-object` yang menamai setiap
+Dua akar masalah ukuran berasal dari `rakit-object` yang menamai setiap
 fungsi/data dengan nama section yang **sama**. Linker menggabungkannya menjadi
 satu section raksasa, sehingga `--gc-sections` tidak bisa membuang kode mati.
 
-### Patch 1 — `vendor/cranelift-object-0.137.0/src/backend.rs`
+### Patch 1 — `vendor/rakit-object-0.137.0/src/backend.rs`
 
 `ObjectModule` menaruh semua fungsi ke section `.text.subsection` dan semua data
 ke `.data.rel.ro.subsection`. Diubah agar tiap objek mendapat nama section unik
@@ -63,7 +63,7 @@ Program kosong (`fn main(){}`), `-C opt-level=3 -C debuginfo=0`:
 |---|---:|---:|---:|
 | LLVM | 4.601.928 | 332.608 | 553 |
 | cg_clif upstream | 5.806.280 | 1.837.352 | 4.142 |
-| **cg_clif modifikasi** | **4.902.480** | **1.350.448** | **3.258** |
+| **rakit modifikasi** | **4.902.480** | **1.350.448** | **3.258** |
 
 Program nyata `p2_mem`:
 
@@ -71,7 +71,7 @@ Program nyata `p2_mem`:
 |---|---:|---:|
 | LLVM | 4.639.888 | 356.608 |
 | cg_clif upstream | 5.936.880 | 1.918.656 |
-| **cg_clif modifikasi** | **5.058.368** | **1.446.968** |
+| **rakit modifikasi** | **5.058.368** | **1.446.968** |
 
 **Perbaikan:** −904 KB (−15,6%) pada program kosong, −878 KB (−14,8%) pada
 `p2_mem`, dan −487 KB (−26,5%) setelah di-strip. Selisih terhadap LLVM menyusut
@@ -82,17 +82,17 @@ Rincian section (program kosong): `.data.rel.ro` turun dari 85.416 → 31.176 by
 
 ## 4. Hasil: waktu compile
 
-Median wall / CPU / peak RSS. cg_clif **lebih cepat dan lebih hemat memori**
+Median wall / CPU / peak RSS. rakit **lebih cepat dan lebih hemat memori**
 saat mengompilasi dibanding LLVM, karena tidak ada pipeline optimisasi berat:
 
-| Program | LLVM (wall/cpu/RSS) | cg_clif up | cg_clif mod |
+| Program | LLVM (wall/cpu/RSS) | rakit up | rakit mod |
 |---|---|---:|---:|
 | p1_arith | 88 / 107 / 106 MB | 80 / 101 / 109 MB | 85 / 111 / 109 MB |
 | p2_mem | 250 / 382 / 134 MB | 140 / 191 / 132 MB | 137 / 182 / 133 MB |
 | p3_calls | 101 / 123 / 116 MB | 88 / 112 / 118 MB | 87 / 116 / 118 MB |
 | p4_simd | 114 / 135 / 117 MB | 95 / 118 / 118 MB | 94 / 124 / 118 MB |
 
-cg_clif mengompilasi ~20–45% lebih cepat dari LLVM. Patch saya tidak menambah
+rakit mengompilasi ~20–45% lebih cepat dari LLVM. Patch saya tidak menambah
 waktu compile berarti (bahkan sedikit lebih cepat pada p2/p3/p4). Peak RSS
 hampir sama; LLVM sedikit lebih hemat pada p1_arith.
 
@@ -100,32 +100,32 @@ hampir sama; LLVM sedikit lebih hemat pada p1_arith.
 
 Median wall (ms), program dijalankan 5×:
 
-| Program | LLVM | cg_clif up | cg_clif mod |
+| Program | LLVM | rakit up | rakit mod |
 |---|---:|---:|---:|
 | p1_arith | 82 | 108 | 108 |
 | p2_mem | **17** | 155 | 156 |
 | p3_calls | **37** | 118 | 116 |
 | p4_simd | **57** | 157 | 156 |
 
-cg_clif **1,3×–9× lebih lambat** dari LLVM. Patch ukuran tidak mengubah
+rakit **1,3×–9× lebih lambat** dari LLVM. Patch ukuran tidak mengubah
 kecepatan runtime (sesuai harapan — hanya membuang kode mati).
 
 ### Akar penyebab runtime (tiga lapis)
 
-**Lapis 1 — tidak ada inlining.** Cranelift menyediakan infrastruktur inlining
+**Lapis 1 — tidak ada inlining.** Rakit menyediakan infrastruktur inlining
 (`Context::inline`, trait `Inline`) tetapi **tidak memanggilnya sendiri**.
-Docstring-nya menyebut `cg_clif` secara eksplisit sebagai embedder yang harus
-menyediakan heuristik inlining. cg_clif saat ini tidak mengimplementasikannya.
+Docstring-nya menyebut `rakit` secara eksplisit sebagai embedder yang harus
+menyediakan heuristik inlining. rakit saat ini tidak mengimplementasikannya.
 
 Bukti terarah (`add3` ditandai `#[inline(always)]`, loop 300 juta iterasi):
 
 | Backend | ukuran `main` | `add3` di-inline? | waktu jalan |
 |---|---:|---|---:|
 | LLVM | 39 byte | ya | **58 ms** |
-| cg_clif up | 32 byte | tidak | 894 ms |
-| cg_clif mod | 32 byte | tidak | 896 ms |
+| rakit up | 32 byte | tidak | 894 ms |
+| rakit mod | 32 byte | tidak | 896 ms |
 
-**Lapis 2 — MIR inliner rustc mati untuk cg_clif.** Menyalakan
+**Lapis 2 — MIR inliner rustc mati untuk rakit.** Menyalakan
 `-Zinline-mir=yes` membuat `main` tumbuh 32 → 211 byte (fungsi benar-benar
 di-inline), tetapi runtime **tidak berubah** (896 ms). Artinya setelah inlining
 pun masih ada hambatan lain.
@@ -134,7 +134,7 @@ pun masih ada hambatan lain.
 (`while i < 300_000_000 { acc = acc.add(i).mul(3); i += 1 }`) menghasilkan:
 
 ```asm
-; cg_clif — 6 instruksi/iterasi, akumulator di stack, rantai dependen
+; rakit — 6 instruksi/iterasi, akumulator di stack, rantai dependen
 4a208: mov %rcx,%rdx
 4a20b: add (%rax),%rdx     ; LOAD acc dari stack
 4a20e: imul $0x3,%rdx,%rdx
@@ -144,36 +144,36 @@ pun masih ada hambatan lain.
 ```
 
 LLVM sebaliknya meng-unroll 3×, menaruh semua nilai di register, dan memecah
-rantai dependensi menjadi beberapa accumulator (ILP). Akibatnya loop cg_clif
+rantai dependensi menjadi beberapa accumulator (ILP). Akibatnya loop rakit
 *latency-bound* (~10 siklus/iterasi) sementara LLVM *throughput-bound*
 (~0,6 siklus/iterasi) — selisih 15× pada kernel ini, dan menjelaskan 2–9× pada
 program benchmark.
 
 Ringkasnya: LLVM melakukan inlining + unrolling + promosi lokal ke register +
-strength reduction; cg_clif tidak melakukan keempatnya. Ini gap arsitektural
+strength reduction; rakit tidak melakukan keempatnya. Ini gap arsitektural
 codegen, bukan satu bug.
 
-**Konfirmasi isolasi:** ketika cg_clif ditautkan ke std yang dibangun LLVM
+**Konfirmasi isolasi:** ketika rakit ditautkan ke std yang dibangun LLVM
 (`--sysroot` ke sysroot nightly), ukuran binary-nya menjadi **4.604.376 byte** —
 praktis sama dengan LLVM (4.609.368 byte) — tetapi runtime-nya tetap ~900 ms
-pada p5/p6. Jadi selisih ukuran berasal dari std yang dikompilasi Cranelift,
+pada p5/p6. Jadi selisih ukuran berasal dari std yang dikompilasi Rakit,
 sedangkan selisih runtime murni berasal dari codegen backend.
 
 ## 6. Peluang optimisasi (prioritas)
 
-1. **Implementasikan trait `Inline` di cg_clif** — diminta langsung oleh API
-   Cranelift, dan prasyarat untuk semua optimisasi berikutnya. Heuristik bisa
+1. **Implementasikan trait `Inline` di rakit** — diminta langsung oleh API
+   Rakit, dan prasyarat untuk semua optimisasi berikutnya. Heuristik bisa
    memakai anotasi rustc (`#[inline(always)]`, `#[inline]`), ukuran callee, dan
    `mir_opt_level`. Tanpa ini, inlining lintas fungsi tidak terjadi.
 2. **Promosikan lokal MIR ke register (SROA/register promotion)** — penyebab
    langsung loop 15× lebih lambat. Variabel `acc` di MIR adalah slot memori dan
    saat ini tetap dibaca/tulis ke stack tiap iterasi. Meski bukan tugas
-   cg_clif, CLIF perlu pass yang mengenali slot lokal dan mempromosikannya.
+   rakit, RAKIT perlu pass yang mengenali slot lokal dan mempromosikannya.
 3. **Unrolling + ILP** — untuk loop numerik, pecah rantai dependensi menjadi
    beberapa accumulator dan unroll beberapa iterasi.
-4. **Perbaiki penamaan section di `cranelift-object` upstream** — patch saya
+4. **Perbaiki penamaan section di `rakit-object` upstream** — patch saya
    sebaiknya diajukan sebagai PR; menguntungkan semua embedder (Wasmtime,
-   cg_clif) karena `--gc-sections` jadi berfungsi.
+   rakit) karena `--gc-sections` jadi berfungsi.
 5. **Aktifkan `per_data_object_section(true)`** — perbaikan satu baris dengan
    hasil −13% ukuran.
 6. **Hapus kode backtrace mati** — kode backtrace (`gimli`, `addr2line`,
@@ -181,7 +181,7 @@ sedangkan selisih runtime murni berasal dari codegen backend.
    modifikasi (638 KB dari 1.063 KB) karena banyak fungsi kecil tidak pernah
    di-inline. Dengan inlining (poin 1) fungsi yang tidak terpakai otomatis
    hilang; alternatifnya `-Zbuild-std` dengan `panic_immediate_abort`.
-7. **Pertimbangkan `opt_level` Cranelift** — saat ini cg_clif selalu memakai
+7. **Pertimbangkan `opt_level` Rakit** — saat ini rakit selalu memakai
    `speed_and_size`; pada versi ini nilainya tidak mengubah hasil dibanding
    `speed`, jadi bukan lever. `-Zinline-mir=yes` juga terbukti tidak membantu
    tanpa poin 2 dan 3.
@@ -201,7 +201,7 @@ Artefak: `bench/out/<label>/<prog>`, log di `/tmp/compare3.log`,
 
 ## 8. Status implementasi rekomendasi (revisi terakhir)
 
-Rekomendasi 1–3 dikerjakan di fork lokal `cg_clif_mod`; rekomendasi 4 tidak
+Rekomendasi 1–3 dikerjakan di fork lokal `rakit_mod`; rekomendasi 4 tidak
 dikerjakan (milik repo resmi).
 
 ### 8.1 SROA (rekomendasi 2) — LANDED, `7ddf2d4`
@@ -220,18 +220,18 @@ p2_mem tetap benar dan tidak regresi. Pembatasan ke *shared borrow* penting:
 memperluas ke `&mut`/`RawPtr` (dengan redirect `local_map`) menghasilkan
 **salah hitung** (p1/p3/p4), jadi sengaja tidak dilakukan.
 
-### 8.2 Inliner CLIF (rekomendasi 1) — LANDED, `2ddb545`
+### 8.2 Inliner RAKIT (rekomendasi 1) — LANDED, `2ddb545`
 
 `src/inliner.rs`: inliner per-CGU yang meng-inline callee kecil (≤64 instruksi
-CLIF) dan *final* (tidak interposable) dengan budget 512 instruksi per caller.
+RAKIT) dan *final* (tidak interposable) dengan budget 512 instruksi per caller.
 Pengaman: tidak meng-inline diri sendiri, tiap callee paling banyak sekali per
 caller, dan **melewati callee yang mereferensi `global_values`** — `inline_one`
-Cranelift tidak me-remap global value (TLS) dengan benar sehingga object file
+Rakit tidak me-remap global value (TLS) dengan benar sehingga object file
 gagal link (`R_X86_64_TLSGD out of range`).
 
 Status: benar dan aktif (terbukti menyusutkan jumlah simbol dengan
 `-Zinline-mir=off`), tetapi **netral** terhadap ukuran/kecepatan karena MIR
-inlining sudah meng-inline helper kecil yang jadi sasarannya. `CG_CLIF_INLINE_MAX=0`
+inlining sudah meng-inline helper kecil yang jadi sasarannya. `RAKIT_INLINE_MAX=0`
 mematikannya (knob untuk bisect).
 
 ### 8.3 Loop unrolling (rekomendasi 3) — LANDED, `9ea4bbe`
@@ -239,7 +239,7 @@ mematikannya (knob untuk bisect).
 Gap runtime yang tersisa (356 ms vs 58 ms LLVM) berasal dari **reassociasi
 affine**: LLVM tidak sekadar meng-unroll loop panas p5/p6, tetapi juga
 mengubah bentuk perhitungan akumulatornya menjadi beberapa perkalian
-independen (rantai dependensi loop-carried dipendekkan). Cranelift tidak punya
+independen (rantai dependensi loop-carried dipendekkan). Rakit tidak punya
 pass loop apa pun, jadi ini perlu ditulis.
 
 `src/unroll.rs` mengimplementasikan dua transformasi:
@@ -264,7 +264,7 @@ pass loop apa pun, jadi ini perlu ditulis.
    op `iconst`/`iadd`/`imul` (satu sisi konstan) yang dimodelkan; memory
    access, call, atau op lain membatalkan rewrite (aman).
 
-2. **Unroll duplikasi body (fallback, mati kecuali `CG_CLIF_UNROLL_CLONE`).**
+2. **Unroll duplikasi body (fallback, mati kecuali `RAKIT_UNROLL_CLONE`).**
    Menggandakan body `k-1` kali dan menyambungnya. Terbukti **benar tapi lebih
    lambat** (357→423 ms pada p6): menggandakan body tidak memendekkan rantai
    dependensi. Ini mengonfirmasi bahwa lever sesungguhnya adalah reassociasi,
@@ -336,14 +336,14 @@ Ringkas: terhadap cg_clif upstream, modifikasi ini memberi **−15% ukuran**,
 tidak menambah waktu compile. Gap yang masih ada pada p2–p5 berasal dari
 inlining lintas-CGU dan promosi memori yang belum lengkap, bukan dari loop.
 
-Compile time ketiga backend praktis setara (~90–180 ms); cg_clif tidak lebih
+Compile time ketiga backend praktis setara (~90–180 ms); rakit tidak lebih
 lambat, hanya masih lebih besar dan (pada p2–p5) lebih lambat saat dijalankan.
 
 ### 8.6 Store→load forwarding stack-slot (rekomendasi 2, lanjutan) — LANDED
 
-`src/store_forward.rs` menutup sisa gap p5/p6. Akar masalahnya: cg_clif
+`src/store_forward.rs` menutup sisa gap p5/p6. Akar masalahnya: rakit
 mematerialisasi agregat (`Option<u64>`, header iterator, tuple) ke stack slot
-eksplisit, dan Cranelift **hanya** value-numbering load yang `readonly`+`notrap`
+eksplisit, dan Rakit **hanya** value-numbering load yang `readonly`+`notrap`
 +`can_move`; store ke stack slot eksplisit bukan `readonly`, jadi pasangan
 `store`/`load` bertahan sampai kode mesin. Di dalam loop, load itu masuk ke
 rantai dependensi ter-carried.
@@ -362,7 +362,7 @@ menolak body yang masih menyentuh memori. Tanpa itu, round-trip store/load
 memblokir unrolling.
 
 Verifikasi: seluruh standard library dikompilasi ulang dengan pass aktif
-(`./y.sh build --sysroot clif`) dan keenam program menghasilkan keluaran
+(`./y.sh build --sysroot rakit`) dan keenam program menghasilkan keluaran
 identik dengan LLVM.
 
 | prog | up run | mod run (sebelum) | mod run (sesudah) |
@@ -370,7 +370,7 @@ identik dengan LLVM.
 | p5_inline | 894 ms | 356 ms | **61 ms** |
 | p6_scalar | 898 ms | 356 ms | **61 ms** |
 
-Knob: `CG_CLIF_NO_STORE_FWD`.
+Knob: `RAKIT_NO_STORE_FWD`.
 
 ### 8.7 Hasil akhir (opt-level=3, semua keluaran identik dengan LLVM)
 
@@ -386,7 +386,7 @@ Knob: `CG_CLIF_NO_STORE_FWD`.
 Ringkas terhadap cg_clif upstream: **−26% ukuran**, **runtime setara LLVM pada
 kernel skalar (p5/p6: ~895 → 61 ms, ~15×)**, compile time tidak bertambah. Gap
 yang tersisa pada p1–p4 (1,3×–6×) berasal dari **autovectorization dan
-inlining lintas-CGU Cranelift**, yang tidak bisa diperbaiki dari sisi cg_clif
+inlining lintas-CGU Rakit**, yang tidak bisa diperbaiki dari sisi rakit
 (sudah diuji: `-C target-cpu=native` tidak menutupnya).
 
 ### 8.8 Penurunan SIMD integer dengan instruksi vektor
@@ -395,9 +395,9 @@ Akar masalah runtime p2_mem: `src/intrinsics/simd.rs` men-skalarisasi setiap
 perbandingan SIMD integer (`simd_eq/ne/lt/le/gt/ge`) menjadi loop per-lane
 (load i8 → `icmp` → `bmask` → store, 16 kali untuk `u8x16`), dan
 `simd_bitmask` menjadi loop shift/or per-lane. Akibatnya `_mm_cmpeq_epi8`
-menghasilkan ±155 instruksi CLIF dan tidak pernah masuk batas inliner.
+menghasilkan ±155 instruksi RAKIT dan tidak pernah masuk batas inliner.
 
-Cranelift x64 sudah bisa menurunkan `icmp` 128-bit integer menjadi satu
+Rakit x64 sudah bisa menurunkan `icmp` 128-bit integer menjadi satu
 `pcmpeq*`/`pcmpgt*` (`isa/x64/lower.isle`) dan `vhigh_bits` menjadi `pmovmskb`.
 Perbaikan:
 
@@ -412,15 +412,15 @@ Perbaikan:
    ditulis ke lokal (`write_cvalue`), menghapus round-trip store/load yang
    membungkus setiap op SIMD.
 
-Hasil pada p2_mem: body `_mm_cmpeq_epi8` mengecil 155→34 instruksi CLIF dan
+Hasil pada p2_mem: body `_mm_cmpeq_epi8` mengecil 155→34 instruksi RAKIT dan
 `_mm_movemask_epi8` 255→23; `_mm_cmpeq_epi8` kini menjadi satu `pcmpeqb`.
 Runtime p2_mem **159 ms (upstream) → 110 ms**. Kebenaran diverifikasi dengan uji
 17 kasus (semua tipe lane integer + float, semua perbandingan, `to_bitmask`) yang
 keluarannya identik dengan LLVM.
 
-Sisa gap p2/p4 berasal dari inlining lintas-CGU Cranelift (helper `memchr` /
+Sisa gap p2/p4 berasal dari inlining lintas-CGU Rakit (helper `memchr` /
 `hashbrown` masih keluar dari baris) dan ketiadaan autovectorization di
-Cranelift — keduanya di luar jangkauan perubahan sisi cg_clif ini.
+Rakit — keduanya di luar jangkauan perubahan sisi rakit ini.
 
 ### 8.9 Konstanta SIMD `vconst` dan forwarding store vektor lintas tipe
 
@@ -433,26 +433,26 @@ pada keenam program bench dan uji SIMD 17 kasus.
    *anonymous global* + `load`. Sekarang diturunkan ke satu `vconst`. Efek
    gandanya penting: selain menghapus satu round-trip memori di jalur panas,
    `vconst` tidak membawa `GlobalValueData::Symbol`, dan *symbol* itulah yang
-   memblokir inliner Cranelift (inliner tidak me-*remap* indeks `ExternalName`).
+   memblokir inliner Rakit (inliner tidak me-*remap* indeks `ExternalName`).
    Situs pemanggilan `_mm_*` di `p2_mem` turun **31 → 3** (sisa 3 berada di
    `hashbrown::find_inner`, lintas-CGU).
 
 2. **Penyalinan nilai SIMD 128-bit lewat by-ref → satu load/store vektor**
    (`0e6c2f0`). Menulis nilai SIMD 128-bit by-ref ke place memori jatuh ke
    `emit_small_memory_copy`, yang memecah 16 byte menjadi dua `load.i64` + dua
-   `store.i64`. Karena cg_clif melewatkan setiap op SIMD lewat stack slot, biaya
+   `store.i64`. Karena rakit melewatkan setiap op SIMD lewat stack slot, biaya
    ini dibayar per operasi; bitcast `__m128i → Simd<i8, 16>` saja menjadi
    1 store + 2 load + 2 store. Sekarang dipakai satu load dan satu store vektor
    16 byte. Vektor yang lebih lebar (`__m256i` tanpa AVX) tidak punya store
    tunggal, jadi tetap memakai `memcpy`.
 
 3. **Store→load forwarding tipe vektor beda lane, ukuran sama** (`8ff4779`).
-   Pass forwarding hanya mencocokkan load ke store bila tipe CLIF-nya persis
+   Pass forwarding hanya mencocokkan load ke store bila tipe RAKIT-nya persis
    sama. Sebuah bitcast SIMD (`__m128i ↔ Simd<i8, 16>`) justru dikompilasi
    sebagai store dengan satu tipe lane dan load dengan tipe lane lain, sehingga
    round-trip itu bertahan sampai kode mesin. Bila ukuran byte sama dan kedua
    tipe vektor, nilai store diteruskan lewat satu instruksi `bitcast`. Endianness
-   target diambil dari ISA dan diberikan ke flag `bitcast` (verifier Cranelift
+   target diambil dari ISA dan diberikan ke flag `bitcast` (verifier Rakit
    mewajibkan endianness eksplisit bila jumlah lane berbeda).
 
 Hasil pada `p2_mem`: runtime **110 → 99 ms** (LLVM 17 ms); ukuran **4.41 MB**
@@ -463,15 +463,15 @@ Hasil pada `p2_mem`: runtime **110 → 99 ms** (LLVM 17 ms); ukuran **4.41 MB**
 
 | Env | Default | Efek |
 |-----|---------|------|
-| `CG_CLIF_UNROLL` | 8 | faktor reassociasi (1 = mati) |
-| `CG_CLIF_UNROLL_CLONE` | unset | aktifkan unroll duplikasi-body (fallback) |
-| `CG_CLIF_INLINE_MAX` | 64 | batas instruksi callee untuk inliner (0 = mati) |
-| `CG_CLIF_INLINE_USES` | 3 | maksimum berapa kali satu callee boleh di-inline ke satu caller |
-| `CG_CLIF_NO_STORE_FWD` | unset | matikan store→load forwarding |
-| `CG_CLIF_PASS_TIME` | unset | cetak waktu per-pass cg_clif (store_forward/unroll/inline/collect) |
-| `CG_CLIF_CLIF_TIME` | unset | cetak waktu per-pass internal Cranelift |
-| `CG_CLIF_SF_NO_CBE` | unset | matikan dataflow store-forwarding lintas blok |
-| `CG_CLIF_SF_CBE_MAX` | 300 | batas instruksi fungsi agar CBE dijalankan |
+| `RAKIT_UNROLL` | 8 | faktor reassociasi (1 = mati) |
+| `RAKIT_UNROLL_CLONE` | unset | aktifkan unroll duplikasi-body (fallback) |
+| `RAKIT_INLINE_MAX` | 64 | batas instruksi callee untuk inliner (0 = mati) |
+| `RAKIT_INLINE_USES` | 3 | maksimum berapa kali satu callee boleh di-inline ke satu caller |
+| `RAKIT_NO_STORE_FWD` | unset | matikan store→load forwarding |
+| `RAKIT_PASS_TIME` | unset | cetak waktu per-pass rakit (store_forward/unroll/inline/collect) |
+| `RAKIT_IR_TIME` | unset | cetak waktu per-pass internal Rakit |
+| `RAKIT_SF_NO_CBE` | unset | matikan dataflow store-forwarding lintas blok |
+| `RAKIT_SF_CBE_MAX` | 300 | batas instruksi fungsi agar CBE dijalankan |
 
 ### 8.11 Inliner callee yang mereferensi global (revisi ini) — LANDED, `c2e292b`
 
@@ -480,14 +480,14 @@ peluang terbesar: `core::hash::sip` dan closure `partition_lomuto_branchless_cyc
 dari `slice::sort_unstable` semuanya mereferensi simbol (konstanta/static),
 sehingga tidak pernah di-inline.
 
-Akar masalahnya ada di **Cranelift**, bukan cg_clif: `create_global_values`
+Akar masalahnya ada di **Rakit**, bukan rakit: `create_global_values`
 menyalin `GlobalValueData` apa adanya, termasuk `GlobalValueData::Symbol` yang
 `ExternalName`-nya mengindeks tabel `user_named_funcs`/`ext_funcs` milik
 **callee**. Indeks itu tidak pernah diterjemahkan ke namespace caller, jadi
 meng-inline callee yang mereferensi const/static/thread-local merusak caller
 (relokasi TLS keluar jangkauan).
 
-Perbaikan: `cranelift-codegen` di-vendor (`vendor/cranelift-codegen-0.137.0`,
+Perbaikan: `rakit-codegen` di-vendor (`vendor/rakit-codegen-0.137.0`,
 ditambahkan ke `[patch.crates-io]`) dan `create_global_values` sekarang
 menerjemahkan nama simbol lewat `translate_symbol_name`, memakai pemetaan nama
 sisi-caller yang sama dengan `create_user_external_name_refs` (dilakukan inline
@@ -500,12 +500,12 @@ runtime **28.5 → 23.1 ms**; `p2_mem` **74.5 → 59 ms**. TLS, atomik, dan refe
 static diverifikasi benar (sebelumnya `R_X86_64_TLSGD out of range`).
 
 Sisa gap hash (SipHash 136.6 ms vs LLVM 20.2 ms; HashMap 35.4 vs 10.0) **bukan**
-lagi soal inlining: memaksa `CG_CLIF_INLINE_MAX=200` agar round SipHash ikut
+lagi soal inlining: memaksa `RAKIT_INLINE_MAX=200` agar round SipHash ikut
 ter-inline justru memperlambat (136.6 → 154 ms), karena round-trip `SipState`
 lewat pointer `&mut self` yang *escaping* tidak bisa di-forward oleh
-`store_forward`, dan Cranelift menumpahkan/memuat ulang state tiap ronde.
+`store_forward`, dan Rakit menumpahkan/memuat ulang state tiap ronde.
 Keunggulan LLVM di sini adalah register allocator + autovektorisasi — keduanya
-internal backend dan tidak terjangkau pass sisi cg_clif.
+internal backend dan tidak terjangkau pass sisi rakit.
 
 ### 8.12 Ringkasan angka tiga arah (revisi ini)
 
@@ -526,7 +526,7 @@ dengan peak RSS setara.
 
 ### 8.13 Biaya pass: dari "berat" jadi "nyaris gratis" — LANDED
 
-Pass CLIF kustom berjalan sekali per fungsi, jadi setiap `std::env::var` di
+Pass RAKIT kustom berjalan sekali per fungsi, jadi setiap `std::env::var` di
 dalamnya dibayar ribuan kali per crate — dan `std::env::var` mengunci map global
 tiap panggilan. Tiga perubahan:
 
@@ -535,17 +535,17 @@ tiap panggilan. Tiga perubahan:
 2. **`store_forward`** — tiga penelusuran setup per-instruksi (slot privat,
    pointer base non-escaping, byte-range yang dibaca load) digabung jadi satu
    `analyze`. Dataflow worklist diganti satu sapuan *reverse-postorder*: pada CFG
-   reducible (semua yang cg_clif hasilkan) predecessor selain back edge sudah
+   reducible (semua yang rakit hasilkan) predecessor selain back edge sudah
    dikunjungi sebelum sebuah blok, jadi satu sapuan mencapai fakta yang sama
    dengan fixed point. Back edge yang belum tersedia hanya menyumbang nol fakta —
    under-approximation konservatif, selalu aman untuk forwarding. Event store
    tiap blok di-decode sekali.
-3. **Akuntansi pass opt-in** — `src/passtime.rs` (`CG_CLIF_PASS_TIME=1`) untuk
-   pass cg_clif sendiri, `src/clifprof.rs` (`CG_CLIF_CLIF_TIME=1`) untuk pass
-   internal Cranelift. Yang kedua butuh `timing.rs` mengekspos `ALL_PASSES`.
+3. **Akuntansi pass opt-in** — `src/passtime.rs` (`RAKIT_PASS_TIME=1`) untuk
+   pass rakit sendiri, `src/rakitprof.rs` (`RAKIT_IR_TIME=1`) untuk pass
+   internal Rakit. Yang kedua butuh `timing.rs` mengekspos `ALL_PASSES`.
 
 Biaya `store_forward` di p2_mem: **9.2 ms → 5.1 ms**; total pass kustom p2_mem
-≈ 8 ms dari ~128 ms compile (≈6%). Profil pass Cranelift (sampel): total ≈27.9 ms;
+≈ 8 ms dari ~128 ms compile (≈6%). Profil pass Rakit (sampel): total ≈27.9 ms;
 Compilation ≈14.5, Egraph ≈4.6, Regalloc ≈4.2, VCode lower ≈2.0, emit ≈1.5.
 
 > **Koreksi (§17):** angka "≈8 ms / ≈6%" di atas **tidak sahih**. Saat itu
@@ -558,7 +558,7 @@ Compilation ≈14.5, Egraph ≈4.6, Regalloc ≈4.2, VCode lower ≈2.0, emit �
 ### 8.14 Perbaikan ICE SIMD lane — LANDED
 
 Commit `a9d182a` ("Keep SIMD values in registers") membuat nilai `#[repr(simd)]`
-berada di register sebagai `ByVal` CLIF vector, tetapi
+berada di register sebagai `ByVal` RAKIT vector, tetapi
 `CValue::value_lane`/`value_typed_lane`/`value_lane_dyn` masih mengasumsikan
 `ByRef` dan langsung `unreachable!()` saat menerima `ByVal`. Akibatnya
 `simd_shuffle` pada `__m128i` (mis. `_mm_slli_si128`) menabrak compiler — ICE
@@ -589,22 +589,22 @@ Kesimpulan tiap sumbu:
   `per_data_object_section`).
 - **Runtime**: M menutup hampir seluruh gap U→LLVM pada loop scalar/inline
   (p5/p6: 894→61 ms, ≈15×) dan mem (p2: 157→61 ms). Sisanya adalah kualitas
-  codegen Cranelift (regalloc + autovektorisasi), bukan pass sisi cg_clif.
+  codegen Rakit (regalloc + autovektorisasi), bukan pass sisi rakit.
 
 
 
 ### 8.16 Inliner: batas pertumbuhan + penyaringan loop (revisi terakhir)
 
-**Akar masalah.** Inliner menumbuhkan CLIF hingga +62% pada kode berat memori
-(p2_mem: 14449 → 23383 instruksi). Setiap pass Cranelift berikutnya harus
+**Akar masalah.** Inliner menumbuhkan RAKIT hingga +62% pada kode berat memori
+(p2_mem: 14449 → 23383 instruksi). Setiap pass Rakit berikutnya harus
 menelusuri seluruh fungsi, jadi pertumbuhan itu membebani semua pass, bukan
 hanya inliner. Inilah satu-satunya penyebab gap compile p2 vs U.
 
 **Batas pertumbuhan per pemanggil.** Jumlah instruksi yang boleh diserap satu
 pemanggil dibatasi ke pecahan dari ukuran pemanggil itu sendiri
-(`CG_CLIF_INLINE_GROWTH`, default 50%), diklem ke `[64, 512]`. Hasil pada p2:
+(`RAKIT_INLINE_GROWTH`, default 50%), diklem ke `[64, 512]`. Hasil pada p2:
 
-| `CG_CLIF_INLINE_GROWTH` | compile wall (ms) | runtime wall (ms) |
+| `RAKIT_INLINE_GROWTH` | compile wall (ms) | runtime wall (ms) |
 |---|---|---|
 | 25  | 135.5 | 67.6 |
 | 50  | 135.3 | 67.0 |
@@ -635,8 +635,8 @@ mahal adalah pertumbuhan instruksi, bukan penelusuran) dan merusak runtime
 
 **Kesimpulan.** Dengan batas pertumbuhan, M ≈ U pada compile (selisih dalam
 noise, ±1–2 ms) sambil tetap memenangi runtime besar: p2 157 → 68 ms, p5/p6
-894/903 → 61 ms. Sisanya adalah kualitas codegen Cranelift (regalloc,
-autovektorisasi), di luar jangkauan pass sisi cg_clif.
+894/903 → 61 ms. Sisanya adalah kualitas codegen Rakit (regalloc,
+autovektorisasi), di luar jangkauan pass sisi rakit.
 
 ### 8.17 Matriks lengkap tiga arah (revisi terakhir)
 
@@ -659,7 +659,7 @@ Kesimpulan tiap sumbu:
   `per_data_object_section`).
 - **Runtime**: M menutup hampir seluruh gap U→LLVM pada loop scalar/inline
   (p5/p6: 894/903 → 61 ms, ~15×) dan mem (p2: 156 → 69 ms, ~2.3×). Sisanya
-  kualitas codegen Cranelift (regalloc, autovektorisasi).
+  kualitas codegen Rakit (regalloc, autovektorisasi).
 
 ### 8.18 Matriks tiga arah (revisi akhir, faktor unroll 128)
 
@@ -681,15 +681,15 @@ naik hanya 32 byte. Kesimpulan compile/ukuran tidak berubah.
 ### 8.19 Lever yang diuji dan netral (jangan diulang tanpa data baru)
 
 - `-Ctarget-cpu=native`: p1–p4 dalam noise (±1–2 ms), p5/p6 tetap 7 ms.
-- `CG_CLIF_INLINE_MAX` 16/256: netral (p2 66–69 ms).
-- Inliner agresif (`CG_CLIF_INLINE_USES=100 CG_CLIF_INLINE_MAX=200`): p1
+- `RAKIT_INLINE_MAX` 16/256: netral (p2 66–69 ms).
+- Inliner agresif (`RAKIT_INLINE_USES=100 RAKIT_INLINE_MAX=200`): p1
   108 → 105 ms, lainnya datar.
-- Cranelift `opt_level=speed` vs `speed_and_size`: tidak berbeda.
-- Unroll duplikasi-body (`CG_CLIF_UNROLL_CLONE`) pada body multi-blok: **tidak
+- Rakit `opt_level=speed` vs `speed_and_size`: tidak berbeda.
+- Unroll duplikasi-body (`RAKIT_UNROLL_CLONE`) pada body multi-blok: **tidak
   aktif** karena `analyze_affine` mensyaratkan body blok tunggal, jadi loop
   `sinf` (multi-blok) tak tersentuh.
 - `-Zinline-mir-threshold=1000..1500`: menang kecil di p2 (67.6 → 61.6 ms) tapi
-  belum dijadikan default (di luar jangkauan pass sisi cg_clif).
+  belum dijadikan default (di luar jangkauan pass sisi rakit).
 
 ### 8.20 Akar masalah sisa gap runtime (bukan autovektorisasi)
 
@@ -704,15 +704,15 @@ autovektorisasi, melainkan kualitas codegen scalar:
   (main punya 9 call); M membiarkannya out-of-line (12 call).
 - **p3 fib**: LLVM mengubah rekursi ganda menjadi loop; M tetap rekursif.
 
-Semua ini adalah kualitas codegen/inliner Cranelift, di luar jangkauan pass
-sisi cg_clif; perbaikannya harus di dalam `cranelift-codegen`.
+Semua ini adalah kualitas codegen/inliner Rakit, di luar jangkauan pass
+sisi rakit; perbaikannya harus di dalam `rakit-codegen`.
 
 Catatan nuansa: p2 sebenarnya berada di batas jangkauan — inliner **adalah**
-pass sisi cg_clif, dan ambang `MAX_CALLEE_INSTS=64` (badan probe jauh lebih
+pass sisi rakit, dan ambang `MAX_CALLEE_INSTS=64` (badan probe jauh lebih
 besar) mencegah probe di-inline. Namun menaikkan ambang sampai cukup untuk
 probe akan meledakkan ukuran kode pada pemanggil lain, jadi ini bukan trade-off
 yang jelas menang; dibiarkan apa adanya. p3/p4 (konversi rekursi→loop,
-unrolling-call untuk ILP, fusi `sincos`) murni pekerjaan level Cranelift.
+unrolling-call untuk ILP, fusi `sincos`) murni pekerjaan level Rakit.
 
 ### 8.25 Validasi repo besar (cipansor/Verif) + dua optimisasi pass — LANDED
 
@@ -745,9 +745,9 @@ backend — supaya subprocess tidak ikut terukur — L 15858 ms, **U 95870 ms, M
 62089 ms**: fork **35% lebih cepat** dari upstream, output identik.
 
 **Akar +6% compile vs upstream: pass, bukan patch vendor.** Dengan semua pass
-dimatikan (`CG_CLIF_NO_STORE_FWD=1 CG_CLIF_NO_IFCONV=1 CG_CLIF_INLINE_MAX=0
-CG_CLIF_UNROLL=0`) compile 3212 ms vs upstream 3208 ms, jadi patch
-`cranelift-object`/`cranelift-codegen` tidak menambah biaya. Biaya per pass pada
+dimatikan (`RAKIT_NO_STORE_FWD=1 RAKIT_NO_IFCONV=1 RAKIT_INLINE_MAX=0
+RAKIT_UNROLL=0`) compile 3212 ms vs upstream 3208 ms, jadi patch
+`rakit-object`/`rakit-codegen` tidak menambah biaya. Biaya per pass pada
 crate ini: store_forward 380-400 ms (dominan), inline 153-158, if_convert 87-98,
 collect 75-80, unroll 5. `store_forward` jalan pada 8060 fungsi ~48 us masing,
 hampir datar per fungsi → overhead tetap, bukan skala instruksi.
@@ -762,7 +762,7 @@ hampir datar per fungsi → overhead tetap, bukan skala instruksi.
 - Compile lib Verif: **3590 → 3439 ms**, output tidak berubah, suite lulus.
 
 **Kenapa rlib lebih besar dari upstream tapi binary jauh lebih kecil.**
-`vendor/cranelift-object` menamai section per fungsi (`.text.<sym>`) dan memberi
+`vendor/rakit-object` menamai section per fungsi (`.text.<sym>`) dan memberi
 setiap objek data section sendiri, alih-alih satu `.text.subsection` /
 `.data.rel.ro.subsection` seperti upstream. Pada crate ini 30.465 section vs
 18.550, sekitar 9.283 di antaranya per objek data dan memakan ~2 MB `.shstrtab`.
@@ -819,13 +819,13 @@ plus workload 15.8 MB md5 `60618db4`. `tokei`: md5 `84479aa6` untuk ketiganya.
   **1.4-2.6× lebih cepat dari LLVM**.
 - Runtime: **1.25× (`bat`), 1.48× (`tokei`), 1.67× (`image`)** lebih cepat dari U.
 
-**Batas yang jujur: cg_clif tetap jauh lebih lambat dari LLVM pada kode
+**Batas yang jujur: rakit tetap jauh lebih lambat dari LLVM pada kode
 komputasi Rust murni.** Pada `image`, U 36.9 s vs L 1.25 s (**29× lebih
 lambat**), dan M hanya memangkasnya jadi 22.1 s (**18× lebih lambat dari L**).
 Akar penyebabnya bukan pass saya, melainkan tidak adanya auto-vectorizer di
-Cranelift: LLVM memvektorisasi loop blur (`mulps`/`addps` di
+Rakit: LLVM memvektorisasi loop blur (`mulps`/`addps` di
 `filter_symmetric_column`/`filter_symmetric_row`), M menghasilkan **nol**
-instruksi packed-float. Bukti tambahan: `CG_CLIF_OPT_LEVEL` = `speed`,
+instruksi packed-float. Bukti tambahan: `RAKIT_OPT_LEVEL` = `speed`,
 `speed_and_size`, atau `none` memberi runtime 5.38-5.52 s dan ukuran binary
 1.66-1.69 MB — praktis tidak berubah, karena knob itu tidak menyalakan
 vektorisasi.
@@ -835,10 +835,10 @@ menyebabkan gap: `blur` saja L 971 ms vs M 19.50 s (20×), `resize` saja L
 285 ms vs M 2.89 s (10×).
 
 **A/B memastikan gap ukuran bukan salah pass.** `bat` dibangun dengan semua
-pass dimatikan (`CG_CLIF_INLINE_MAX=0 CG_CLIF_INLINE_LEAF_MAX=0 CG_CLIF_UNROLL=0
-CG_CLIF_NO_STORE_FWD=1 CG_CLIF_NO_IFCONV=1`) menghasilkan 14.92 MB; dengan pass
+pass dimatikan (`RAKIT_INLINE_MAX=0 RAKIT_INLINE_LEAF_MAX=0 RAKIT_UNROLL=0
+RAKIT_NO_STORE_FWD=1 RAKIT_NO_IFCONV=1`) menghasilkan 14.92 MB; dengan pass
 menyala 13.43 MB. Pass **memperkecil** binary 10%, jadi selisih 2× terhadap
-LLVM adalah warisan cg_clif (section per fungsi + model PIC), bukan regresi.
+LLVM adalah warisan rakit (section per fungsi + model PIC), bukan regresi.
 Upstream pun lebih buruk di sini: 55.012 relokasi `R_X86_64_RELATIVE` vs M
 41.507 vs L 12.639, `.got` 197 KB (U) / 165 KB (M) / 12.5 KB (L).
 
@@ -853,7 +853,7 @@ Upstream pun lebih buruk di sini: 55.012 relokasi `R_X86_64_RELATIVE` vs M
    5.95 s.
 
 **LTO.** `bat` dan `tokei` menyetel `lto = true`/`"thin"` di profil rilis.
-cg_clif menolaknya (`error: LTO is not supported by rustc_codegen_cranelift`),
+rakit menolaknya (`error: LTO is not supported by rustc_codegen_rakit`),
 jadi LTO dimatikan untuk **ketiga** backend agar yang dibandingkan backend,
 bukan profil build.
 
@@ -861,7 +861,7 @@ bukan profil build.
 
 **Akar masalah.** `MAX_CALLEE_USES = 3` membatasi **semua** callee, termasuk
 yang badannya satu operasi. `<f32 as Mul>::mul`, `<f32 as Add>::add`, dan
-`__iterator_get_unchecked` adalah satu instruksi CLIF, tetapi pemanggil hanya
+`__iterator_get_unchecked` adalah satu instruksi RAKIT, tetapi pemanggil hanya
 boleh meng-inline-nya 3 kali. Loop blur memanggilnya puluhan kali per iterasi,
 jadi sisanya tetap berupa call sungguhan — dan setiap call memaksa spill/reload
 di sekelilingnya. Inilah sebabnya 46 call masih tersisa di `image` blur pada
@@ -874,14 +874,14 @@ revisi 8.16.
 
 Pertumbuhan kode tetap terbatas: badan seperti itu satu operasi, dan sebuah
 leaf tidak punya callee sendiri sehingga tidak bisa memicu ekspansi berantai.
-Rekursi tetap mustahil. Knob: `CG_CLIF_INLINE_TRIVIAL_MAX` (ambang) dan
-`CG_CLIF_INLINE_NO_TRIVIAL` (matikan, untuk A/B).
+Rekursi tetap mustahil. Knob: `RAKIT_INLINE_TRIVIAL_MAX` (ambang) dan
+`RAKIT_INLINE_NO_TRIVIAL` (matikan, untuk A/B).
 
 **Ambang 8 → 16.** Dengan ambang 8, `Add`/`Mul` hilang tetapi 8 call
 `__iterator_get_unchecked` masih tersisa. Bisect perambatan call pada
 `filter_symmetric_column`:
 
-| `CG_CLIF_INLINE_TRIVIAL_MAX` | call tersisa di loop kolom | runtime blur |
+| `RAKIT_INLINE_TRIVIAL_MAX` | call tersisa di loop kolom | runtime blur |
 |---|---|---|
 | 8  | 8 (`__iterator_get_unchecked`) | 15.27 s |
 | 9  | 8 | — |
@@ -890,7 +890,7 @@ Rekursi tetap mustahil. Knob: `CG_CLIF_INLINE_TRIVIAL_MAX` (ambang) dan
 | 16 | **0** | **12.80 s** |
 | 32 | 0 | 12.84 s (plateau) |
 
-Badan adapter iterator itu 12–13 instruksi CLIF, jadi ambang 8 tepat di
+Badan adapter iterator itu 12–13 instruksi RAKIT, jadi ambang 8 tepat di
 bawahnya. 16 memberi margin tanpa biaya terukur; 32 tidak menambah apa pun.
 
 **Dampak pada blur `image` (2048 px, `--release`).** A/B memakai biner compiler
@@ -940,17 +940,17 @@ memperlambat** p2.
 
 **Validasi kebenaran.**
 
-- `./y.sh test --sysroot clif`: **25.368 tes lulus, 0 gagal**.
+- `./y.sh test --sysroot rakit`: **25.368 tes lulus, 0 gagal**.
 - `bat` 0.26.1 (13.4 MB, banyak dependensi) dan `tokei` 15.0.0 dibangun ulang
   dan dijalankan; keluaran tokei identik **per file** dengan baseline M
   (52 file, 15.966 baris kode). Perbedaan md5 hanya urutan array `reports`
   (iterasi hashmap), bukan isi.
 
 **Koreksi klaim 8.20.** Bagian 8.20 menyatakan sisa gap runtime "bukan soal
-inliner, harus di dalam `cranelift-codegen`". Itu keliru untuk kasus ini:
-inliner **adalah** pass sisi cg_clif, dan memperbaiki batas pemakaiannya
+inliner, harus di dalam `rakit-codegen`". Itu keliru untuk kasus ini:
+inliner **adalah** pass sisi rakit, dan memperbaiki batas pemakaiannya
 menutup 42% gap blur (22.3 → 12.8 s). Yang benar-benar tersisa di
-`cranelift-codegen` adalah dua hal lain:
+`rakit-codegen` adalah dua hal lain:
 
 1. **Vektorisasi** — `mulps` 0 vs 9 pada loop yang sama.
 2. **Regalloc / stack traffic** — `filter_symmetric_column` masih 240 referensi
@@ -1011,7 +1011,7 @@ sasaran, sampel juga jatuh tepat di batas instruksi `movups`.
 | build | sampel | waktu di `compiler_builtins` (soft-float) |
 |---|---|---|
 | LLVM | 1513 | **0,0%** |
-| Cranelift sebelum | 15229 | **30,3%** |
+| Rakit sebelum | 15229 | **30,3%** |
 
 Penyebabnya satu baris di `src/intrinsics/mod.rs`:
 
@@ -1028,7 +1028,7 @@ Sekitar 30% waktu blur hilang di sini.
 
 #### Perbaikan
 
-Cranelift tidak punya instruksi round-half-away-from-zero, jadi `round`
+Rakit tidak punya instruksi round-half-away-from-zero, jadi `round`
 dibangun dari primitif yang ada:
 
 ```
@@ -1055,8 +1055,8 @@ Blur 2048×2048, 6 lintasan, 9 repetisi:
 | build | runtime median | ukuran | peak RSS | panggilan `roundf` |
 |---|---|---|---|---|
 | LLVM | 1233,9 ms | 579.296 B | 122 MB | 0 |
-| Cranelift sebelum | 12752,1 ms | 1.627.864 B | 123 MB | 1 |
-| Cranelift + round native | **10355,5 ms** | 1.629.168 B | 123 MB | **0** |
+| Rakit sebelum | 12752,1 ms | 1.627.864 B | 123 MB | 1 |
+| Rakit + round native | **10355,5 ms** | 1.629.168 B | 123 MB | **0** |
 
 - Runtime: **−18,8%** (12,75 s → 10,36 s), 1,23× lebih cepat.
 - Ukuran: +1.304 B (+0,08%) — biaya delapan instruksi inline, ditukar dengan
@@ -1080,10 +1080,10 @@ Penyebab dominan sisanya adalah **auto-vectorization**. Dihitung dengan
 | | instruksi SIMD di seluruh biner | di `filter_symmetric_column` (loop terpanas) |
 |---|---|---|
 | LLVM | 1485 | 67 |
-| Cranelift | 29 | 2 |
+| Rakit | 29 | 2 |
 
-LLVM memvektorisasi loop blur; Cranelift tidak. Ini pekerjaan di dalam
-`cranelift-codegen` (loop vectorizer), di luar jangkauan pass sisi cg_clif,
+LLVM memvektorisasi loop blur; Rakit tidak. Ini pekerjaan di dalam
+`rakit-codegen` (loop vectorizer), di luar jangkauan pass sisi rakit,
 dan tidak ditambal di sini. Angka ini menggantikan klaim lama di §8.20 bahwa
 gap "bukan soal autovektorisasi": untuk blur, vektorisasi adalah faktor
 dominan. §8.20 tetap berlaku untuk benchmark mikro p1–p8 yang loop-nya
@@ -1095,11 +1095,11 @@ memang skalar.
 
 ### 9.1 Metodologi yang sempat salah
 
-Percobaan pertama memakai `cargo build` tanpa `RUSTC=rustc-clif`, sehingga
-yang terukur adalah **LLVM**, bukan Cranelift. Gejalanya: ukuran biner 579.296
-byte (LLVM) alih-alih 1.629.168 (Cranelift), dan tunable `CG_CLIF_UNROLL`
-1/4/16/128 menghasilkan md5 identik. Setelah `RUSTC=rustc-clif` dipakai,
-barulah angka Cranelift muncul. **Semua angka unroll/inliner di bawah sudah
+Percobaan pertama memakai `cargo build` tanpa `RUSTC=rustc-rakit`, sehingga
+yang terukur adalah **LLVM**, bukan Rakit. Gejalanya: ukuran biner 579.296
+byte (LLVM) alih-alih 1.629.168 (Rakit), dan tunable `RAKIT_UNROLL`
+1/4/16/128 menghasilkan md5 identik. Setelah `RUSTC=rustc-rakit` dipakai,
+barulah angka Rakit muncul. **Semua angka unroll/inliner di bawah sudah
 memakai build yang benar.**
 
 ### 9.2 Yang terbukti BUKAN penyebab
@@ -1107,8 +1107,8 @@ memakai build yang benar.**
 | Hipotesis | Uji | Hasil |
 |---|---|---|
 | Autovektorisasi | LLVM `-Cno-vectorize-loops -Cno-vectorize-slp` | 763 instr, **0 SIMD** → 1248 ms, vs 551 instr/71 SIMD → 1246 ms. **Tidak berpengaruh.** |
-| Unroll CLIF | `CG_CLIF_UNROLL` 1/4/16/128 | 10280–10362 ms, biner identik. Pass hanya menangani loop satu-blok ber-delta konstan; loop blur tidak memenuhi syarat. |
-| Inliner CLIF | `CG_CLIF_INLINE_MAX=200 INLINE_LEAF_MAX=400 INLINE_USES=8` | 10380 ms vs 10359 baseline. Ukuran naik 1.629.168→1.635.000, **runtime tidak membaik**. |
+| Unroll RAKIT | `RAKIT_UNROLL` 1/4/16/128 | 10280–10362 ms, biner identik. Pass hanya menangani loop satu-blok ber-delta konstan; loop blur tidak memenuhi syarat. |
+| Inliner RAKIT | `RAKIT_INLINE_MAX=200 INLINE_LEAF_MAX=400 INLINE_USES=8` | 10380 ms vs 10359 baseline. Ukuran naik 1.629.168→1.635.000, **runtime tidak membaik**. |
 
 Jadi klaim lama "vektorisasi adalah faktor dominan" **salah**; klaim §8.20
 (asli) yang benar.
@@ -1120,8 +1120,8 @@ Menghitung pola jump table PIC (`movslq (%r,%r,4),%r; add %r,%r; jmp *%r`):
 | biner | situs jump table |
 |---|---|
 | LLVM | 0 (pakai bentuk absolut `jmp *0x…`, 214 situs) |
-| Cranelift (sebelum) | **2714** |
-| Cranelift (sesudah patch) | **84** |
+| Rakit (sebelum) | **2714** |
+| Rakit (sesudah patch) | **84** |
 
 Contoh nyata: `ImageBuffer::from_fn` menurunkan `match i {0=>r,1=>g,2=>b}`
 menjadi jump table 3-entri. LLVM memakai 2 `cmp`. Biaya jump table di sini
@@ -1132,13 +1132,13 @@ bukan sekadar 1 cabang tak-langsung: ia juga memaksa alamat dasar dihitung
 
 `src/base.rs`, `TerminatorKind::SwitchInt`: switch dengan ≤8 cabang dan
 diskriminan ≤64-bit diturunkan menjadi rantai `icmp_imm_s` + `brif`, bukan
-`cranelift_frontend::Switch::emit` (yang memilih `br_table`). Batas 64-bit
+`rakit_frontend::Switch::emit` (yang memilih `br_table`). Batas 64-bit
 wajib: `icmp_imm_s` menerima immediate `i64`, sehingga diskriminan `i128`
 akan terpotong.
 
 ### 9.5 Hasil
 
-| metrik | LLVM | CLIF base | CLIF + patch |
+| metrik | LLVM | RAKIT base | RAKIT + patch |
 |---|---|---|---|
 | blur 2048² (median 9 rep) | 1217 ms | 10352 ms | **10135 ms** (−2,1%) |
 | ukuran biner | 579.296 | 1.629.168 | **1.500.000** (−7,9%) |
@@ -1156,10 +1156,10 @@ setelah itu **3011 lulus / 0 gagal** (suite coretests).
 
 Setelah patch, gap blur masih ~8,3×. Profil sampel menunjukkan LLVM
 memusatkan 60,6% waktu fungsi panas di **satu offset** (loop ketat), sedangkan
-Cranelift menyebarkannya ke **213 offset** — gejala loop yang tidak
+Rakit menyebarkannya ke **213 offset** — gejala loop yang tidak
 di-rotate/di-unroll dan register spill (240 referensi `(%rsp)` vs 66).
-Perbaikannya ada di `cranelift-codegen` (loop rotation, regalloc), bukan di
-lapisan cg_clif, dan tidak dikerjakan di sini.
+Perbaikannya ada di `rakit-codegen` (loop rotation, regalloc), bukan di
+lapisan rakit, dan tidak dikerjakan di sini.
 
 ### 9.8 Matriks tiga arah final (L = LLVM, U = cg_clif upstream, M = modifikasi)
 
@@ -1191,9 +1191,9 @@ switch kecil**. Patch-nya kecil (≈25 baris di `src/base.rs`), benar
 (3011 tes lulus, keluaran byte-identik dengan LLVM), dan memberi keuntungan
 ganda: runtime −2,1% dan ukuran −7,9% pada blur.
 
-Sisa gap runtime didominasi kualitas `cranelift-codegen` (loop rotation,
-regalloc/spilling), bukan lapisan cg_clif. Itu perlu perubahan di crate
-`cranelift-codegen` dan berada di luar cakupan fork ini.
+Sisa gap runtime didominasi kualitas `rakit-codegen` (loop rotation,
+regalloc/spilling), bukan lapisan rakit. Itu perlu perubahan di crate
+`rakit-codegen` dan berada di luar cakupan fork ini.
 
 ## 10. Temuan terbesar: `trunc`/`round` menjadi soft-float libcall (§10)
 
@@ -1202,10 +1202,10 @@ sepenuhnya portabel (tidak butuh `-Ctarget-cpu=native`).
 
 ### 10.1 Cara menemukannya
 
-Profil per-fungsi (sampler 200 µs + `nm`) untuk biner LLVM vs CLIF menunjukkan
-pola yang sangat berbeda, bukan sekadar "CLIF lebih lambat merata":
+Profil per-fungsi (sampler 200 µs + `nm`) untuk biner LLVM vs RAKIT menunjukkan
+pola yang sangat berbeda, bukan sekadar "RAKIT lebih lambat merata":
 
-| fungsi | LLVM | CLIF (sebelum) |
+| fungsi | LLVM | RAKIT (sebelum) |
 |---|---|---|
 | `image_drv::main` | 29,3% | ~0% |
 | `filter_symmetric_column` | 28,0% | 25,4% |
@@ -1214,14 +1214,14 @@ pola yang sangat berbeda, bukan sekadar "CLIF lebih lambat merata":
 | `truncf` (compiler_builtins) | — | 2,9% |
 | `to_bits`/`from_bits`/`exp_unbiased`/`unsigned` | — | 5,9% |
 
-Yang mencolok: CLIF menghabiskan **~13% sampel di `compiler_builtins`**, yaitu
+Yang mencolok: RAKIT menghabiskan **~13% sampel di `compiler_builtins`**, yaitu
 soft-float Rust murni, sementara LLVM hanya memanggil satu `roundf` glibc.
-Pencarian di asm menegaskan: biner CLIF punya **0** instruksi `roundss`,
+Pencarian di asm menegaskan: biner RAKIT punya **0** instruksi `roundss`,
 padahal x86-64 punya instruksi native untuk itu.
 
 ### 10.2 Akar masalah
 
-`vendor/cranelift-codegen-0.137.0/src/isa/x64/lower.isle`:
+`vendor/rakit-codegen-0.137.0/src/isa/x64/lower.isle`:
 
 ```lisp
 (rule 2 (x64_round_f32 a imm) (if-let true (has_sse41)) (x64_roundss a imm))
@@ -1232,11 +1232,11 @@ Jadi `ftrunc` hanya menjadi `roundss` bila target punya **SSE4.1**. Pada
 baseline x86-64 (yang menjadi default), aturan itu tidak aktif dan turun ke
 libcall `TruncF32` → `compiler_builtins::math::libm_math::generic::trunc_status`.
 
-Ini bukan bug Cranelift (memang benar secara semantik), tapi konsekuensi
+Ini bukan bug Rakit (memang benar secara semantik), tapi konsekuensi
 mahal: soft-float per elemen piksel, sementara LLVM memakai `roundf` glibc
 yang jauh lebih murah.
 
-Temuan tambahan: lowering `round` di cg_clif sendiri dibangun di atas
+Temuan tambahan: lowering `round` di rakit sendiri dibangun di atas
 `ins().trunc(x)`, sehingga **setiap `.round()` ikut menanggung libcall yang
 sama**. Inilah sebabnya patch pertama (hanya `sym::trunc`) tidak berefek
 (10091 ms vs 10053 ms) — sumber panasnya justru `round`.
@@ -1246,9 +1246,9 @@ sama**. Inilah sebabnya patch pertama (hanya `sym::trunc`) tidak berefek
 `trunc` diturunkan ke round-trip integer, yang hanya butuh SSE2:
 
 ```rust
-fn trunc_via_int(fx, x, clif_ty, bits) -> Value {
+fn trunc_via_int(fx, x, rakit_ty, bits) -> Value {
     let int_part = fx.bcx.ins().fcvt_to_sint_sat(int_ty, x);
-    let back     = fx.bcx.ins().fcvt_from_sint(clif_ty, int_part);
+    let back     = fx.bcx.ins().fcvt_from_sint(rakit_ty, int_part);
     let back     = fx.bcx.ins().fcopysign(back, x);   // jaga tanda nol
     let limit    = 2^bits;                             // 2^23 f32, 2^52 f64
     let small    = fx.bcx.ins().fcmp(FloatCC::LessThan, fx.bcx.ins().fabs(x), limit);
@@ -1275,14 +1275,14 @@ tidak pernah trap.
    `v.trunc()` dengan `f64::trunc(v)` — padahal keduanya dikompilasi oleh
    lowering yang sedang diuji, jadi membandingkan diri sendiri. Diganti dengan
    uji diferensial lintas-backend: hash dari `trunc`/`round`/`fract` dihitung
-   oleh biner CLIF dan biner LLVM, lalu dibandingkan.
+   oleh biner RAKIT dan biner LLVM, lalu dibandingkan.
 
 ### 10.5 Verifikasi
 
 - **Diferensial vs LLVM**: hash identik (`4de7d090cdfce77d`) untuk
   `trunc`/`round`/`fract` atas **seluruh 2^32 pola f32** + sweep f64
   (2048 eksponen × 4 mantissa × 2 tanda).
-- **Test suite**: `./y.sh test --sysroot clif` → **TEST_EXIT=0**, 65 suite
+- **Test suite**: `./y.sh test --sysroot rakit` → **TEST_EXIT=0**, 65 suite
   hijau, 0 gagal (sebelumnya 6 gagal karena bug tanda nol).
 - **Output benchmark**: identik dengan LLVM pada n = 512, 1024, 2048
   (`8018560249`).
@@ -1294,12 +1294,12 @@ image blur 2048×2048, target baseline x86-64, median 9 run:
 | backend | wall (ms) | RSS (MB) | ukuran (byte) |
 |---|---|---|---|
 | LLVM | 1237,7 | 122,5 | — |
-| CLIF baseline | 10257,5 | 123,0 | 1500000 |
-| CLIF + switch (§9) | 10002,5 | 122,9 | 1500000 |
-| **CLIF + switch + trunc** | **8422,0** | 123,0 | **1499568** |
-| CLIF + `-Ctarget-cpu=native` | 8241,8 | 123,0 | 1498832 |
+| RAKIT baseline | 10257,5 | 123,0 | 1500000 |
+| RAKIT + switch (§9) | 10002,5 | 122,9 | 1500000 |
+| **RAKIT + switch + trunc** | **8422,0** | 123,0 | **1499568** |
+| RAKIT + `-Ctarget-cpu=native` | 8241,8 | 123,0 | 1498832 |
 
-- **−15,8%** vs CLIF-final, **−17,9%** vs baseline.
+- **−15,8%** vs RAKIT-final, **−17,9%** vs baseline.
 - `-Ctarget-cpu=native` mencapai 8241,8 ms; lowering portabel ini memulihkan
   **hampir seluruh** manfaat SSE4.1 **tanpa** mengorbankan portabilitas.
 - `compiler_builtins` **hilang total** dari profil (0 sampel, dari ~13%).
@@ -1308,9 +1308,9 @@ image blur 2048×2048, target baseline x86-64, median 9 run:
 ### 10.7 Koreksi klaim §9.9
 
 §9.9 menyatakan sisa gap "berada di luar cakupan fork ini". Itu **salah**:
-`cranelift-codegen` di-vendor lewat `[patch.crates-io]`, jadi bisa diubah. Dan
-ternyata perbaikan terbesar justru datang dari lapisan cg_clif sendiri
-(`src/intrinsics/mod.rs`), bukan dari `cranelift-codegen`.
+`rakit-codegen` di-vendor lewat `[patch.crates-io]`, jadi bisa diubah. Dan
+ternyata perbaikan terbesar justru datang dari lapisan rakit sendiri
+(`src/intrinsics/mod.rs`), bukan dari `rakit-codegen`.
 
 Sisa gap setelah perbaikan ini (8422 ms vs 1238 ms LLVM) masih didominasi
 kualitas codegen: `try_from_fn`/`wrap_mut_1`/`Pixels`/`Zip` yang tidak
@@ -1319,7 +1319,7 @@ ter-inline (≈18% sampel) dan spilling register di loop panas.
 ## 11. Sisa gap: apa yang sebenarnya tersisa (§11)
 
 Setelah §10, `compiler_builtins` hilang dari profil, jadi pertanyaannya berubah
-menjadi: apa yang LLVM lakukan dan CLIF tidak? Jawaban awalnya terlihat seperti
+menjadi: apa yang LLVM lakukan dan RAKIT tidak? Jawaban awalnya terlihat seperti
 autovektorisasi, tetapi pengukuran §11.4 membantahnya. Bagian ini mencatat
 hipotesis itu, bukti yang membatalkannya, dan penyebab yang benar-benar tersisa.
 
@@ -1328,7 +1328,7 @@ hipotesis itu, bukti yang membatalkannya, dan penyebab yang benar-benar tersisa.
 Disassembly fungsi panas `filter_symmetric_column` pada target baseline x86-64
 menunjukkan perbedaan bentuk yang mencolok:
 
-| metrik | LLVM | CLIF modifikasi |
+| metrik | LLVM | RAKIT modifikasi |
 |---|---|---|
 | total instruksi | 904 | 733 |
 | SIMD packed (`ps`/`pd`) | **75** | **1** |
@@ -1336,27 +1336,27 @@ menunjukkan perbedaan bentuk yang mencolok:
 | scalar SSE (`ss`/`sd`) | 39 | 59 |
 | `mulss`/`addss`/`subss` | 15 | 24 |
 
-Wajar kalau ini dibaca sebagai "LLVM memvektorisasi loop, Cranelift tidak". Itu
+Wajar kalau ini dibaca sebagai "LLVM memvektorisasi loop, Rakit tidak". Itu
 memang benar sebagai fakta codegen, tetapi **bukan** penyebab utama gap runtime.
 
 ### 11.2 Bukti yang membatalkan hipotesis vectorization
 
 Kalau vectorization adalah penyebab utama, mematikannya di LLVM harus
-mengembalikan LLVM ke level CLIF. Tidak demikian:
+mengembalikan LLVM ke level RAKIT. Tidak demikian:
 
 | konfigurasi | runtime (ms) | ukuran (byte) |
 |---|---|---|
 | LLVM `-O3` (default, vectorized) | 1240 | 579296 |
 | LLVM `-O3` **tanpa** vectorize (`-Cno-vectorize-loops -Cno-vectorize-slp`) | 1531 | 577136 |
-| CLIF baseline (upstream, tanpa patch) | 8375 | 1500272 |
-| CLIF modifikasi (§13) | 7877 | 1463784 |
+| RAKIT baseline (upstream, tanpa patch) | 8375 | 1500272 |
+| RAKIT modifikasi (§13) | 7877 | 1463784 |
 
 Mematikan vectorization hanya merugikan LLVM ~23%. Jadi vectorization
 menyumbang sebagian kecil dari selisih 6,8×; **~82% selisih tetap ada pada LLVM
 yang scalar murni**. Ini juga konsisten dengan §8.20 yang sudah mencatat hal
 serupa pada benchmark lain.
 
-### 11.3 Penyebab sebenarnya: loop scalar CLIF penuh address recomputation
+### 11.3 Penyebab sebenarnya: loop scalar RAKIT penuh address recomputation
 
 Sampling RIP per-alamat (30.355 sampel, `setarch -R`) pada biner modifikasi
 menempatkan 27,2% sampel di `filter_symmetric_column`. Loop terpanasnya berisi
@@ -1396,24 +1396,24 @@ Tiga hal yang salah, semuanya bukan vectorization:
    sisa dari masalah §8.19/§8.20: nilai yang hidup melewati batas blok
    kehilangan forwarding.
 2. **Invariant (`0x10(%r12)`, `0x30(%r12)`, koefisien di `0xf60(%rsp)`) dimuat
-   ulang setiap iterasi.** Cranelift **tidak punya LICM**.
+   ulang setiap iterasi.** Rakit **tidak punya LICM**.
 3. **Bounds/null check tidak tereliminasi** dan muncul duplikat.
 
 Perbandingan langsung: LLVM (tanpa vectorize) menjalankan loop yang sama dalam
-**63 instruksi untuk 16 MAC = 3,9 instruksi/MAC**; CLIF butuh **14,8**. Rasio
+**63 instruksi untuk 16 MAC = 3,9 instruksi/MAC**; RAKIT butuh **14,8**. Rasio
 3,8× itu menjelaskan hampir seluruh gap runtime.
 
 ### 11.4 Mengapa ini sulit diperbaiki di fork ini
 
-Ketiga penyebab di atas berada di `cranelift-codegen`, bukan di cg_clif:
+Ketiga penyebab di atas berada di `rakit-codegen`, bukan di rakit:
 
-- **LICM**: Cranelift tidak memiliki pass ini sama sekali (tidak ada
-  `licm`/`loop_rotate` di `cranelift-codegen/src/`). Menulisnya berarti
+- **LICM**: Rakit tidak memiliki pass ini sama sekali (tidak ada
+  `licm`/`loop_rotate` di `rakit-codegen/src/`). Menulisnya berarti
   memindahkan instruksi keluar loop dengan benar terhadap aliasing memori.
-- **Store/load forwarding lintas blok**: `store_forward.rs` milik cg_clif
+- **Store/load forwarding lintas blok**: `store_forward.rs` milik rakit
   menangani kasus intra-prosedur sederhana, tetapi pointer yang di-spill di
   sini melewati blok dengan bentuk yang tidak dikenali pass itu.
-- **Loop rotation / unrolling**: juga tidak ada di Cranelift. Fork ini punya
+- **Loop rotation / unrolling**: juga tidak ada di Rakit. Fork ini punya
   pass `unroll.rs`, tetapi jalurnya hanya *affine reassociation*: ia bekerja
   sangat baik (52×) pada loop yang state-nya fungsi linear dari dirinya sendiri
   (§13.4), dan tidak berlaku pada loop memori seperti `filter_symmetric_column`.
@@ -1421,13 +1421,13 @@ Ketiga penyebab di atas berada di `cranelift-codegen`, bukan di cg_clif:
   dikerjakan.
 
 Karena itu, gap yang tersisa didokumentasikan sebagai **batasan arsitektural
-Cranelift**, bukan bug yang bisa ditambal di sisi cg_clif.
+Rakit**, bukan bug yang bisa ditambal di sisi rakit.
 
 ### 11.5 Yang tetap berlaku
 
 Perbaikan §9, §10, §12, dan §13 tetap sah dan tidak bergantung pada vectorization:
 
-- Pada beban gambar (`imagedrv`, `filter_symmetric_column`), runtime CLIF
+- Pada beban gambar (`imagedrv`, `filter_symmetric_column`), runtime RAKIT
   modifikasi **7877 ms vs 8375 ms baseline upstream** (−5,9%), ukuran biner
   **1.463.784 vs 1.500.272 byte** (−2,4%).
 - Pada benchmark suite §9.8, ukuran biner tetap **lebih kecil dari LLVM**
@@ -1438,7 +1438,7 @@ Perbaikan §9, §10, §12, dan §13 tetap sah dan tidak bergantung pada vectoriz
 
 Jadi dari empat tujuan awal — RAM, CPU, ukuran, kecepatan compile — ketiganya
 tercapai. Sisa gap CPU runtime dijelaskan oleh ketiadaan
-LICM/loop-rotation/unrolling di Cranelift, bukan oleh vectorization.
+LICM/loop-rotation/unrolling di Rakit, bukan oleh vectorization.
 
 ## 12. `floor` dan `ceil` juga korban libcall yang sama (§12)
 
@@ -1450,23 +1450,23 @@ Jadi pada target baseline x86-64, `floor` dan `ceil` juga menjadi soft-float
 
 ### 12.1 Kesalahan metodologi yang hampir menutupi temuan ini
 
-Dua percobaan pertama saya menunjukkan waktu **identik** antara CLIF dan LLVM.
+Dua percobaan pertama saya menunjukkan waktu **identik** antara RAKIT dan LLVM.
 Penyebabnya dua, dan keduanya kesalahan saya:
 
-1. `RUSTC=rustc-clif rustc ...` — variabel `RUSTC` hanya dibaca **cargo**,
+1. `RUSTC=rustc-rakit rustc ...` — variabel `RUSTC` hanya dibaca **cargo**,
    bukan `rustc` langsung. Jadi kedua perintah menjalankan rustc LLVM. Buktinya
-   `md5sum` kedua biner sama persis. Perbaikannya: panggil `rustc-clif` langsung.
+   `md5sum` kedua biner sama persis. Perbaikannya: panggil `rustc-rakit` langsung.
 2. Benchmark pertama memakai array 16 MB, melewati cache, sehingga
    **memory-bound** dan menutupi biaya compute.
 
 Setelah kedua kesalahan diperbaiki (array 16 KB di L1, 400 repetisi, panggil
-`rustc-clif` langsung), barulah selisihnya terlihat.
+`rustc-rakit` langsung), barulah selisihnya terlihat.
 
 ### 12.2 Hasil
 
 Waktu per elemen, loop compute-bound:
 
-| operasi | CLIF sebelum | CLIF sesudah | LLVM |
+| operasi | RAKIT sebelum | RAKIT sesudah | LLVM |
 |---|---|---|---|
 | `floor` | 37,48 ms (**22,9 ns**) | 6,14 ms (3,75 ns) | 5,92 ms (3,61 ns) |
 | `ceil` | 38,78 ms (**23,7 ns**) | 5,86 ms (3,57 ns) | 5,95 ms (3,63 ns) |
@@ -1549,15 +1549,15 @@ melintasi blok. Dataflow itu dilewati untuk fungsi besar lewat
 `CBE_MAX_INSTS = 300`.
 
 Batas 300 itu ditetapkan sebelum biayanya diukur. Saya ukur: **~121 ns per
-instruksi**, jadi fungsi terbesar yang cg_clif hasilkan pada beban ini (6.353
+instruksi**, jadi fungsi terbesar yang rakit hasilkan pada beban ini (6.353
 instruksi) hanya butuh **3,03 ms** dataflow — 5,2% dari total build 6,3 s.
 Menukar eliminasi store/load dengan 5% waktu compile adalah trade-off yang
 jelas menang, dan justru fungsi besar itulah yang paling banyak punya store di
 satu blok yang dibaca di blok lain.
 
 Perbaikan: batas dinaikkan ke `16_384` instruksi, cukup untuk semua fungsi yang
-cg_clif hasilkan sambil tetap membatasi input patologis. Tunable
-`CG_CLIF_SF_CBE_MAX` tetap ada untuk bisect.
+rakit hasilkan sambil tetap membatasi input patologis. Tunable
+`RAKIT_SF_CBE_MAX` tetap ada untuk bisect.
 
 Hasil pada loop panas `filter_symmetric_column`:
 
@@ -1600,7 +1600,7 @@ berbeda dan tidak boleh dibandingkan langsung dengan tabel di sana.
 
 | konfigurasi | runtime (ms) | ukuran (byte) |
 |---|---|---|
-| CLIF baseline (sebelum §13) | 8374,6 | 1.500.272 |
+| RAKIT baseline (sebelum §13) | 8374,6 | 1.500.272 |
 | + §13.1 store forwarding | 7828,0 | 1.465.336 |
 | + §13.2 memset | 7877,0 | 1.463.784 |
 | LLVM `-O3` | 1240,1 | 579.296 |
@@ -1613,14 +1613,14 @@ perbaikan runtime pada beban ini.
 ### 13.4 Pass unroll: menyala, tetapi hanya pada bentuk affine
 
 Saya mengukur apakah pass unroll benar-benar bekerja, dengan A/B pada
-`CG_CLIF_UNROLL` (128 default vs 1 = mati). Hasilnya penting dan perlu
+`RAKIT_UNROLL` (128 default vs 1 = mati). Hasilnya penting dan perlu
 dipisahkan dari kesimpulan §11:
 
 **Pass ini bekerja sangat baik pada loop yang bentuknya affine.** Pada
 `p5_inline` (loop 300 juta iterasi, `acc = (acc+i)*3`, `i += 1` — bentuk affine
 murni):
 
-| `CG_CLIF_UNROLL` | runtime | output |
+| `RAKIT_UNROLL` | runtime | output |
 |---|---|---|
 | 128 (default) | **7 ms** | `2899565707696607360` |
 | 1 (dimatikan) | **365 ms** | `2899565707696607360` |
@@ -1649,14 +1649,14 @@ tanpa itu berisiko salah-optimasi. Ini arah kerja berikutnya yang konkret.
 
 Diukur dengan `bench/fullbench.sh` (7 repetisi compile, 9 repetisi run, median
 per program, lalu dijumlahkan), delapan program `bench/progs/`, `opt-level=3`.
-Kolom `mod vs up` adalah runtime modifikasi terhadap upstream cg_clif —
-perbandingan backend murni, keduanya memakai std hasil Cranelift sendiri.
+Kolom `mod vs up` adalah runtime modifikasi terhadap cg_clif upstream —
+perbandingan backend murni, keduanya memakai std hasil Rakit sendiri.
 
 | label | compile wall (ms) | compile cpu (ms) | peak RSS (MB) | total size (KB) | run wall (ms) | run cpu (ms) | run RSS (MB) |
 |---|---|---|---|---|---|---|---|
 | LLVM (stock rustc) | 876 | 1149 | 133 | 36.095 | 365 | 365 | 48 |
 | cg_clif upstream | 707 | 922 | 131 | 45.675 | 2467 | 2461 | 49 |
-| **cg_clif modifikasi** | **726** | **962** | **132** | **31.688** | **517** | **514** | **48** |
+| **rakit modifikasi** | **726** | **962** | **132** | **31.688** | **517** | **514** | **48** |
 
 Runtime per program:
 
@@ -1675,7 +1675,7 @@ Ringkasan terhadap empat tujuan awal:
 
 - **Ukuran hasil**: modifikasi **31.688 KB vs upstream 45.675 KB (−30,6%)**,
   dan **lebih kecil dari LLVM** (36.095 KB, −12,2%). Penyebab utamanya bukan
-  §13.2, melainkan patch `cranelift-object` yang memberi tiap fungsi dan objek
+  §13.2, melainkan patch `rakit-object` yang memberi tiap fungsi dan objek
   data seksi bernama unik, sehingga `--gc-sections` akhirnya bisa membuang kode
   mati. Buktinya, dihitung pada berkas objek di dalam `libstd-*.rlib` (bukan
   pada `.so` hasil link, yang sudah menggabungkan semuanya): upstream punya
@@ -1701,9 +1701,9 @@ Kebenaran: kedelapan program menghasilkan output **byte-identik** dengan LLVM
 
 > **Catatan metodologi.** Angka pada versi pertama §13.5 (upstream 36.184 KB)
 > salah karena `cg_clif_upstream/dist` saat itu basi: sysroot-nya sudah tidak
-> memuat `libstd`, sehingga `rustc-clif` diam-diam jatuh ke sysroot LLVM dan
-> menghasilkan biner LLVM berukuran ±4,6 MB yang dikira keluaran Cranelift.
-> Setelah kedua backend dibangun ulang (`./y.sh build --sysroot clif` di
+> memuat `libstd`, sehingga `rustc-rakit` diam-diam jatuh ke sysroot LLVM dan
+> menghasilkan biner LLVM berukuran ±4,6 MB yang dikira keluaran Rakit.
+> Setelah kedua backend dibangun ulang (`./y.sh build --sysroot rakit` di
 > keduanya), upstream menjadi 45.675 KB. Selalu cek bahwa `dist/lib/rustlib/
 > */lib/libstd-*.rlib` ada dan ukuran U ≠ ukuran L sebelum memercayai matriks.
 
@@ -1743,24 +1743,24 @@ for _ in 0..200_000 { let a = [0.0f32; 64]; let b = [1.5f64; 32]; let c = [0u32;
 | konfigurasi | runtime |
 |---|---|
 | memset aktif (default) | **4,8 ms** |
-| `CG_CLIF_NO_REPEAT_MEMSET=1` | **23,6 ms** |
+| `RAKIT_NO_REPEAT_MEMSET=1` | **23,6 ms** |
 
 **4,9× lebih cepat**, output identik. Jadi §13.2 memang bernilai besar — hanya
 saja pada pola kode yang tidak muncul di delapan program benchmark ini, sehingga
 tidak terlihat di matriks §13.5.
 
-Tunable `CG_CLIF_NO_REPEAT_MEMSET` ditambahkan khusus agar klaim ini bisa
+Tunable `RAKIT_NO_REPEAT_MEMSET` ditambahkan khusus agar klaim ini bisa
 direproduksi dan di-bisect.
 
 ## 14. LICM: pass loop-invariant code motion yang baru (§14)
 
-Cranelift tidak punya LICM. Pass `egraph` hanya meng-hoist *expression node*
+Rakit tidak punya LICM. Pass `egraph` hanya meng-hoist *expression node*
 yang murni dan sengaja **tidak** memindahkan load; `gvn` melakukan value
 numbering tetapi tidak keluar dari blok. Akibatnya loop yang memuat nilai
 invariant setiap iterasi (koefisien, batas, base pointer) menyimpan load itu di
 dalam rantai dependensi loop-carried.
 
-`vendor/cranelift-codegen-0.137.0/src/licm.rs` menambahkan pass tersebut,
+`vendor/rakit-codegen-0.137.0/src/licm.rs` menambahkan pass tersebut,
 dipanggil dari `Context::compile` **setelah** egraph pass: egraph sudah melipat
 dan menyederhanakan badan loop, jadi yang di-hoist adalah bentuk final, bukan
 bentuk yang nanti ditulis ulang di tempat.
@@ -1810,8 +1810,8 @@ pada edge EH.
 
 ### 14.3 Dampak terukur
 
-A/B dengan `CG_CLIF_NO_LICM=1` vs default, 11 repetisi, median, `opt-level=3`,
-kedelapan program `bench/progs/`. Kedua sisi memakai sysroot Cranelift mod
+A/B dengan `RAKIT_NO_LICM=1` vs default, 11 repetisi, median, `opt-level=3`,
+kedelapan program `bench/progs/`. Kedua sisi memakai sysroot Rakit mod
 sendiri (bukan sysroot LLVM — lihat catatan metodologi §13.5).
 
 | program | LICM mati | LICM hidup | delta | ukuran |
@@ -1833,7 +1833,7 @@ Pertambahan ukuran hanya puluhan sampai ratusan byte.
 
 ### 14.4 Verifikasi
 
-- Suite tes cg_clif penuh: **25.368 tes lulus, 0 gagal**, termasuk rand, regex,
+- Suite tes rakit penuh: **25.368 tes lulus, 0 gagal**, termasuk rand, regex,
   graviola, dan portable-simd yang dikompilasi ulang dengan pass aktif.
 - `bench/tests/t_licm.rs` ditambahkan sebagai regresi khusus: lima bentuk yang
   pernah merusak pass (phi loop-carried, `brif` dua cabang ke header, store yang
@@ -1845,19 +1845,19 @@ Pertambahan ukuran hanya puluhan sampai ratusan byte.
 
 | variabel | arti |
 |---|---|
-| `CG_CLIF_NO_LICM=1` | matikan pass LICM |
-| `CG_CLIF_LICM_DEBUG=1` | cetak setiap hoist ke stderr |
-| `CG_CLIF_NO_COLLAPSE=1` | matikan collapse forwarding-latch sebelum unroll |
+| `RAKIT_NO_LICM=1` | matikan pass LICM |
+| `RAKIT_LICM_DEBUG=1` | cetak setiap hoist ke stderr |
+| `RAKIT_NO_COLLAPSE=1` | matikan collapse forwarding-latch sebelum unroll |
 
 ## 15. False dependency pada konversi u64→float (LANDED)
 
 ### 15.1 Gejala
 
-`p4_simd` tetap 2,5× lebih lambat dari LLVM meski semua pass cg_clif dimatikan
+`p4_simd` tetap 2,5× lebih lambat dari LLVM meski semua pass rakit dimatikan
 satu per satu (NONE 105,5 / NOUNROLL 105,2 / NOINLINE 106,3 / NOLICM 110,4 /
 NOSF 107,0 / NOIFCONV 106,3 ms — semuanya dalam derau). Jumlah panggilan `sinf`
 saat runtime juga identik: interposer `LD_PRELOAD` menghitung **4.000.000**
-panggilan untuk LLVM maupun Cranelift, dengan keluaran byte-identik
+panggilan untuk LLVM maupun Rakit, dengan keluaran byte-identik
 (`-0.9937716`). Jadi bukan jumlah kerja, melainkan **biaya per panggilan**:
 7,4 ns vs 18,9 ns.
 
@@ -1865,7 +1865,7 @@ panggilan untuk LLVM maupun Cranelift, dengan keluaran byte-identik
 
 Memisahkan loop menjadi dua tahap — isi `a[i] = i as f32` dulu, lalu
 `o[i] = a[i].sin()` — menyusutkan gap dari 2,5× menjadi 1,25×
-(LLVM 39,1 ms vs Cranelift 48,7 ms). Artinya **konversi integer→float** di loop
+(LLVM 39,1 ms vs Rakit 48,7 ms). Artinya **konversi integer→float** di loop
 panas, bukan `sinf`, yang menjadi biang keladi.
 
 ### 15.3 Akar masalah
@@ -1878,7 +1878,7 @@ sebelumnya adalah hasil `sinf` iterasi sebelumnya, sehingga setiap iterasi
 harus menunggu panggilan sebelumnya selesai — loop yang seharusnya
 *throughput-bound* berubah menjadi *latency-bound*.
 
-Disassembly Cranelift (sebelum perbaikan):
+Disassembly Rakit (sebelum perbaikan):
 
 ```
 3792d:  cvtsi2ss %rdi,%xmm0     ; tidak ada xorps sebelum ini
@@ -1893,7 +1893,7 @@ cvtsi2ss %r14,%xmm0
 call    *%r15
 ```
 
-Jumlah `xorps` di seluruh binary: Cranelift **5**, LLVM **46**.
+Jumlah `xorps` di seluruh binary: Rakit **5**, LLVM **46**.
 
 ### 15.4 Mengapa hanya jalur unsigned
 
@@ -1912,7 +1912,7 @@ bukan kasus langka.
 
 ### 15.5 Perbaikan
 
-`vendor/cranelift-codegen-0.137.0/src/isa/x64/inst/emit.rs`, di
+`vendor/rakit-codegen-0.137.0/src/isa/x64/inst/emit.rs`, di
 `emit_signed_cvt`: emit `xorps dst,dst` sebelum konversi.
 
 ```rust
@@ -1937,11 +1937,11 @@ Loop `(i as f32).sin()` (`p9_u64f32`), 4 juta iterasi:
 |---|---|
 | LLVM | 29,7 ms |
 | cg_clif upstream | 75,7 ms |
-| cg_clif modifikasi (sebelum) | 75,6 ms |
-| **cg_clif modifikasi (sesudah)** | **34,1 ms** |
+| rakit modifikasi (sebelum) | 75,6 ms |
+| **rakit modifikasi (sesudah)** | **34,1 ms** |
 
 **2,2× lebih cepat**, dan kini hanya 15% di belakang LLVM. Karena upstream
-menunjukkan angka yang sama (75,7 ms), ini defisiensi Cranelift yang berdiri
+menunjukkan angka yang sama (75,7 ms), ini defisiensi Rakit yang berdiri
 sendiri, bukan efek samping perubahan lain di fork ini.
 
 Dampak pada benchmark utama:
@@ -1959,7 +1959,7 @@ dan seluruh keluaran tetap byte-identik dengan LLVM.
 
 ### 15.7 Verifikasi
 
-- Suite tes cg_clif penuh lulus, tanpa kegagalan.
+- Suite tes rakit penuh lulus, tanpa kegagalan.
 - Keluaran kedelapan program bench identik dengan LLVM.
 - `bench/progs/p9_u64f32.rs` ditambahkan sebagai penjaga regresi: kernel ini
   mengisolasi jalur unsigned, sehingga `xorps` yang hilang muncul sebagai
@@ -1978,7 +1978,7 @@ dan seluruh keluaran tetap byte-identik dengan LLVM.
 
 Sisa selisih p4_simd (96,2 vs 55,3 ms) berasal dari hal lain: LLVM menggabungkan
 `sinf` + `cosf` pada argumen yang sama menjadi satu panggilan `sincosf`
-(`objdump` menunjukkan `sincosf` di binary LLVM, sedangkan Cranelift tetap
+(`objdump` menunjukkan `sincosf` di binary LLVM, sedangkan Rakit tetap
 memanggil `sinf@` dan `cosf@` terpisah). Penggabungan itu adalah transformasi
 tingkat IR (loop fusion + common-subexpression), bukan sesuatu yang bisa
 disimpulkan di level mesin.
@@ -1993,7 +1993,7 @@ karena isi loop-nya hanya aritmetika sepele dan satu tulis byte; 5 ns per byte
 jauh di atas biaya yang wajar untuk kerja sebesar itu.
 
 Yang membuatnya menonjol: `insert` biasa pada `HashMap` justru **2x lebih
-cepat** daripada LLVM, dan `vec![7u8; N]` hanya 2,55x. Jadi bukan "Cranelift
+cepat** daripada LLVM, dan `vec![7u8; N]` hanya 2,55x. Jadi bukan "Rakit
 lambat di memori", melainkan satu bentuk kode tertentu.
 
 ### 16.2 Akar masalah
@@ -2079,14 +2079,14 @@ badan fungsi yang tadinya berdiri sendiri kini tidak perlu di-emit terpisah.
 - `bench/tests/t_iter_inline.rs` menutup bentuk kode ini: rantai `map`+`collect`,
   `filter`+`map`+`collect`, `step_by` (state iterator yang bukan range sederhana),
   dan `collect` bersarang.
-- Knob `CG_CLIF_INLINE_*` tetap ada untuk bisecting, jadi perubahan ini bisa
+- Knob `RAKIT_INLINE_*` tetap ada untuk bisecting, jadi perubahan ini bisa
   dimatikan tanpa rebuild bila perlu.
 
 ### 16.6 Sisa gap
 
 Setelah call hilang, sisa selisih `collect` (10,7 vs 2,0 ms) berasal dari
 **autovectorization**: LLVM mengubah loop hitung/tulis byte menjadi SIMD
-(`pcmpeqb` + `pand` + horizontal add pada `i4_static`). Cranelift tidak punya
+(`pcmpeqb` + `pand` + horizontal add pada `i4_static`). Rakit tidak punya
 autovectorizer, dan menambahkannya adalah pekerjaan tingkat pass yang jauh lebih
 besar daripada perubahan budget ini. Gap yang sama muncul di k2/k7 (3x) dan
 k8_sort (3,1x) — semuanya bentuk yang LLVM vectorize atau unroll.
@@ -2113,7 +2113,7 @@ harus diperbaiki bersamaan:
    mencetak laporan. Diganti dengan `static [AtomicU64; 5]`, di-`fetch_add` dari
    thread mana pun dan di-`swap(0)` saat melapor.
 
-Setelah itu biaya per-pass baru terlihat, diaktifkan lewat `CG_CLIF_PASS_TIME=1`.
+Setelah itu biaya per-pass baru terlihat, diaktifkan lewat `RAKIT_PASS_TIME=1`.
 
 ### 17.2 Angka pertama: `unroll` memakan 18,9 ms
 
@@ -2227,14 +2227,14 @@ Eksekusi (ms):
 Tiga hal yang perlu dibaca dari tabel ini:
 
 1. **Ukuran biner mod 7–27% lebih kecil dari LLVM** dan 26–27% lebih kecil dari
-   upstream clif, konsisten di semua program. Ini efek dari kode yang lebih
+   cg_clif upstream, konsisten di semua program. Ini efek dari kode yang lebih
    sedikit di-emit, bukan dari strip.
 2. **p5/p6 adalah kasus di mana mod mengalahkan LLVM 8x** (6,8 ms vs 57,6 ms).
-   Upstream clif di program yang sama butuh 894 ms — artinya ada bug/kelemahan
+   cg_clif upstream di program yang sama butuh 894 ms — artinya ada bug/kelemahan
    besar di sana yang pass inliner fork ini perbaiki, bukan sekadar tuning.
 3. **p2_mem tetap 4,2x lebih lambat dari LLVM.** Penyebabnya bukan pass fork ini
    (mod sudah 2,3x lebih cepat dari upstream), melainkan kualitas codegen
-   Cranelift sendiri: LLVM mengubah loop memori menjadi kode SIMD, Cranelift
+   Rakit sendiri: LLVM mengubah loop memori menjadi kode SIMD, Rakit
    tidak punya autovectorizer.
 
 ### 17.8 Catatan jujur soal batas
@@ -2263,7 +2263,7 @@ Dua program identik kecuali satu baris. Yang pertama menguji habis dibagi dengan
 tes tulis tangan (`(acc.wrapping_mul(m)) <= T`), yang kedua memakai
 `acc % 7 == 0`:
 
-| Varian | LLVM | cg_clif |
+| Varian | LLVM | rakit |
 |---|---|---|
 | tes tulis tangan | 55,2 ms | **55,8 ms** |
 | `acc % 7 == 0` | 61,4 ms | **108,7 ms** |
@@ -2273,7 +2273,7 @@ melainkan khusus operator `%`. Hipotesis lain sudah dieliminasi lebih dulu:
 konversi `u64→f64` bertanda (`jl`) bukan penyebabnya (signedconv == modonly),
 dan if-conversion fork ini memang bekerja (memakai `cmovne`).
 
-Dump CLIF (`--emit llvm-ir` menulis `.clif`, karena `should_write_ir` memeriksa
+Dump RAKIT (`--emit llvm-ir` menulis `.rakit`, karena `should_write_ir` memeriksa
 `OutputType::LlvmAssembly`) menunjukkan bentuk persisnya:
 
 ```text
@@ -2284,7 +2284,7 @@ v88 = urem.i64 v86, v87
 
 ### 18.3 Akar masalah
 
-Cranelift men-strength-reduce `urem` oleh konstanta menjadi multiply-shift, tapi
+Rakit men-strength-reduce `urem` oleh konstanta menjadi multiply-shift, tapi
 tetap **mematerialisasi seluruh sisa**: `mulq` + 2 shift + `imul` + `sub`, enam
 instruksi, ditambah dua cabang per iterasi karena loop tidak dirotasi. LLVM
 melipat `x % C == 0` menjadi dua instruksi (`imul`, `cmp`) plus `setb`/`xor`
@@ -2338,10 +2338,10 @@ Karena itu `t_iter` dijadikan regression test: kesalahan ini **senyap**.
 Pada kernel terisolasi, versi modifikasi kini **lebih cepat dari LLVM**
 (55,9 vs 61,3 ms) karena `cmovbe` menggantikan `setb`+`xor` LLVM. Pada
 `p1_arith` sisa gap 1,18x bukan lagi soal `%` melainkan konversi `f64→u64`
-saturating yang di Cranelift memakai rantai cabang (LLVM branchless) — itu
-pekerjaan level `cranelift-codegen`, bukan pass sisi cg_clif.
+saturating yang di Rakit memakai rantai cabang (LLVM branchless) — itu
+pekerjaan level `rakit-codegen`, bukan pass sisi rakit.
 
-Knob: `CG_CLIF_NO_DIVTEST=1`. Semua delapan benchmark dan seluruh test suite
+Knob: `RAKIT_NO_DIVTEST=1`. Semua delapan benchmark dan seluruh test suite
 menghasilkan keluaran identik dengan LLVM (kecuali thread-id di `t_panic`/`t_tls`,
 yang memang berbeda antar-run; `t_panic` juga kehilangan baris `println`
 terakhir di **kedua** backend — bug pra-ada, bukan akibat pass ini).
@@ -2350,9 +2350,9 @@ terakhir di **kedua** backend — bug pra-ada, bukan akibat pass ini).
 
 Dua jebakan yang memakan waktu di sini:
 
-1. **Variabel `CG_CLIF_*` dibaca saat kompilasi, bukan saat run.** Menjalankan
-   `CG_CLIF_NO_DIVTEST=1 ./binary` tidak mematikan apa pun. Harus
-   `CG_CLIF_NO_DIVTEST=1 rustc-clif ... -o binary`.
+1. **Variabel `RAKIT_*` dibaca saat kompilasi, bukan saat run.** Menjalankan
+   `RAKIT_NO_DIVTEST=1 ./binary` tidak mematikan apa pun. Harus
+   `RAKIT_NO_DIVTEST=1 rustc-rakit ... -o binary`.
 2. **Loop dengan batas konstanta bisa dilipat jadi bentuk tertutup.** `p5_inline`
    (300 juta iterasi) berjalan 6,8 ms — 48 miliar iterasi/detik, mustahil
    secara fisik. Disassembly menunjukkan unroll 128x dengan strength reduction
@@ -2426,7 +2426,7 @@ depan. Dua faktor berbeda dipakai:
 - `ATOM_FACTOR = 2` untuk loop beratom. Membangun ulang atom tiap langkah
   berbiaya O(factor^2) perkalian, jadi faktor besar justru merugikan; 2 sudah
   memutus rantai `imul` yang dibawa.
-- `PARTIAL_FACTOR = 6` (dapat diatur `CG_CLIF_PARTIAL`) untuk reduksi affine
+- `PARTIAL_FACTOR = 6` (dapat diatur `RAKIT_PARTIAL`) untuk reduksi affine
   murni tanpa atom.
 
 Sapuan faktor mengonfirmasi: untuk loop beratom, faktor 2 terbaik (p7 49→39,6 ms,
@@ -2484,13 +2484,13 @@ Runtime peak RSS identik dengan LLVM di semua program.
 
 - Uji diferensial (`t_atom`): keluaran modifikasi == LLVM == atom-dimatikan,
   identik.
-- Suite penuh `./y.sh test --sysroot clif`: **65 suite, 0 gagal, exit 0**
+- Suite penuh `./y.sh test --sysroot rakit`: **65 suite, 0 gagal, exit 0**
   (termasuk `regex`, `rand`, `graviola`, `portable-simd`, `stdarch`).
-- Knob: `CG_CLIF_PARTIAL` (faktor reduksi), `CG_CLIF_NO_ATOM` (matikan atom).
+- Knob: `RAKIT_PARTIAL` (faktor reduksi), `RAKIT_NO_ATOM` (matikan atom).
 
 ### 19.7 Sisa gap `p8_minmax` (35 ms vs LLVM 17,7 ms)
 
-Dump CLIF membuktikan reassosiasi **bekerja**: untuk faktor 2, blok badan
+Dump RAKIT membuktikan reassosiasi **bekerja**: untuk faktor 2, blok badan
 menghitung `v75 = C*acc`, `v89 = C^2*acc + C*(i|1) + (i+1)|1` — keduanya `imul`
 independen dari `acc` header (`imul v59,C` dan `imul v59,C^2`) — dan klon
 meneruskan `v89` ke header, sehingga rantai `acc` terputus menjadi satu `imul`
@@ -2520,7 +2520,7 @@ dan sudah memberi 38→35 ms plus kemenangan penuh di `p7`.
 ### 20.1 Gejala
 
 Menjalankan suite `regex` (lewat dependensi `env_logger`) membuat compiler
-**panic** di `vendor/cranelift-codegen-0.137.0/src/ir/dfg.rs:401`:
+**panic** di `vendor/rakit-codegen-0.137.0/src/ir/dfg.rs:401`:
 
 ```
 index out of bounds: the len is 2440 but the index is 4294967295
@@ -2529,9 +2529,9 @@ index out of bounds: the len is 2440 but the index is 4294967295
 di dalam `EgraphPass` → `insert_pure_enode` → `constructor_simplify`. Indeks
 `4294967295` (`u32::MAX`) adalah `Value::reserved_value()`: sebuah instruksi
 memakai nilai yang tidak ada. Mematikan pass lain tidak menolong; hanya
-`CG_CLIF_NO_DIVTEST=1` yang menghilangkan ICE. Jadi `div_test` (§18) yang
+`RAKIT_NO_DIVTEST=1` yang menghilangkan ICE. Jadi `div_test` (§18) yang
 memicunya — **bug pra-ada**, bukan akibat pekerjaan §19 (ICE tetap muncul dengan
-`CG_CLIF_UNROLL=1`).
+`RAKIT_UNROLL=1`).
 
 ### 20.2 Akar masalah: penggunaan lewat alias tak terhitung
 
@@ -2541,7 +2541,7 @@ memicunya — **bug pra-ada**, bukan akibat pekerjaan §19 (ICE tetap muncul den
 1. **Argumen cabang (block-call args).** `arguments()` untuk `brif`/`jump`
    mengembalikan **hanya kondisi**, bukan argumen blok tujuan. Nilai remainder
    yang juga diteruskan sebagai argumen phi tidak terhitung.
-2. **Alias nilai.** cg_clif banyak memancarkan alias (`v420 -> v399`). Jika
+2. **Alias nilai.** rakit banyak memancarkan alias (`v420 -> v399`). Jika
    sebuah alias dari nilai remainder dipakai, penggunaan itu tercatat atas nama
    alias, bukan nilai aslinya.
 
@@ -2636,7 +2636,7 @@ tail-recursion elimination, struktur lane).
 
 ### 21.5 Verifikasi
 
-`./y.sh test --sysroot clif` → **65 suite, 0 gagal** (EXIT 0). Semua keluaran
+`./y.sh test --sysroot rakit` → **65 suite, 0 gagal** (EXIT 0). Semua keluaran
 program benchmark (p1–p9, `t_atom`, `t_loop`, `t_u64f32`, `t_iter`, `t_alias`)
 identik dengan LLVM.
 
@@ -2686,7 +2686,7 @@ dibawa sebagai state karena lane sudah maju melewati `a_B` saat keluar.
 `p8_minmax` (30 juta iterasi): **29 → 21 ms** (LLVM 18). Sapuan faktor
 (ms): f=2 **21**, 4 23, 6 22, 8 24. f=2 menang karena tekanan register lebih
 kecil (8 nilai terbawa pada f=4 memicu spill; f=2 tidak). Sisa gap ~1.17× ke
-LLVM adalah kualitas regalloc `cranelift-codegen` (spill), di luar cakupan.
+LLVM adalah kualitas regalloc `rakit-codegen` (spill), di luar cakupan.
 
 ### 22.5 Verifikasi
 
@@ -2705,7 +2705,7 @@ Catatan: `fcvt_from_sint` pada **i32 langsung** TIDAK aman (nilai `u32 ≥ 2^31`
 jadi negatif), jadi tipe sempit saja bukan alasan cukup — hanya `uextend` yang
 menjamin non-negatif.
 
-- `./y.sh test --sysroot clif` → **65 suite, 0 gagal**.
+- `./y.sh test --sysroot rakit` → **65 suite, 0 gagal**.
 - Semua 9 program benchmark keluaran identik dengan LLVM; tidak ada regresi
   (p1–p9, compile/size/runtime).
 
@@ -2716,7 +2716,7 @@ menjamin non-negatif.
 `(i as f32)` untuk `i: usize` menjadi `fcvt_from_uint` (u64→f32). Di x86-64
 konversi u64→float yang benar untuk seluruh rentang butuh **branch**: nilai
 ≥ 2^63 harus di-`shr`/`or` dulu. LLVM menghindarinya karena analisis rentang
-tahu `i < N < 2^63` → cukup satu `cvtsi2ss`. Cranelift tak melihat batas itu,
+tahu `i < N < 2^63` → cukup satu `cvtsi2ss`. Rakit tak melihat batas itu,
 jadi selalu mengeluarkan barisan bercabang.
 
 ### 23.2 Perbaikan (`src/unroll.rs`, `narrow_uint_fcvt`)
@@ -2725,11 +2725,11 @@ Untuk setiap `fcvt_from_uint(x)`, telusuri **dominator** bloknya. Jika ada
 dominator yang mem-`brif` pada `icmp ult x, C` (atau `ule`) dengan `C < 2^63`
 dan **sisi-true-nya mendominasi** blok itu, maka di blok tersebut `x ≤ C < 2^63`
 — aman diganti `fcvt_from_sint`. Ditangani juga `C > x` / `C >= x`. Batas
-dinamis (bukan konstanta) atau ≥ 2^63 dibiarkan. Knob: `CG_CLIF_NO_NARROW_FCVT`.
+dinamis (bukan konstanta) atau ≥ 2^63 dibiarkan. Knob: `RAKIT_NO_NARROW_FCVT`.
 
 Kesederhanaan ini penting: transformasi tidak butuh model loop — hanya
 `DominatorTree` dan satu `icmp` penjaga, sehingga bekerja juga untuk loop
-berbadan **banyak blok** (loop `for i in 0..n` di cg_clif sering terpecah
+berbadan **banyak blok** (loop `for i in 0..n` di rakit sering terpecah
 beberapa blok oleh penurunan iterator rentang, dan `analyze` di §19 menolaknya).
 
 ### 23.3 Hasil
@@ -2756,17 +2756,17 @@ Catatan: `fcvt_from_sint` pada **i32 langsung** TIDAK aman (nilai `u32 ≥ 2^31`
 jadi negatif), jadi tipe sempit saja bukan alasan cukup — hanya `uextend` yang
 menjamin non-negatif.
 
-- `./y.sh test --sysroot clif` → **65 suite, 0 gagal**.
+- `./y.sh test --sysroot rakit` → **65 suite, 0 gagal**.
 
 ## 24. Fusi `sin`+`cos` → `sincos` (LANDED)
 
 ### 24.1 Masalah
 LLVM menggabungkan `sin(x)` dan `cos(x)` dengan argumen sama menjadi satu
 panggilan `sincosf`/`sincos` (glibc memakai reduksi argumen bersama, ~30% lebih
-murah dari dua panggilan). cg_clif memanggil `sinf` + `cosf` terpisah. Di
+murah dari dua panggilan). rakit memanggil `sinf` + `cosf` terpisah. Di
 `p4_simd` (loop `a[i]=sin(i); b[i]=cos(i)`) ini ~14% runtime.
 
-### 24.2 Perbaikan (`src/sincos.rs`, pass CLIF baru)
+### 24.2 Perbaikan (`src/sincos.rs`, pass RAKIT baru)
 Untuk setiap `sinf(x)`/`sin(x)` dan `cosf(x)`/`cos(x)` dengan argumen sama,
 bila blok `sin` **mendominasi** blok `cos` (atau blok yang sama):
 1. buat dua stack slot (keluaran sin & cos),
@@ -2778,7 +2778,7 @@ bila blok `sin` **mendominasi** blok `cos` (atau blok yang sama):
    (`detach_inst_results` + `change_to_alias`), hapus kedua panggilan lama.
 
 Pass berjalan di `base.rs` (punya `module` untuk mendeklarasikan simbol) setelah
-`unroll`. Knob: `CG_CLIF_NO_SINCOS`.
+`unroll`. Knob: `RAKIT_NO_SINCOS`.
 
 ### 24.3 Bug yang ditemukan (penting)
 Versi pertama mendeklarasikan **satu** func_ref berdasarkan tipe pasangan
@@ -2798,21 +2798,21 @@ dalam loop, `sin`-saja/`cos`-saja. Semua byte-identik LLVM. `./y.sh test` →
 ## 25. Upaya eliminasi bounds check redundan (NEGATIF — ditarik)
 
 ### 25.1 Motivasi
-`for i in 0..v.len() { v[i] }` di cg_clif menghasilkan **dua** perbandingan di
+`for i in 0..v.len() { v[i] }` di rakit menghasilkan **dua** perbandingan di
 loop: guard `i < len` (lompat ke body) dan, di body, cek bounds `i >= len →
 panic_bounds_check`. Yang kedua redundan (guard sudah membuktikan `i < len`).
 Ini pola sangat umum; LLVM mengeliminasinya.
 
 ### 25.2 Yang dicoba
-Pass CLIF `redundant_branch`: untuk tiap `brif (icmp CC x y) T, F`, cari
+Pass RAKIT `redundant_branch`: untuk tiap `brif (icmp CC x y) T, F`, cari
 dominator dengan `brif (icmp CC x' y')` di mana sisi yang sesuai mendominasi
 blok ini; jika `(x,y) == (x',y')`, kondisi terbukti dan cabang mati → ganti
 dengan `jump`. Ditambah substitusi block-param pada edge langsung (guard
 meneruskan `i` ke body lewat parameter blok).
 
-### 25.3 Mengapa gagal (akar masalah, via dump CLIF)
+### 25.3 Mengapa gagal (akar masalah, via dump RAKIT)
 - **9 benchmark: 0 perubahan biner.** Pass tidak pernah menyala.
-- Dump CLIF `bcbig` menunjukkan guard loop membandingkan terhadap `v8` (nilai
+- Dump RAKIT `bcbig` menunjukkan guard loop membandingkan terhadap `v8` (nilai
   `end` dari `Range`, diteruskan sebagai block-param) sedangkan cek bounds
   membandingkan terhadap `v75` (hasil `load` `v.len()` yang **terpisah**).
   `v8 != v75` sebagai SSA value walau keduanya = panjang slice. Aturan
@@ -2833,11 +2833,11 @@ panjang lebih dulu.
 ## 26. Upaya hoisting load loop-invariant (NEGATIF — ditarik)
 
 ### 26.1 Motivasi
-Header `Vec` (`ptr`, `len`) di-emit cg_clif sebagai load slot stack biasa
-(`notrap` saja, tanpa `readonly`/`can_move`) tiap iterasi. Pass CLIF
+Header `Vec` (`ptr`, `len`) di-emit rakit sebagai load slot stack biasa
+(`notrap` saja, tanpa `readonly`/`can_move`) tiap iterasi. Pass RAKIT
 `licm_loads` menandai load dari slot privat yang alamatnya `stack_addr+const`
 dan slotnya tak di-store di loop itu menjadi `readonly+can_move+notrap`,
-berharap pass LICM Cranelift (yang jalan kemudian di `Context::compile`)
+berharap pass LICM Rakit (yang jalan kemudian di `Context::compile`)
 mengangkatnya ke preheader.
 
 ### 26.2 Hasil (negatif)
@@ -2864,9 +2864,9 @@ loop-nya memang memory-reload-bound, bukan libcall/vektorisasi-bound.
 
 ### 27.1 Kenapa ini bisa padahal saya sempat bilang "tidak bisa"
 Transformasi `fib`→loop **bukan** pekerjaan backend — itu pass **middle-end
-LLVM (`TailCallElim`)** pada LLVM IR. cg_clif melewati middle-end itu, jadi
-bentuk naif (dua call/aktivasi) sampai ke CLIF. Tapi polanya bisa dipulihkan di
-CLIF: pass baru `src/rec_loop.rs` mencocokkan
+LLVM (`TailCallElim`)** pada LLVM IR. rakit melewati middle-end itu, jadi
+bentuk naif (dua call/aktivasi) sampai ke RAKIT. Tapi polanya bisa dipulihkan di
+RAKIT: pass baru `src/rec_loop.rs` mencocokkan
 `F(x) = if x < base { x } else { F(x-c1) + F(x-c2) }` dan menulis ulang jadi
 loop berakumulator `acc=0; while x>=base { acc += F(x-c1); x -= c2 } return acc+x`.
 Ini meniru `TailCallElim`, hanya untuk pola linear-recurrence (fib-shaped).
@@ -2882,7 +2882,7 @@ Ini meniru `TailCallElim`, hanya untuk pola linear-recurrence (fib-shaped).
 - Bangun 3 blok baru (loop/base/rec) dengan param loop-carried `(n, acc)`,
   redirect terminator entry ke `jump loop(n, 0)`, hapus 5 blok lama
   (`remove_block_and_insts`). Dijalankan sebelum `store_forward` (early).
-- Knob `CG_CLIF_NO_REC_LOOP` untuk A/B.
+- Knob `RAKIT_NO_REC_LOOP` untuk A/B.
 
 ### 27.3 Hasil
 `fib` sekarang **1 call/iterasi** (persis bentuk LLVM). p3_calls
@@ -2894,7 +2894,7 @@ benchmark identik LLVM, **`./y.sh test` → 25368 passed / 65 suites / 0 failed*
 Hanya pola linear-recurrence identitas ini. Kelas yang lebih luas (base bukan
 identitas, `k·F(n-1)+c`, dst.) butuh generalisasi seperti `TailCallElim` penuh —
 pekerjaan lanjutan. Ini bukti bahwa gap "middle-end" LLVM bisa dipulihkan
-sebagian dengan pass CLIF bertarget.
+sebagian dengan pass RAKIT bertarget.
 
 ## 28. Inliner "hot callee" → p2 −5%
 
@@ -2919,7 +2919,7 @@ alih-alih berhenti setelah beberapa.
 - p2_mem **52.6 → 50.0 ms (−5.0%)**, gap 3.42× → **3.25×**.
 - p1/p3–p9 dalam noise (≤±1.6%); **p9 tak regresi**.
 - Size +0.2–0.4% (8–18 KB), compile sama (dalam noise).
-- `./y.sh test --sysroot clif` → **25368 passed / 65 suites / 0 failed**.
+- `./y.sh test --sysroot rakit` → **25368 passed / 65 suites / 0 failed**.
 
 ### 28.4 Catatan
 `HOT_BUDGET=4096` (lebih agresif) memberi p2 −4.1% **dan** p3 −5.3% tetapi p9 +4.3%
@@ -2927,7 +2927,7 @@ regresi → ditolak; 1024 = titik aman. Jadi "p2 tidak bisa" ternyata **sebagian
 (sort inlining); sisa p2 tetap codegen (partition 28% sudah 0-call, codegen-bound).
 
 ### 28.5 Validasi pada crate nyata (extbench) — generalisasi terbukti
-A/B hot-callee (ON vs `CG_CLIF_NO_HOT_INLINE=1`) pada 3 crate nyata crateworks:
+A/B hot-callee (ON vs `RAKIT_NO_HOT_INLINE=1`) pada 3 crate nyata crateworks:
 | crate | run hot/base | Δrun | Δcompile | Δsize |
 |-------|-------------|------|----------|-------|
 | openlocationcode | 10971/11139 | −1.5% | −0.4% | −616 |
@@ -2937,4 +2937,4 @@ Menang kecil di 2/3, netral di stdnum, **compile ~netral**. Berbeda dengan
 `MIN_GROWTH=1024` (sesi lain) yang memberi p2 −8.7% tetapi **compile +15%** di
 crate nyata lalu dibuang. Hot-callee menargetkan callee yang di-inline berulang
 (bukan menaikkan lantai semua caller), jadi biaya compile-nya kecil dan
-**bukan overfitting ke p2_mem**. Knob `CG_CLIF_NO_HOT_INLINE` untuk bisect.
+**bukan overfitting ke p2_mem**. Knob `RAKIT_NO_HOT_INLINE` untuk bisect.

@@ -1,5 +1,5 @@
 // Plain scalar while-loop, no iterator struct, no function calls.
-// Isolates whether Cranelift promotes MIR locals to registers.
+// Isolates whether Rakit promotes MIR locals to registers.
 fn main() {
     let mut acc: u64 = 0;
     let mut i: u64 = 0;
