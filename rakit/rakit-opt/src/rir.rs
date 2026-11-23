@@ -1486,7 +1486,8 @@ pub fn unsupported_reason(func: &CgFunction) -> Option<String> {
                     return Some(format!("result type {ty}"));
                 }
             }
-            match func.dfg.insts[inst] {
+            let data = func.dfg.insts[inst];
+            match data {
                 InstructionData::UnaryImm { opcode: Opcode::Iconst, .. } => {
                     if let Some(r) = func.dfg.inst_results(inst).first() {
                         if map_type_to_rir(func.dfg.value_type(*r)) == Some(RirType::I128) {
@@ -1526,7 +1527,8 @@ pub fn unsupported_reason(func: &CgFunction) -> Option<String> {
                         return Some("try call ABI".to_string());
                     }
                 }
-                InstructionData::Store { args, .. } | InstructionData::StoreNoOffset { args, .. } => {
+                InstructionData::Store { opcode: Opcode::Store, args, .. }
+                | InstructionData::StoreNoOffset { opcode: Opcode::Store, args, .. } => {
                     let ty = func.dfg.value_type(args[0]);
                     if map_type_to_rir(ty).is_none() {
                         return Some(format!("store type {ty}"));
@@ -1565,7 +1567,26 @@ pub fn unsupported_reason(func: &CgFunction) -> Option<String> {
                 InstructionData::ExceptionHandlerAddress { opcode, .. } => {
                     return Some(format!("exception address {opcode}"));
                 }
-                _ => {}
+                InstructionData::UnaryImm { opcode, .. } => {
+                    return Some(format!("unary imm {opcode}"));
+                }
+                InstructionData::UnaryIeee32 { opcode: Opcode::F32const, .. }
+                | InstructionData::UnaryIeee64 { opcode: Opcode::F64const, .. }
+                | InstructionData::IntCompare { opcode: Opcode::Icmp, .. }
+                | InstructionData::FloatCompare { opcode: Opcode::Fcmp, .. }
+                | InstructionData::StackAddr { opcode: Opcode::StackAddr, .. }
+                | InstructionData::Load { opcode: Opcode::Load, .. }
+                | InstructionData::LoadNoOffset { opcode: Opcode::Load, .. }
+                | InstructionData::UnaryGlobalValue { .. }
+                | InstructionData::FuncAddr { opcode: Opcode::FuncAddr, .. }
+                | InstructionData::DynamicStackAddr { opcode: Opcode::DynamicStackAddr, .. }
+                | InstructionData::CondTrap { opcode: Opcode::Trapz | Opcode::Trapnz, .. }
+                | InstructionData::BranchTable { .. }
+                | InstructionData::Jump { .. }
+                | InstructionData::Brif { .. }
+                | InstructionData::Trap { .. }
+                | InstructionData::NullAry { opcode: Opcode::Nop } => {}
+                _ => return Some(format!("unsupported instruction {}", data.opcode())),
             }
         }
     }
@@ -2409,6 +2430,20 @@ mod call_tests {
             i,
             RirInst::CallIndirect { call_conv, .. } if *call_conv == call_conv_to_rir(CallConv::Fast)
         )));
+    }
+
+    #[test]
+    fn fence_is_not_rir_eligible() {
+        let (mut f, e) = new_func(&[], &[]);
+        let fence = f.dfg.make_inst(InstructionData::NullAry { opcode: Opcode::Fence });
+        f.layout.append_inst(fence, e);
+        ret(&mut f, e, &[]);
+        assert!(import(&f).is_none(), "import must reject a fence");
+        assert!(!is_supported(&f), "preflight must reject a fence");
+        assert!(
+            unsupported_reason(&f).is_some(),
+            "preflight must give a reason for a fence"
+        );
     }
 
     #[test]

@@ -2613,19 +2613,9 @@ Runtime (wall ms) M vs L, sebelum → sesudah sesi ini:
 | p7_branchy | 40.3 | **36** | 45 | 100 |
 | p8_minmax  | 35.0 | **29** | 18 | 38 |
 
-Matriks lengkap sesi ini (C = compile wall ms, R = run wall ms, size = byte):
-
-| prog | C L/U/M | R L/U/M | size L/U/M |
-|------|---------|---------|------------|
-| p1 | 86/82/78 | 82/108/100 | 4.63/5.88/4.13 MB |
-| p2 | 247/125/146 | 16/155/52 | 4.64/5.94/4.14 MB |
-| p3 | 99/86/86 | 36/116/94 | 4.61/5.82/4.06 MB |
-| p4 | 107/92/98 | 56/156/99 | 4.64/5.89/4.14 MB |
-| p5 | 83/76/84 | 58/893/**6** | 4.61/5.81/4.05 MB |
-| p6 | 82/76/75 | 58/902/**6** | 4.61/5.81/4.05 MB |
-| p7 | 84/77/76 | 45/100/**36** | 4.61/5.81/4.05 MB |
-| p8 | 84/79/80 | 18/38/**29** | 4.61/5.81/4.05 MB |
-| p9 | 94/86/87 | 30/76/34 | 4.64/5.89/4.13 MB |
+Matriks lengkap sesi ini tidak menyimpan CPU/RSS, jadi angka wall/size di atas
+hanya dipakai untuk delta. Matriks penuh terbaru (compile/run wall, CPU, peak
+RSS, dan ukuran artefak dalam byte) ada di §29.
 
 M unggul dari LLVM pada: waktu compile (semua kecuali p4/p5 sedikit lebih
 lambat; p2 1.7× lebih cepat), ukuran (≈12% lebih kecil di semua prog), dan
@@ -2959,42 +2949,42 @@ R = run; wall/CPU dalam ms, RSS dalam MB, size dalam byte):
 
 | prog | bk | Cwall | Ccpu | Crss | size | Rwall | Rcpu | Rrss |
 |------|----|------:|-----:|-----:|-----:|------:|-----:|-----:|
-| p1_arith | L | 84 | 102 | 105.5 | 4,635,232 | 82 | 82 | 10.5 |
-| p1_arith | U | 81 | 104 | 107.2 | 5,877,944 | 110 | 109 | 10.7 |
-| p1_arith | M | 78 | 100 | 109.6 | 4,146,240 | 102 | 101 | 10.7 |
-| p2_mem | L | 245 | 378 | 133.8 | 4,639,888 | 16 | 16 | 10.5 |
-| p2_mem | U | 128 | 174 | 130.8 | 5,936,144 | 157 | 158 | 10.7 |
-| p2_mem | M | 161 | 224 | 133.1 | 4,143,704 | 48 | 47 | 10.8 |
-| p3_calls | L | 102 | 125 | 116.1 | 4,612,368 | 37 | 36 | 10.7 |
-| p3_calls | U | 85 | 112 | 116.4 | 5,820,136 | 116 | 116 | 10.7 |
-| p3_calls | M | 96 | 123 | 118.6 | 4,067,168 | 59 | 60 | 10.5 |
-| p4_simd | L | 108 | 133 | 116.4 | 4,636,096 | 58 | 58 | 48.1 |
-| p4_simd | U | 90 | 114 | 117.0 | 5,892,376 | 156 | 155 | 49.5 |
-| p4_simd | M | 100 | 124 | 119.2 | 4,152,832 | 82 | 82 | 48.8 |
-| p5_inline | L | 82 | 101 | 104.9 | 4,609,368 | 58 | 57 | 10.7 |
-| p5_inline | U | 75 | 100 | 106.5 | 5,813,704 | 893 | 892 | 10.8 |
-| p5_inline | M | 76 | 101 | 108.3 | 4,060,088 | 7 | 6 | 10.5 |
-| p6_scalar | L | 82 | 101 | 101.2 | 4,609,368 | 58 | 57 | 10.3 |
-| p6_scalar | U | 75 | 98 | 103.0 | 5,813,688 | 902 | 901 | 10.7 |
-| p6_scalar | M | 75 | 96 | 104.6 | 4,060,088 | 6 | 6 | 10.7 |
-| p7_branchy | L | 84 | 102 | 104.9 | 4,609,520 | 43 | 42 | 10.7 |
-| p7_branchy | U | 77 | 100 | 106.6 | 5,813,800 | 100 | 100 | 10.7 |
-| p7_branchy | M | 76 | 98 | 108.4 | 4,060,248 | 35 | 35 | 10.7 |
-| p8_minmax | L | 84 | 104 | 104.9 | 4,609,544 | 18 | 18 | 10.7 |
-| p8_minmax | U | 77 | 103 | 106.6 | 5,813,752 | 38 | 38 | 10.7 |
-| p8_minmax | M | 77 | 100 | 108.4 | 4,060,216 | 20 | 20 | 10.5 |
-| p9_u64f32 | L | 94 | 114 | 110.9 | 4,635,448 | 30 | 30 | 17.8 |
-| p9_u64f32 | U | 83 | 104 | 112.6 | 5,886,872 | 76 | 76 | 18.9 |
-| p9_u64f32 | M | 90 | 113 | 114.7 | 4,149,856 | 33 | 32 | 18.2 |
+| p1_arith | L | 86 | 107 | 105.7 | 4,635,232 | 81 | 81 | 10.7 |
+| p1_arith | U | 81 | 103 | 107.9 | 5,877,944 | 108 | 108 | 10.8 |
+| p1_arith | M | 77 | 100 | 109.7 | 4,147,312 | 102 | 101 | 10.7 |
+| p2_mem | L | 272 | 400 | 133.6 | 4,639,888 | 16 | 17 | 10.5 |
+| p2_mem | U | 126 | 167 | 130.6 | 5,936,144 | 156 | 157 | 10.7 |
+| p2_mem | M | 177 | 247 | 133.4 | 4,144,224 | 52 | 53 | 10.7 |
+| p3_calls | L | 99 | 121 | 116.1 | 4,612,368 | 37 | 37 | 10.5 |
+| p3_calls | U | 90 | 120 | 116.2 | 5,820,136 | 117 | 116 | 10.5 |
+| p3_calls | M | 92 | 118 | 118.4 | 4,068,256 | 59 | 59 | 10.7 |
+| p4_simd | L | 108 | 128 | 116.4 | 4,636,096 | 56 | 56 | 48.2 |
+| p4_simd | U | 92 | 117 | 117.0 | 5,892,376 | 159 | 157 | 49.4 |
+| p4_simd | M | 111 | 135 | 119.0 | 4,153,904 | 83 | 82 | 48.8 |
+| p5_inline | L | 81 | 101 | 104.9 | 4,609,368 | 58 | 57 | 10.7 |
+| p5_inline | U | 77 | 100 | 106.6 | 5,813,704 | 896 | 894 | 10.5 |
+| p5_inline | M | 77 | 106 | 108.4 | 4,061,168 | 7 | 6 | 10.7 |
+| p6_scalar | L | 82 | 99 | 101.4 | 4,609,368 | 58 | 57 | 10.5 |
+| p6_scalar | U | 75 | 95 | 102.8 | 5,813,688 | 900 | 900 | 10.7 |
+| p6_scalar | M | 76 | 100 | 104.6 | 4,061,168 | 6 | 6 | 10.7 |
+| p7_branchy | L | 83 | 102 | 105.0 | 4,609,520 | 44 | 44 | 10.8 |
+| p7_branchy | U | 80 | 102 | 106.8 | 5,813,800 | 101 | 99 | 10.7 |
+| p7_branchy | M | 77 | 100 | 108.6 | 4,061,320 | 35 | 35 | 10.7 |
+| p8_minmax | L | 85 | 103 | 105.2 | 4,609,544 | 18 | 17 | 10.5 |
+| p8_minmax | U | 78 | 97 | 106.6 | 5,813,752 | 38 | 38 | 10.5 |
+| p8_minmax | M | 80 | 104 | 108.4 | 4,061,312 | 20 | 20 | 10.8 |
+| p9_u64f32 | L | 94 | 114 | 110.6 | 4,635,448 | 31 | 31 | 17.8 |
+| p9_u64f32 | U | 87 | 109 | 112.7 | 5,886,872 | 76 | 76 | 18.8 |
+| p9_u64f32 | M | 93 | 119 | 114.8 | 4,150,944 | 34 | 34 | 18.2 |
 
-Dibanding matriks §21.4: runtime `p3` 94→59, `p4` 99→82, `p8` 29→20;
-`p2` 52→48, `p7` 36→35; `p1`/`p9` dalam ±1 ms; `p5`/`p6` 6→7 ms karena
+Dibanding matriks §21.4: runtime `p3` 94→59, `p4` 99→83, `p8` 29→20;
+`p2` 52→52, `p7` 36→35; `p1`/`p9` dalam ±1 ms; `p5`/`p6` 6→7 ms karena
 pembulatan. Ukuran artefak M lebih kecil dari L dan U pada semua program
 (4.06–4.15 MB vs L 4.61–4.64 MB, U 5.81–5.94 MB). Compile absolut naik di
 semua backend pada run ini (mesin lebih lambat), tetapi dengan anggaran RIR CGU
-besar `p2` M 161 ms (U 128, L 245); `p5`/`p6` M 76/75 ms, setara U (75/75)
-dan lebih cepat dari L (82/82). `p2` masih ~26% lebih lambat compile daripada
-U, tetapi runtime-nya jauh lebih cepat dari U (48 vs 157 ms).
+besar `p2` M 177 ms (U 126, L 272); `p5`/`p6` M 77/76 ms, setara U (77/75)
+dan lebih cepat dari L (81/82). `p2` masih ~40% lebih lambat compile daripada
+U, tetapi runtime-nya ~3× lebih cepat dari U (52 vs 156 ms).
 
 ### 29.1 Anggaran RIR untuk CGU besar (p2/p5 compile)
 
@@ -3075,4 +3065,15 @@ Semua temuan review ditindaklanjuti. Perubahan yang mendarat:
 - **Indirect call non-System V** diterima bila semua parameter ABI normal dan
   convention dapat di-encode RIR; test round-trip `CallConv::Fast`.
 - **Matriks benchmark** §29 sekarang memuat wall, CPU, peak RSS, dan ukuran
-  artefak dalam byte untuk setiap backend dan program.
+  artefak dalam byte untuk setiap backend dan program. Matriks parsial lama di
+  §21.4 dihapus dan diganti rujukan ke §29.
+- **Clone badan loop tidak lagi berbagi operand call.** `clone_body` memanggil
+  `InstructionData::deep_clone` sebelum `map_values`, sehingga daftar argumen
+  milik call asli tidak ditimpa oleh clone pertama. Regresi:
+  `bench/tests/t_loop_call_args.rs`; urutan argumen L dan M identik
+  (`1,3,10,32,99,301,908,2730`).
+- **Preflight RIR menolak opcode yang tidak di-import.** `unsupported_reason`
+  sekarang default menolak bentuk instruksi tak dikenal; `Fence` (NullAry
+  non-Nop) tidak lagi dihitung eligible. Test `fence_is_not_rir_eligible`.
+- **Nop di header tidak memblokir RIR unroll.** Placeholder DCE diterima oleh
+  `pure_header_inst`; test `dead_nop_in_header_does_not_block_unrolling`.

@@ -132,7 +132,8 @@ fn const_i64(func: &Function, mut v: Value) -> Option<i64> {
 /// executions, so only pure header computations are safe to leave in place.
 fn pure_header_inst(inst: &Inst) -> bool {
     match inst {
-        Inst::Iconst(..)
+        Inst::Nop(..)
+        | Inst::Iconst(..)
         | Inst::F32const(..)
         | Inst::F64const(..)
         | Inst::Copy(..)

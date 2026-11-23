@@ -810,24 +810,24 @@ fn clone_body(
 
     let insts: Vec<Inst> = insts.to_vec();
     for &old_inst in &insts {
-        let mut data = func.dfg.insts[old_inst];
-        {
-            let mut value_lists = std::mem::take(&mut func.dfg.value_lists);
-            let mut jump_tables = std::mem::take(&mut func.dfg.jump_tables);
-            let mut exception_tables = std::mem::take(&mut func.dfg.exception_tables);
-            // `InstructionData` is `Copy` and its `BlockCall`s share the value
-            // pool with the original instruction. Deep-clone them first, or
-            // remapping the clone's branch arguments would corrupt the original.
-            for call in data.branch_destination_mut(&mut jump_tables, &mut exception_tables) {
-                *call = call.deep_clone(&mut value_lists);
-            }
-            data.map_values(&mut value_lists, &mut jump_tables, &mut exception_tables, |v| {
-                *vmap.get(&v).unwrap_or(&v)
-            });
-            func.dfg.value_lists = value_lists;
-            func.dfg.jump_tables = jump_tables;
-            func.dfg.exception_tables = exception_tables;
+        let original = func.dfg.insts[old_inst];
+        let mut value_lists = std::mem::take(&mut func.dfg.value_lists);
+        let mut jump_tables = std::mem::take(&mut func.dfg.jump_tables);
+        let mut exception_tables = std::mem::take(&mut func.dfg.exception_tables);
+        // `InstructionData` is `Copy`, but pooled operand lists and `BlockCall`
+        // arguments live in the value pool. Deep-clone the whole instruction
+        // before remapping: otherwise the first clone rewrites the original
+        // call's shared argument list and later clones remap the wrong values.
+        let mut data = original.deep_clone(&mut value_lists);
+        for call in data.branch_destination_mut(&mut jump_tables, &mut exception_tables) {
+            *call = call.deep_clone(&mut value_lists);
         }
+        data.map_values(&mut value_lists, &mut jump_tables, &mut exception_tables, |v| {
+            *vmap.get(&v).unwrap_or(&v)
+        });
+        func.dfg.value_lists = value_lists;
+        func.dfg.jump_tables = jump_tables;
+        func.dfg.exception_tables = exception_tables;
         let ctrl_typevar = func.dfg.ctrl_typevar(old_inst);
         let new_inst = func.dfg.make_inst(data);
         func.dfg.make_inst_results(new_inst, ctrl_typevar);

@@ -100,3 +100,37 @@ fn conditional_second_entry_does_not_overshoot() {
     assert!(verify(&f).is_ok(), "{:?}", verify(&f));
     assert_eq!(run(&f, &[]).unwrap(), vec![Val::I(1)], "changed={changed}");
 }
+
+#[test]
+fn dead_nop_in_header_does_not_block_unrolling() {
+    let mut b = Builder::new(vec![Type::I64], vec![]);
+    let e = b.func().entry;
+    let zero = b.iconst(e, Type::I64, 0);
+    let header = b.add_block(vec![Type::I64, Type::I64]);
+    let body = b.add_block(vec![]);
+    let exit = b.add_block(vec![Type::I64]);
+    b.jump(e, header, vec![zero, zero]);
+
+    // Dead-code elimination leaves Nop placeholders behind. They have no
+    // effect and must not make an otherwise pure header look unsafe.
+    b.nop(header, Type::I64);
+
+    let iv = b.func().block(header).params[0];
+    let acc = b.func().block(header).params[1];
+    let bound = b.iconst(header, Type::I64, 4);
+    let cond = b.icmp(header, IntCc::Ult, Type::I64, iv, bound);
+    b.brif(header, cond, body, vec![], exit, vec![acc]);
+
+    let one = b.iconst(body, Type::I64, 1);
+    let iv2 = b.bin(body, BinOp::Add, Type::I64, iv, one);
+    let acc2 = b.bin(body, BinOp::Add, Type::I64, acc, iv);
+    b.jump(body, header, vec![iv2, acc2]);
+
+    let out = b.func().block(exit).params[0];
+    b.ret(exit, vec![out]);
+
+    let mut f = b.into_func();
+    assert!(unroll::run(&mut f));
+    assert!(verify(&f).is_ok(), "{:?}", verify(&f));
+    assert_eq!(run(&f, &[]).unwrap(), vec![Val::I(6)]);
+}
