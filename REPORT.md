@@ -201,7 +201,7 @@ Artefak: `bench/out/<label>/<prog>`, log di `/tmp/compare3.log`,
 
 ## 8. Status implementasi rekomendasi (revisi terakhir)
 
-Rekomendasi 1–3 dikerjakan di fork lokal `rakit_mod`; rekomendasi 4 tidak
+Rekomendasi 1–3 dikerjakan di fork lokal `rakit`; rekomendasi 4 tidak
 dikerjakan (milik repo resmi).
 
 ### 8.1 SROA (rekomendasi 2) — LANDED, `7ddf2d4`

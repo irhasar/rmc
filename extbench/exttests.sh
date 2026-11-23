@@ -5,7 +5,7 @@
 set -u
 EXT=$(cd "$(dirname "$0")" && pwd)
 N=nightly-2026-11-17
-declare -A RUSTC=( [L]="rustc +$N" [U]=${RUSTC_U:-$EXT/../cg_clif_upstream/dist/bin/rustc-clif} [M]=${RUSTC_M:-$EXT/../rakit_mod/dist/bin/rustc-rakit} )
+declare -A RUSTC=( [L]="rustc +$N" [U]=${RUSTC_U:-$EXT/../cg_clif_upstream/dist/bin/rustc-clif} [M]=${RUSTC_M:-$EXT/../rakit/dist/bin/rustc-rakit} )
 CRATES=${CRATEWORKS:-$EXT/crateworks}/crates
 OUT=$EXT/out/tests; mkdir -p "$OUT"
 

@@ -2,7 +2,7 @@
 set -u
 NIGHTLY=nightly-2026-11-17
 CG_UP="$(cd "$(dirname "$0")/.." && pwd)/cg_clif_upstream/dist/bin/rustc-clif"
-CG_MOD="$(cd "$(dirname "$0")/.." && pwd)/rakit_mod/dist/bin/rustc-rakit"
+CG_MOD="$(cd "$(dirname "$0")/.." && pwd)/rakit/dist/bin/rustc-rakit"
 PROGS="$(cd "$(dirname "$0")" && pwd)/progs"
 D=/tmp/sz2; mkdir -p $D
 for src in $PROGS/p2_mem.rs $PROGS/p3_calls.rs; do

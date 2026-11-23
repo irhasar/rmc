@@ -2,7 +2,7 @@
 set -u
 EXT=$(cd "$(dirname "$0")" && pwd); ROOT=$(cd "$EXT/.." && pwd)
 BENCH=$ROOT/bench
-M=$ROOT/rakit_mod/dist/bin/rustc-rakit
+M=$ROOT/rakit/dist/bin/rustc-rakit
 CRATES=$EXT/crateworks/crates; DRV=$EXT/drivers; OUT=$EXT/out_leafab; mkdir -p "$OUT"
 export PATH="$HOME/.cargo/bin:$PATH"
 cm(){ python3 "$BENCH/measure.py" --reps 5 --warmup 1 --json -- "$@" | python3 -c "import sys,json;d=json.load(sys.stdin);print('%.0f'%(d['wall_med']*1000))"; }

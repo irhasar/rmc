@@ -29,7 +29,7 @@ export CARGO_PROFILE_RELEASE_LTO=false
 declare -A BIN=(
   [L]="$HOME/.cargo/bin/cargo"
   [U]="$EXT/../cg_clif_upstream/dist/bin/cargo-clif"
-  [M]="$EXT/../rakit_mod/dist/bin/cargo-rakit"
+  [M]="$EXT/../rakit/dist/bin/cargo-rakit"
 )
 declare -A TDIR=( [L]=target-bL [U]=target-bU [M]=target-bM )
 

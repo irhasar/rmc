@@ -6,9 +6,9 @@ Only the **modified** backend was rebranded to **Rakit**; the upstream baseline
 Cranelift reference. The old engine, project, and IR tokens no longer appear in
 the modified tree's source, docs, or scripts.
 
-- **Layout**: the modified tree is `rakit_mod/`; the reference tree stays
+- **Layout**: the modified tree is `rakit/`; the reference tree stays
   `cg_clif_upstream/` (original cg_clif + Cranelift, unmodified).
-- **Vendoring (modified tree only)**: `rakit_mod/vendor/rakit-*` holds the full
+- **Vendoring (modified tree only)**: `rakit/vendor/rakit-*` holds the full
   codegen dependency set (`rakit-codegen`, `rakit-frontend`, `rakit-module`,
   `rakit-native`, `rakit-jit`, `rakit-object`, plus the transitive
   `rakit-bforest`, `rakit-bitset`, `rakit-control`, `rakit-entity`,
@@ -17,15 +17,15 @@ the modified tree's source, docs, or scripts.
   deps. `cg_clif_upstream/` keeps its original registry dependencies.
 - **Package/binary (modified tree)**: `rustc_codegen_rakit`, dylib
   `librustc_codegen_rakit.so`, wrappers `rustc-rakit` / `rustdoc-rakit` /
-  `cargo-rakit`, dist `rakit_mod/dist`.
+  `cargo-rakit`, dist `rakit/dist`.
 - **Env knobs (modified tree)**: the old prefix is now `RAKIT_*` (e.g.
   `RAKIT_NO_LANES`, `RAKIT_UNROLL_DEBUG`, `RAKIT_INLINE_MAX`); the IR-time
   counter is `RAKIT_IR_TIME`.
 - **Manifests (modified tree)**: the old `[patch.crates-io]` was removed; deps
   point directly at `vendor/rakit-*` via `path`.
 - **Build verified** with `nightly-2026-11-17` + `rust-src,rustc-dev,llvm-tools`:
-  `cargo check`/`cargo build --lib` clean in `rakit_mod`, and
-  `./y.sh build --sysroot rakit` produced `rakit_mod/dist/bin/rustc-rakit` plus
+  `cargo check`/`cargo build --lib` clean in `rakit`, and
+  `./y.sh build --sysroot rakit` produced `rakit/dist/bin/rustc-rakit` plus
   its Rakit-compiled std sysroot; a hello-world compiled and ran (`sum=5050`).
 
 ## Session (2026-11-22, "win everything") — why the remaining p1/p2/p3/p4/p8/p9 gaps are architectural
@@ -179,7 +179,7 @@ no knob closes them. **Nothing new landed beyond the already-pushed `a51c34b`
   https://github.com/cipansor/crateworks.git`).
 
 ## Session (2026-11-22) — `rec_loop`: recursion→loop (LANDED, p3 −38%)
-- New pass `rakit_mod/src/rec_loop.rs`: matches a self-recursive linear
+- New pass `rakit/src/rec_loop.rs`: matches a self-recursive linear
   recurrence `F(x) = if x < base { x } else { F(x-c1) + F(x-c2) }` and rewrites
   it into a loop `acc=0; while x>=base { acc += F(x-c1); x -= c2 } return acc+x`.
   This is what LLVM's middle-end `TailCallElim` does on LLVM IR; rakit has no
@@ -506,7 +506,7 @@ no knob closes them. **Nothing new landed beyond the already-pushed `a51c34b`
 ## Session (2026-11-19) — small-switch compare chain (LANDED, `6cefd14`)
 - **Methodology trap (important)**: `cargo build` in a driver crate does NOT use
   the Rakit backend. You must set `RUSTC=rustc-rakit` (with
-  `rakit_mod/dist/bin` on PATH), or you silently benchmark LLVM. Tell-tale
+  `rakit/dist/bin` on PATH), or you silently benchmark LLVM. Tell-tale
   sign: binary ~579 KB (LLVM) instead of ~1.63 MB (Rakit), and identical
   md5 across tunable values. All §9 numbers in REPORT.md use the correct build.
 - **Disproved**: autovectorization is NOT the blur gap. LLVM with
@@ -518,7 +518,7 @@ no knob closes them. **Nothing new landed beyond the already-pushed `a51c34b`
 - **Root cause found**: `rakit_frontend::Switch::emit` picks `br_table` for
   any contiguous case range, so `match i { 0=>r, 1=>g, 2=>b }` becomes a jump
   table. Binary had **2714** jump-table sites vs LLVM 0.
-- **Fix** (`rakit_mod/src/base.rs`, `SwitchInt`): ≤8 cases and discriminant
+- **Fix** (`rakit/src/base.rs`, `SwitchInt`): ≤8 cases and discriminant
   ≤64 bits → `icmp_imm_s` + `brif` chain. The 64-bit guard is REQUIRED:
   `icmp_imm_s` takes an i64 immediate, so i128/f128 discriminants truncate
   (that bug failed 13 coretests).
@@ -568,7 +568,7 @@ no knob closes them. **Nothing new landed beyond the already-pushed `a51c34b`
   symbol-size analysis instead of profiling.
 
 ## Session (2026-11-18, latest) — if-conversion diamond → select/cmove (LANDED locally)
-- New pass in the fork: `rakit_mod/src/if_convert.rs`. Collapses a short,
+- New pass in the fork: `rakit/src/if_convert.rs`. Collapses a short,
   side-effect-free two-way diamond (`brif` head -> then/else -> common join)
   into a `select` in the head, which Rakit lowers to `cmove`. Runs
   **before** `unroll` (slot `IF_CONVERT` in `passtime.rs`; knob
@@ -593,7 +593,7 @@ no knob closes them. **Nothing new landed beyond the already-pushed `a51c34b`
   user-supplied `repo`-scoped PAT (not stored).
 
 ## Session (2026-11-18, latest) — affine unroll factor 8 → 128 (LANDED locally)
-- `rakit_mod` head **`6951858`** "Raise the affine loop unroll factor to 128
+- `rakit` head **`6951858`** "Raise the affine loop unroll factor to 128
   with a checked step bound"; `rmc_clone` subtree commit **`193ec3e`** (PR #10
   branch `replace-main-with-rakit-experiments`), **not pushed** (see below).
 - **Win**: reassociating an affine loop to closed form `S_k = M^k·S + c` removes
@@ -646,7 +646,7 @@ no knob closes them. **Nothing new landed beyond the already-pushed `a51c34b`
   are ready.
 
 ## Session (2026-11-18) — inliner growth cap (LANDED locally)
-- `rakit_mod` head **`41dc347`** "Bound inliner growth by caller size; speed up
+- `rakit` head **`41dc347`** "Bound inliner growth by caller size; speed up
   dead-store removal".
 - **Root cause of the p2 compile gap vs U**: the inliner grew RAKIT by up to 62%
   (14449 → 23383 insts on p2_mem). Every later Rakit pass then walks the
@@ -674,7 +674,7 @@ no knob closes them. **Nothing new landed beyond the already-pushed `a51c34b`
   (RC=11/RR=11).
 
 ## Session (2026-11-18) — pass cost + SIMD lane ICE fix
-- `rakit_mod` head `97617a1`; `rmc_clone` subtree head `7249d45`.
+- `rakit` head `97617a1`; `rmc_clone` subtree head `7249d45`.
 - New `src/tunables.rs`: every env knob read once via `OnceLock` (passes run per
   function; `std::env::var` locks a global map each call).
 - `store_forward` rewritten: one `analyze()` setup walk instead of three, and a
@@ -701,7 +701,7 @@ cg_clif upstream (`rustc_codegen_cranelift`) vs a modified Rakit fork.
 - `REPORT.md` — findings, numbers, root causes, recommendations.
 - `build.sh` — rebuilds the modified Rakit backend + its Rakit std sysroot.
 - `cg_clif_upstream/` — pristine cg_clif (commit 42ac63e), unmodified.
-- `rakit_mod/` — fork with the modifications (see commits
+- `rakit/` — fork with the modifications (see commits
   `b6c94e4`…`9ea4bbe`).
 - `bench/` — harness:
   - `allaxes.sh` — **canonical all-axes 3-way harness** (LLVM / cg_clif
@@ -744,7 +744,7 @@ Add new programs under `bench/progs/` so they are picked up automatically.
 ## Build environment
 - Toolchain: `nightly-2026-11-17` (must match, rakit pins it).
 - Need `rust-src` and `llvm-tools`. `$HOME/.cargo/bin` on PATH.
-- Build: `build.sh` → `rakit_mod/dist/bin/rustc-rakit`.
+- Build: `build.sh` → `rakit/dist/bin/rustc-rakit`.
 - Rebuilding Rakit std takes ~1–2 min incremental.
 - **The toolchain is not always present.** Some sandbox restarts come back with
   no `rustc`, `cargo`, `rustup`, or `$HOME/.cargo` at all (`find / -name rustc`
@@ -776,7 +776,7 @@ Add new programs under `bench/progs/` so they are picked up automatically.
 - With LLVM-built std, rakit's binary size matches LLVM, proving the size gap
   comes from Rakit-built std and the runtime gap from the backend itself.
 
-## Modifications landed in `rakit_mod` (beyond upstream)
+## Modifications landed in `rakit` (beyond upstream)
 - `b6c94e4` per-symbol sections (size −15.6% raw, −26.5% stripped).
 - `7ddf2d4` **SROA**: a scalar local that is only *shared*-borrowed is kept in a
   register; a stack slot is materialized lazily at the first real address use
@@ -927,7 +927,7 @@ Add new programs under `bench/progs/` so they are picked up automatically.
 ## Gotchas
 - `measure.py`/`compare3.sh`: pass the rustc command as separate argv elements;
   the `--sysroot` handling in `run_backend` requires the sysroot as its own arg.
-- Regenerating `rakit_mod/Cargo.lock` needs dropping `--locked` because of the
+- Regenerating `rakit/Cargo.lock` needs dropping `--locked` because of the
   local `[patch.crates-io]` for `rakit-object`.
 - `--gc-sections` works in this environment (verified with a hand-written asm test).
 - **RAKIT rewriting:** `InstructionData` is `Copy` and its `BlockCall`s share the
@@ -945,7 +945,7 @@ Add new programs under `bench/progs/` so they are picked up automatically.
 ## Push status (T6) — DONE
 - PR **#10** (`replace-main-with-rakit-experiments` → `main`) is open,
   **mergeable=True (clean)**. Local `rmc_clone` == remote.
-- Latest fork commit on `rakit_mod`: `8ff4779`
+- Latest fork commit on `rakit`: `8ff4779`
   `Forward same-size vector stores to loads of a different lane type`
   (on top of `0e6c2f0` SIMD copy via one vector load/store and `38923c0`
   SIMD constants → `vconst`). Squashed into one commit `4759d90` in
@@ -1069,7 +1069,7 @@ store/load round-trips.
   `GITHUB_TOKEN` is read-only for this repo, 403). New commits on the branch:
   `467f05c` "Inline small constant memcpy/memmove and honour RAKIT_INLINE_MAX"
   and `aee9ba3` "docs: record push status for the latest session".
-- The branch replaces the whole `main` tree (subtree `rakit_mod/` at repo
+- The branch replaces the whole `main` tree (subtree `rakit/` at repo
   root alongside `cg_clif_upstream/`, `bench/`, `REPORT.md`, `AGENTS.md`).
 
 ## Session benchmark report (2026-11-18, inliner-globals fix)
@@ -1110,14 +1110,14 @@ the residual 3–7x is **Rakit codegen quality, not inlining**:
 - Pushed to PR **#10** (`replace-main-with-rakit-experiments` → `main`), head
   now **`8f84035`**, 16 commits, `mergeable=True`, `mergeable_state=clean`.
   Commits this session: `64b3760` "Inline callees that reference globals; allow
-  repeated inlining" (vendors `rakit_mod/vendor/rakit-codegen-0.137.0` +
+  repeated inlining" (vendors `rakit/vendor/rakit-codegen-0.137.0` +
   the `translate_symbol_name` fix) and `8f84035` (docs).
 - The environment's injected `GITHUB_TOKEN` is read-only for this repo (all
   writes 403 `Resource not accessible by integration`); a user-supplied
   `repo`-scoped classic PAT was used to push. (History note below kept for the
   blocked attempt.)
 - Historical note — BLOCKED ON CREDENTIALS
-- `rakit_mod` head is `c2e292b` "Inline callees that reference globals; allow
+- `rakit` head is `c2e292b` "Inline callees that reference globals; allow
   repeated inlining"; it vendors `vendor/rakit-codegen-0.137.0` (added to
   `[patch.crates-io]`) with the `translate_symbol_name` fix.
 - `rmc_clone` (subtree layout) is committed as **`64b3760`** on branch
@@ -1147,7 +1147,7 @@ the residual 3–7x is **Rakit codegen quality, not inlining**:
         push origin replace-main-with-rakit-experiments
 
 - **Pushed**: `c64e31b` is on the remote; PR #10 is `mergeable_state: clean`.
-  Confirmed via the contents API that `rakit_mod/src/intrinsics/mod.rs` on
+  Confirmed via the contents API that `rakit/src/intrinsics/mod.rs` on
   the remote contains the native `round` lowering.
 
 ## Session 2026-11-19 (later) — the trunc libcall finding
@@ -1183,7 +1183,7 @@ rules). On the x86-64 baseline it falls through to a libcall into
 
 ### The fix
 
-`trunc_via_int` in `rakit_mod/src/intrinsics/mod.rs`: `fcvt_to_sint_sat` →
+`trunc_via_int` in `rakit/src/intrinsics/mod.rs`: `fcvt_to_sint_sat` →
 `fcvt_from_sint` → `fcopysign` (to keep the sign of zero), guarded by
 `|x| < 2^mantissa_bits` with `select`. SSE2 only, never traps (the saturating
 conversion cannot).
@@ -1238,7 +1238,7 @@ stays clean:
       push origin <branch>
 
 Verified after push: `trunc_via_int` and the `fcopysign` sign fix are present in
-`rakit_mod/src/intrinsics/mod.rs` on the remote branch.
+`rakit/src/intrinsics/mod.rs` on the remote branch.
 
 ### Follow-up: the remaining gap is auto-vectorization, not inlining
 
@@ -1352,7 +1352,7 @@ Before trusting any U-vs-L row, check all three:
 
 ```bash
 ls cg_clif_upstream/dist/lib/rustlib/*/lib/libstd-*.rlib   # must exist
-ls rakit_mod/dist/lib/rustlib/*/lib/libstd-*.rlib        # must exist
+ls rakit/dist/lib/rustlib/*/lib/libstd-*.rlib        # must exist
 stat -c%s /tmp/fb/p1_arith_U /tmp/fb/p1_arith_L             # must differ
 ```
 
@@ -1363,7 +1363,7 @@ Rebuild with `./y.sh build --sysroot rakit` in both trees before measuring.
 
 ## Session 2026-11-17 — divisibility folding pass
 
-**New pass: `rakit_mod/src/div_test.rs`** rewrites `x % C == 0` / `!= 0` /
+**New pass: `rakit/src/div_test.rs`** rewrites `x % C == 0` / `!= 0` /
 `brif` on a remainder into a multiply-compare, dropping the `urem` entirely.
 Commit `8aa1dfb` in `rmc_clone` (subtree layout, branch
 `replace-main-with-rakit-experiments` = PR #10's head).

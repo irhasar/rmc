@@ -4,9 +4,9 @@
 /target/
 /out/
 bench/out/
-rakit_mod/build/
-rakit_mod/dist/
-rakit_mod/target/
+rakit/build/
+rakit/dist/
+rakit/target/
 cg_clif_upstream/build/
 cg_clif_upstream/dist/
 cg_clif_upstream/target/

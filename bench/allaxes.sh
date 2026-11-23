@@ -14,7 +14,7 @@ OUT="$BENCH/out/allaxes"; mkdir -p "$OUT"
 N=nightly-2026-11-17
 RUSTC_LLVM="rustc +$N"
 CG_UP="$ROOT/cg_clif_upstream/dist/bin/rustc-clif"
-CG_MOD="$ROOT/rakit_mod/dist/bin/rustc-rakit"
+CG_MOD="$ROOT/rakit/dist/bin/rustc-rakit"
 CREPS=${CREPS:-3}
 RREPS=${RREPS:-5}
 

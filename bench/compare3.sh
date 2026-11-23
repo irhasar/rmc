@@ -20,7 +20,7 @@ mkdir -p "$OUT"
 NIGHTLY=nightly-2026-11-17
 RUSTC_LLVM="rustc +$NIGHTLY"
 CG_UP="$(cd "$(dirname "$0")/.." && pwd)/cg_clif_upstream/dist/bin/rustc-clif"
-CG_MOD="$(cd "$(dirname "$0")/.." && pwd)/rakit_mod/dist/bin/rustc-rakit"
+CG_MOD="$(cd "$(dirname "$0")/.." && pwd)/rakit/dist/bin/rustc-rakit"
 LLVM_SYSROOT=$(rustc +$NIGHTLY --print sysroot)
 
 REPS_COMPILE=${REPS_COMPILE:-3}
@@ -66,8 +66,8 @@ run_backend llvm "" $RUSTC_LLVM
 echo "### cg_clif upstream (own Cranelift std)"
 run_backend cgclif_up "" $CG_UP
 echo "### Rakit modified (own Rakit std)"
-run_backend rakit_mod "" $CG_MOD
+run_backend rakit "" $CG_MOD
 echo "### cg_clif upstream + LLVM std (isolates backend)"
 run_backend cgclif_up_llvmstd "$LLVM_SYSROOT" $CG_UP
 echo "### Rakit modified + LLVM std (isolates backend)"
-run_backend rakit_mod_llvmstd "$LLVM_SYSROOT" $CG_MOD
+run_backend rakit_llvmstd "$LLVM_SYSROOT" $CG_MOD

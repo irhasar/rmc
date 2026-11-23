@@ -5,7 +5,7 @@ Repo ini berisi eksperimen terukur membandingkan tiga backend codegen Rust pada
 
 1. **LLVM** — `rustc` bawaan.
 2. **cg_clif upstream** — basis `42ac63e`, tanpa perubahan.
-3. **Rakit modifikasi** — fork dengan patch performa di `rakit_mod/`.
+3. **Rakit modifikasi** — fork dengan patch performa di `rakit/`.
 
 Ketiga backend menghasilkan **output program yang identik** (diverifikasi pada
 program sintetis, tiga crate nyata, dan repo 4,1 MB), jadi yang diukur adalah
@@ -19,7 +19,7 @@ kualitas codegen, bukan semantik.
 
 | Path | Keterangan |
 |---|---|
-| `rakit_mod/` | Backend Rakit yang dimodifikasi; inti pekerjaan ada di sini. |
+| `rakit/` | Backend Rakit yang dimodifikasi; inti pekerjaan ada di sini. |
 | `cg_clif_upstream/` | cg_clif upstream (basis `42ac63e`) sebagai baseline. |
 | `bench/` | Harness tiga arah: ukuran, waktu compile, runtime. Program `progs/p1..p6*.rs`. |
 | `extbench/` | Harness untuk crate nyata (`openlocationcode`, `holidays-rs`, `stdnum-rs`). |
@@ -27,8 +27,8 @@ kualitas codegen, bukan semantik.
 | `AGENTS.md` | Catatan konteks dan riwayat sesi kerja. |
 | `build.sh` | Rebuild backend Rakit + sysroot-nya. |
 
-`rakit_mod/` bersifat **self-contained**: pustaka codegen Rakit di-vendor di
-`rakit_mod/vendor/` (paket `rakit-codegen`, `rakit-frontend`, `rakit-object`,
+`rakit/` bersifat **self-contained**: pustaka codegen Rakit di-vendor di
+`rakit/vendor/` (paket `rakit-codegen`, `rakit-frontend`, `rakit-object`,
 dan seterusnya), sehingga tidak ada lagi dependensi ke paket eksternal bernama
 lama. Sebaliknya, `cg_clif_upstream/` sengaja **tidak diubah** — tetap cg_clif
 asli dengan Cranelift asli, sebagai baseline pembanding.
@@ -36,17 +36,17 @@ asli dengan Cranelift asli, sebagai baseline pembanding.
 ## Build
 
 Prasyarat: toolchain `nightly-2026-11-17` dengan komponen `rust-src`,
-`rustc-dev`, dan `llvm-tools`, plus dependensi build di `rakit_mod/Readme.md`.
+`rustc-dev`, dan `llvm-tools`, plus dependensi build di `rakit/Readme.md`.
 
 ```bash
 ./build.sh
-# hasil: rakit_mod/dist/bin/rustc-rakit beserta sysroot-nya
+# hasil: rakit/dist/bin/rustc-rakit beserta sysroot-nya
 ```
 
 `rustc-rakit` langsung dapat dipakai untuk mengompilasi program:
 
 ```bash
-rakit_mod/dist/bin/rustc-rakit --edition=2021 -O main.rs -o main
+rakit/dist/bin/rustc-rakit --edition=2021 -O main.rs -o main
 ```
 
 ## Hasil ringkas
@@ -94,7 +94,7 @@ modifikasi justru **≈8× lebih cepat dari LLVM** (7 ms vs 58 ms).
 - **Compile.** Biaya tambahan fork berasal dari pass, **bukan** dari patch
   vendor: dengan semua pass dimatikan, fork 3212 ms vs upstream 3208 ms.
 
-Modifikasi utama ada di `rakit_mod/src/`: `inliner.rs` (inlining bertingkat
+Modifikasi utama ada di `rakit/src/`: `inliner.rs` (inlining bertingkat
 dengan tier leaf), `if_convert.rs` (diamond → `select`/`cmove`),
 `store_forward.rs` (store-to-load forwarding + dead-store elimination),
 `unroll.rs` (pelebaran loop counted), dan `driver/aot.rs`. Rincian lengkap,
@@ -117,8 +117,8 @@ cd extbench && ./extbench.sh
 
 Kode di repo ini dilisensikan **Apache-2.0**; lihat `LICENSE`.
 
-`rakit_mod/` dan `cg_clif_upstream/` mempertahankan lisensi ganda aslinya
-(MIT/Apache-2.0). Pustaka codegen Rakit di `rakit_mod/vendor/` dilisensikan
+`rakit/` dan `cg_clif_upstream/` mempertahankan lisensi ganda aslinya
+(MIT/Apache-2.0). Pustaka codegen Rakit di `rakit/vendor/` dilisensikan
 **Apache-2.0 WITH LLVM-exception**, yang mengizinkan modifikasi dan
 pendistribusian, termasuk untuk keperluan komersial, dengan kewajiban
 mempertahankan notice lisensi dan mencantumkan perubahan. Daftar perubahan

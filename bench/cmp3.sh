@@ -6,7 +6,7 @@ ROOT=$(dirname "$BENCH")
 N=nightly-2026-11-17
 L="rustc +$N"
 U="$ROOT/cg_clif_upstream/dist/bin/rustc-clif"
-M="$ROOT/rakit_mod/dist/bin/rustc-rakit"
+M="$ROOT/rakit/dist/bin/rustc-rakit"
 P="$BENCH/progs"
 D=/tmp/cmp3; mkdir -p $D
 printf "%-10s %8s %8s %8s | %8s %8s %8s | %8s %8s %8s\n" prog Lrun Urun Mrun Lsz Usz Msz Lcpl Ucpl Mcpl
