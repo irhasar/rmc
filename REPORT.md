@@ -3105,8 +3105,9 @@ sebelumnya. Yang bisa diperbaiki tanpa mengubah arah proyek sudah mendarat:
   preheader hanya dibuat bila header punya paling banyak satu predecessor di
   luar loop. Regresi
   `licm::tests::licm_does_not_split_a_multi_entry_loop_header` memeriksa tidak
-  ada blok preheader baru dan SSA dominance tetap terjaga. `serde_json 1.0.154` + `regex` kini
-  dikompilasi dan dijalankan Rakit tanpa `RAKIT_NO_LICM=1`.
+  ada blok preheader baru dan SSA dominance tetap terjaga. `serde_json 1.0.154`
+  + `regex` kini dikompilasi tanpa `RAKIT_NO_LICM=1`; jalur u64 berjalan, tetapi
+  serialisasi `f64` masih abort karena `pmulhu.w` belum didukung.
 - **Intrinsik SSE2 `pmulhu.w` belum ada.** Program yang mencetak `f64` lewat
   formatter serde_json masih abort di runtime. Ini warisan cg_clif dan perlu
   implementasi intrinsik, bukan perbaikan pass.
