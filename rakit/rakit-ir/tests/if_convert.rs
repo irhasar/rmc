@@ -182,3 +182,49 @@ fn converts_return_arms() {
     );
     assert_eq!(func.blocks.len(), 1);
 }
+
+#[test]
+fn converts_two_value_join() {
+    let mut b = Builder::new(
+        vec![Type::I64],
+        vec![Type::Bool, Type::I64, Type::I64],
+    );
+    let e = b.func().entry;
+    let c = b.func().block(e).params[0];
+    let x = b.func().block(e).params[1];
+    let y = b.func().block(e).params[2];
+    let t = b.add_block(vec![]);
+    let f = b.add_block(vec![]);
+    let j = b.add_block(vec![Type::I64, Type::I64]);
+    b.brif(e, c, t, vec![], f, vec![]);
+    b.jump(t, j, vec![x, x]);
+    b.jump(f, j, vec![y, y]);
+    let p0 = b.func().block(j).params[0];
+    let p1 = b.func().block(j).params[1];
+    let sum = b.bin(j, BinOp::Add, Type::I64, p0, p1);
+    b.ret(j, vec![sum]);
+
+    let mut func = b.into_func();
+    assert_eq!(
+        run(&func, &[Val::B(true), Val::I(4), Val::I(9)]).unwrap(),
+        vec![Val::I(8)]
+    );
+    assert!(if_convert::run(&mut func));
+    assert!(verify(&func).is_ok(), "{:?}", verify(&func).err());
+    assert_eq!(
+        run(&func, &[Val::B(true), Val::I(4), Val::I(9)]).unwrap(),
+        vec![Val::I(8)]
+    );
+    assert_eq!(
+        run(&func, &[Val::B(false), Val::I(4), Val::I(9)]).unwrap(),
+        vec![Val::I(18)]
+    );
+    assert_eq!(
+        func.blocks[0]
+            .insts
+            .iter()
+            .filter(|i| matches!(i, Inst::Select(..)))
+            .count(),
+        2
+    );
+}

@@ -20,7 +20,7 @@ impl fmt::Debug for Block {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Type {
     I8,
     I16,
@@ -46,7 +46,7 @@ impl Type {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum BinOp {
     Add,
     Sub,
@@ -73,7 +73,7 @@ impl BinOp {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum IntCc {
     Eq,
     Ne,
@@ -87,7 +87,7 @@ pub enum IntCc {
     Uge,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum FloatCc {
     Eq,
     Ne,

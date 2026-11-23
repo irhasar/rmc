@@ -1,5 +1,19 @@
 # AGENTS.md
 
+## Session (2026-11-23, Fase 2 step 8) — multi-value if_convert + local GVN
+- `if_convert` now handles joins/returns carrying any number of values
+  (including zero), not just one. Two identical `if`s compile to a two-param
+  join; the pass emits one `select` per join param.
+- New `rakit-ir/src/gvn.rs`: local value numbering keyed by opcode/type/operands;
+  duplicate pure instructions become `Copy` of the first result. `Hash` derives
+  added to `Type`, `BinOp`, `IntCc`, `FloatCc`.
+- `RirPass` order: `optimize -> div_test -> if_convert -> gvn -> optimize`.
+- Tests: 33/33 (6 div_test + 5 gvn + 7 if_convert + 15 ir). New: two-value
+  join, duplicate add/constant/select, different types, cross-block non-merge.
+- End-to-end: `pick2(c,x,y) = { let a = if c {x} else {y}; let b = ...; a+b }`
+  with `RAKIT_RIR=1 RAKIT_RIR_DEBUG=1` logs `if_convert fired` then
+  `gvn fired`, prints `8 18`, identical to normal.
+
 ## Session (2026-11-23, Fase 2 step 7) — `if_convert` migrated to RIR
 - New `rakit-ir/src/if_convert.rs`: converts a two-way diamond (`brif` to two
   short arms that `jump` to a common join or both `return`) into a `select` in

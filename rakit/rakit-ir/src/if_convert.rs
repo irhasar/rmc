@@ -28,7 +28,7 @@ pub fn run(func: &mut Function) -> bool {
 
 struct ArmPlan {
     insts: Vec<Inst>,
-    value: Value,
+    values: Vec<Value>,
     defined: HashSet<Value>,
 }
 
@@ -63,38 +63,42 @@ fn convert_one(func: &mut Function) -> bool {
         let Some(else_end) = arm_end(&func.blocks[eb]) else {
             continue;
         };
-        let (join, then_value, else_value, join_ty, is_return) = match (&then_end, &else_end) {
-            (ArmEnd::Jump(tj, tv), ArmEnd::Jump(ej, ev)) => {
-                if tj != ej || succs[tb] != 1 || succs[eb] != 1 {
-                    continue;
+        let (join, then_values, else_values, value_tys, is_return) =
+            match (&then_end, &else_end) {
+                (ArmEnd::Jump(tj, tv), ArmEnd::Jump(ej, ev)) => {
+                    if tj != ej || tv.len() != ev.len() || succs[tb] != 1 || succs[eb] != 1 {
+                        continue;
+                    }
+                    let jb = tj.0 as usize;
+                    if jb >= block_count || jb == head || jb == tb || jb == eb {
+                        continue;
+                    }
+                    let params = &func.blocks[jb].params;
+                    if params.len() != tv.len() {
+                        continue;
+                    }
+                    let tys: Vec<Type> = params
+                        .iter()
+                        .map(|p| func.values[p.0 as usize])
+                        .collect();
+                    (Some(*tj), tv.clone(), ev.clone(), tys, false)
                 }
-                let jb = tj.0 as usize;
-                if jb >= block_count || jb == head || jb == tb || jb == eb {
-                    continue;
+                (ArmEnd::Return(tv), ArmEnd::Return(ev)) => {
+                    if tv.len() != ev.len()
+                        || tv.len() != func.ret.len()
+                        || succs[tb] != 0
+                        || succs[eb] != 0
+                    {
+                        continue;
+                    }
+                    (None, tv.clone(), ev.clone(), func.ret.clone(), true)
                 }
-                if func.blocks[jb].params.len() != 1 {
-                    continue;
-                }
-                (
-                    Some(*tj),
-                    *tv,
-                    *ev,
-                    func.values[func.blocks[jb].params[0].0 as usize],
-                    false,
-                )
-            }
-            (ArmEnd::Return(tv), ArmEnd::Return(ev)) => {
-                if succs[tb] != 0 || succs[eb] != 0 || func.ret.len() != 1 {
-                    continue;
-                }
-                (None, *tv, *ev, func.ret[0], true)
-            }
-            _ => continue,
-        };
-        let Some(then_plan) = analyze_arm(&func.blocks[tb], then_value) else {
+                _ => continue,
+            };
+        let Some(then_plan) = analyze_arm(&func.blocks[tb], then_values) else {
             continue;
         };
-        let Some(else_plan) = analyze_arm(&func.blocks[eb], else_value) else {
+        let Some(else_plan) = analyze_arm(&func.blocks[eb], else_values) else {
             continue;
         };
         if !values_dead_outside(func, tb, eb, &then_plan, &else_plan) {
@@ -118,23 +122,37 @@ fn convert_one(func: &mut Function) -> bool {
         let Some(mut else_new) = clone_arm(func, &else_plan, &mut else_map) else {
             continue;
         };
-        let then_val = remap(then_plan.value, &then_map);
-        let else_val = remap(else_plan.value, &else_map);
-        let sel = new_value(func, join_ty);
+        let then_vals: Vec<Value> = then_plan
+            .values
+            .iter()
+            .map(|v| remap(*v, &then_map))
+            .collect();
+        let else_vals: Vec<Value> = else_plan
+            .values
+            .iter()
+            .map(|v| remap(*v, &else_map))
+            .collect();
+        let mut selects = Vec::with_capacity(value_tys.len());
+        let mut sels = Vec::with_capacity(value_tys.len());
+        for i in 0..value_tys.len() {
+            let sel = new_value(func, value_tys[i]);
+            sels.push(sel);
+            selects.push((sel, value_tys[i], then_vals[i], else_vals[i]));
+        }
 
         let head_block = &mut func.blocks[head];
         head_block.insts.pop();
         head_block.insts.append(&mut then_new);
         head_block.insts.append(&mut else_new);
-        head_block
-            .insts
-            .push(Inst::Select(sel, join_ty, cond, then_val, else_val));
+        for (sel, ty, tv, ev) in selects {
+            head_block.insts.push(Inst::Select(sel, ty, cond, tv, ev));
+        }
         if is_return {
-            head_block.insts.push(Inst::Return(vec![sel]));
+            head_block.insts.push(Inst::Return(sels));
         } else {
             head_block
                 .insts
-                .push(Inst::Jump(join.expect("jump arm has a join"), vec![sel]));
+                .push(Inst::Jump(join.expect("jump arm has a join"), sels));
         }
         remove_blocks(func, &[tb, eb]);
         remove_values(func, &removed_values);
@@ -168,19 +186,19 @@ fn cfg(func: &Function) -> (Vec<usize>, Vec<usize>) {
 }
 
 enum ArmEnd {
-    Jump(Block, Value),
-    Return(Value),
+    Jump(Block, Vec<Value>),
+    Return(Vec<Value>),
 }
 
 fn arm_end(block: &BlockData) -> Option<ArmEnd> {
     match block.insts.last()? {
-        Inst::Jump(t, args) if args.len() == 1 => Some(ArmEnd::Jump(*t, args[0])),
-        Inst::Return(args) if args.len() == 1 => Some(ArmEnd::Return(args[0])),
+        Inst::Jump(t, args) => Some(ArmEnd::Jump(*t, args.clone())),
+        Inst::Return(args) => Some(ArmEnd::Return(args.clone())),
         _ => None,
     }
 }
 
-fn analyze_arm(block: &BlockData, value: Value) -> Option<ArmPlan> {
+fn analyze_arm(block: &BlockData, values: Vec<Value>) -> Option<ArmPlan> {
     let n = block.insts.len();
     if n == 0 {
         return None;
@@ -204,7 +222,7 @@ fn analyze_arm(block: &BlockData, value: Value) -> Option<ArmPlan> {
     }
     Some(ArmPlan {
         insts,
-        value,
+        values,
         defined,
     })
 }
@@ -246,7 +264,7 @@ fn uses_other_arm(plan: &ArmPlan, other: &HashSet<Value>) -> bool {
     plan.insts
         .iter()
         .any(|inst| inst.operands().iter().any(|v| other.contains(v)))
-        || other.contains(&plan.value)
+        || plan.values.iter().any(|v| other.contains(v))
 }
 
 fn clone_arm(

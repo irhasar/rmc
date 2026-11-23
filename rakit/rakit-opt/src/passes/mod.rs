@@ -57,6 +57,14 @@ impl Pass for RirPass {
         if debug && ifconv_changed {
             eprintln!("[rir] if_convert fired");
         }
+        let gvn_changed = rakit_ir::gvn::run(&mut rir_func);
+        if gvn_changed {
+            rakit_ir::optimize(&mut rir_func);
+            changed = true;
+        }
+        if debug && gvn_changed {
+            eprintln!("[rir] gvn fired");
+        }
         if !changed && std::env::var_os("RAKIT_RIR_FORCE").is_none() {
             if debug {
                 eprintln!("[rir] no-change {:?}", pctx.ctx.func.name);

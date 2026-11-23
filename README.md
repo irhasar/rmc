@@ -85,10 +85,18 @@ folder memakai modul yang sama, sehingga `I8/I16/I32` konsisten.
 
 Pass RIR `if_convert` (`rakit-ir/src/if_convert.rs`) mengubah diamond `brif` →
 dua arm pendek → join/return menjadi `select` di blok head, lalu menghapus arm
-dan nilai yang menjadi mati. Batasannya konservatif: arm tanpa parameter, satu
-predecessor, maksimal 8 instruksi, tanpa div/rem, dan nilai arm tidak dipakai
-di luar arm. Dengan `RAKIT_RIR=1 RAKIT_NO_IFCONV=1`,
-`if c { x + 1 } else { x + 2 }` dikonversi di RIR dan output tetap sama.
+dan nilai yang menjadi mati. Join/return boleh membawa banyak nilai (termasuk
+nol), jadi dua `if` identik yang menghasilkan dua nilai ikut dikonversi.
+Batasannya konservatif: arm tanpa parameter, satu predecessor, maksimal 8
+instruksi, tanpa div/rem, dan nilai arm tidak dipakai di luar arm. Dengan
+`RAKIT_RIR=1 RAKIT_NO_IFCONV=1`, `if c { x + 1 } else { x + 2 }` dikonversi di
+RIR dan output tetap sama.
+
+Pass `gvn` (`rakit-ir/src/gvn.rs`) melakukan value numbering lokal: instruksi
+murni duplikat dalam satu blok diganti `Copy` ke hasil pertama. Key-nya adalah
+opcode + tipe + operand, sehingga tipe atau operand berbeda tidak pernah
+digabung. Pipeline RIR sekarang:
+`optimize → div_test → if_convert → gvn → optimize`.
 
 ## Build
 
