@@ -190,11 +190,17 @@ fn remap_inst_values(inst: &mut Inst, map: &[Option<Value>]) {
         | Inst::Bin(v, _, _, _, _)
         | Inst::Icmp(v, _, _, _, _)
         | Inst::Fcmp(v, _, _, _, _)
-        | Inst::Select(v, _, _, _, _) => r(map, v),
+        | Inst::Select(v, _, _, _, _)
+        | Inst::StackAddr(v, _, _)
+        | Inst::Load(v, _, _, _) => r(map, v),
         _ => {}
     }
     match inst {
-        Inst::Nop(..) | Inst::Iconst(..) | Inst::F32const(..) | Inst::F64const(..) => {}
+        Inst::Nop(..)
+        | Inst::Iconst(..)
+        | Inst::F32const(..)
+        | Inst::F64const(..)
+        | Inst::StackAddr(..) => {}
         Inst::Copy(_, _, x) => r(map, x),
         Inst::Bin(_, _, _, x, y) | Inst::Icmp(_, _, _, x, y) | Inst::Fcmp(_, _, _, x, y) => {
             r(map, x);
@@ -204,6 +210,11 @@ fn remap_inst_values(inst: &mut Inst, map: &[Option<Value>]) {
             r(map, c);
             r(map, x);
             r(map, y);
+        }
+        Inst::Load(_, _, a, _) => r(map, a),
+        Inst::Store(_, a, _, v) => {
+            r(map, a);
+            r(map, v);
         }
         Inst::Jump(_, args) | Inst::Return(args) => {
             for a in args {

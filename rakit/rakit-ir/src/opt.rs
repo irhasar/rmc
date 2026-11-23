@@ -222,6 +222,9 @@ fn dce(func: &mut Function) -> bool {
     for bi in 0..func.blocks.len() {
         for ii in 0..func.blocks[bi].insts.len() {
             let inst = &func.blocks[bi].insts[ii];
+            if matches!(inst, Inst::Load(..) | Inst::Store(..)) {
+                continue;
+            }
             if let Some(r) = inst.result_value() {
                 if !matches!(inst, Inst::Nop(..)) && uses.get(&r).copied().unwrap_or(0) == 0 {
                     let ty = func.values[r.0 as usize];

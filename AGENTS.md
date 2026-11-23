@@ -1,5 +1,18 @@
 # AGENTS.md
 
+## Session (2026-11-23, Fase 2 step 13) — memory bridge
+- RIR: `StackSlot`/`StackSlotData`, `Function.stack_slots`, `Inst::StackAddr`,
+  `Inst::Load`, `Inst::Store` (scalar, constant offset); builder helpers.
+- Bridge `rakit-opt/src/rir.rs` imports fixed stack slots and
+  `stack_addr`/`load`/`store`/`load_no_offset`/`store_no_offset`; export
+  recreates slots and memory ops. Addresses are `I64`.
+- Interpreter: stack-slot arena with bounds checks; `Val::P` addresses.
+- Verifier checks slot range, address type, load/store types.
+- Passes stay conservative: GVN/LICM skip memory ops; if-convert rejects arms
+  with memory; DCE keeps loads/stores.
+- Tests: 53 RIR (3 memory) + 8 bridge; `./y.sh build` exit 0; h19 (array via
+  `get_unchecked`) imports, logs simplify/gvn, prints 11 like LLVM.
+
 ## Session (2026-11-23, Fase 2 step 12) — LICM
 - New `rakit-ir/src/licm.rs`: finds natural loops from back edges + dominators,
   requires a unique outside predecessor ending in `jump` to the header, and

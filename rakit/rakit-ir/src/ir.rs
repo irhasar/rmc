@@ -32,6 +32,15 @@ pub enum Type {
     Ptr,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct StackSlot(pub u32);
+
+#[derive(Clone, Copy, Debug)]
+pub struct StackSlotData {
+    pub size: u32,
+    pub align: u32,
+}
+
 impl Type {
     pub fn is_int(self) -> bool {
         matches!(self, Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::Ptr)
@@ -111,6 +120,12 @@ pub enum Inst {
     Icmp(Value, IntCc, Type, Value, Value),
     Fcmp(Value, FloatCc, Type, Value, Value),
     Select(Value, Type, Value, Value, Value),
+    /// Address of a stack slot plus a constant byte offset.
+    StackAddr(Value, StackSlot, i32),
+    /// Load a scalar from `addr + offset`.
+    Load(Value, Type, Value, i32),
+    /// Store a scalar to `addr + offset`.
+    Store(Type, Value, i32, Value),
     Jump(Block, Vec<Value>),
     Brif(Value, Block, Vec<Value>, Block, Vec<Value>),
     Return(Vec<Value>),
@@ -127,8 +142,10 @@ impl Inst {
             | Inst::Bin(v, _, _, _, _)
             | Inst::Icmp(v, _, _, _, _)
             | Inst::Fcmp(v, _, _, _, _)
-            | Inst::Select(v, _, _, _, _) => Some(*v),
-            Inst::Jump(..) | Inst::Brif(..) | Inst::Return(..) => None,
+            | Inst::Select(v, _, _, _, _)
+            | Inst::StackAddr(v, _, _)
+            | Inst::Load(v, _, _, _) => Some(*v),
+            Inst::Store(..) | Inst::Jump(..) | Inst::Brif(..) | Inst::Return(..) => None,
         }
     }
 
@@ -138,12 +155,18 @@ impl Inst {
 
     pub fn operands(&self) -> Vec<Value> {
         match self {
-            Inst::Nop(..) | Inst::Iconst(..) | Inst::F32const(..) | Inst::F64const(..) => Vec::new(),
+            Inst::Nop(..)
+            | Inst::Iconst(..)
+            | Inst::F32const(..)
+            | Inst::F64const(..)
+            | Inst::StackAddr(..) => Vec::new(),
             Inst::Copy(_, _, x) => vec![*x],
             Inst::Bin(_, _, _, x, y) => vec![*x, *y],
             Inst::Icmp(_, _, _, x, y) => vec![*x, *y],
             Inst::Fcmp(_, _, _, x, y) => vec![*x, *y],
             Inst::Select(_, _, c, x, y) => vec![*c, *x, *y],
+            Inst::Load(_, _, a, _) => vec![*a],
+            Inst::Store(_, a, _, v) => vec![*a, *v],
             Inst::Jump(_, args) | Inst::Return(args) => args.clone(),
             Inst::Brif(cond, _, targs, _, fargs) => {
                 let mut v = Vec::with_capacity(targs.len() + fargs.len() + 1);
@@ -177,6 +200,8 @@ pub struct Function {
     /// Types of the function's return values.
     pub ret: Vec<Type>,
     pub entry: Block,
+    /// Fixed-size stack slots addressed by `StackAddr`.
+    pub stack_slots: Vec<StackSlotData>,
 }
 
 impl Function {
@@ -195,6 +220,7 @@ impl Function {
             values,
             ret,
             entry: Block(0),
+            stack_slots: Vec::new(),
         }
     }
 

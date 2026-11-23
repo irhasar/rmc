@@ -10,7 +10,9 @@ use std::collections::HashMap;
 
 use rakit_codegen::ir::{
     Block as ClifBlock, BlockArg, BlockCall, Function as ClifFunction, Inst as ClifInst,
-    InstructionData, Opcode, Signature, Type as ClifType, Value as ClifValue, ValueList,
+    InstructionData, MemFlagsData, Opcode, Signature, StackSlot as ClifStackSlot,
+    StackSlotData as ClifStackSlotData, StackSlotKind, Type as ClifType, Value as ClifValue,
+    ValueList,
     condcodes::{FloatCC as ClifFloatCC, IntCC as ClifIntCC},
     immediates::{Ieee32, Ieee64, Imm64},
     types,
@@ -18,14 +20,14 @@ use rakit_codegen::ir::{
 
 use rakit_ir::{
     BinOp, Block as RirBlock, Builder, FloatCc as RirFloatCc, Function as RirFunction,
-    Inst as RirInst, IntCc as RirIntCc, Type as RirType, Value as RirValue,
+    Inst as RirInst, IntCc as RirIntCc, StackSlot as RirStackSlot, Type as RirType,
+    Value as RirValue,
 };
 
 /// Import a CLIF function into RIR, or `None` if it uses anything outside the
 /// supported scalar subset.
 pub fn import(func: &ClifFunction) -> Option<RirFunction> {
     if func.global_values.len() != 0
-        || func.sized_stack_slots.len() != 0
         || func.dynamic_stack_slots.len() != 0
         || func.stack_limit.is_some()
     {
@@ -56,6 +58,15 @@ pub fn import(func: &ClifFunction) -> Option<RirFunction> {
     }
 
     let mut builder = Builder::new(ret, entry_params);
+    let mut slot_map: HashMap<ClifStackSlot, RirStackSlot> = HashMap::new();
+    for (cs, data) in func.sized_stack_slots.iter() {
+        if !matches!(data.kind, StackSlotKind::ExplicitSlot) {
+            return None;
+        }
+        let align = 1u32.checked_shl(data.align_shift as u32).unwrap_or(1);
+        let rs = builder.add_stack_slot(data.size, align);
+        slot_map.insert(cs, rs);
+    }
     let mut block_map: HashMap<ClifBlock, RirBlock> = HashMap::new();
     block_map.insert(entry, RirBlock(0));
 
@@ -142,6 +153,52 @@ pub fn import(func: &ClifFunction) -> Option<RirFunction> {
                     let v = builder.select(rb, ty, c, x, y);
                     map_value(func, &mut vmap, r, v);
                 }
+                InstructionData::StackAddr {
+                    opcode: Opcode::StackAddr,
+                    stack_slot,
+                    offset,
+                } => {
+                    let r = single_result(func, inst)?;
+                    let slot = *slot_map.get(&stack_slot)?;
+                    let v = builder.stack_addr(rb, slot, offset.into());
+                    map_value(func, &mut vmap, r, v);
+                }
+                InstructionData::Load {
+                    opcode: Opcode::Load,
+                    arg,
+                    offset,
+                    ..
+                } => {
+                    let r = single_result(func, inst)?;
+                    let ty = map_type_to_rir(func.dfg.value_type(r))?;
+                    let addr = lookup(func, &vmap, arg)?;
+                    let v = builder.load(rb, ty, addr, offset.into());
+                    map_value(func, &mut vmap, r, v);
+                }
+                InstructionData::LoadNoOffset { opcode: Opcode::Load, arg, .. } => {
+                    let r = single_result(func, inst)?;
+                    let ty = map_type_to_rir(func.dfg.value_type(r))?;
+                    let addr = lookup(func, &vmap, arg)?;
+                    let v = builder.load(rb, ty, addr, 0);
+                    map_value(func, &mut vmap, r, v);
+                }
+                InstructionData::Store {
+                    opcode: Opcode::Store,
+                    args,
+                    offset,
+                    ..
+                } => {
+                    let value = lookup(func, &vmap, args[0])?;
+                    let addr = lookup(func, &vmap, args[1])?;
+                    let ty = map_type_to_rir(func.dfg.value_type(args[0]))?;
+                    builder.store(rb, ty, addr, offset.into(), value);
+                }
+                InstructionData::StoreNoOffset { opcode: Opcode::Store, args, .. } => {
+                    let value = lookup(func, &vmap, args[0])?;
+                    let addr = lookup(func, &vmap, args[1])?;
+                    let ty = map_type_to_rir(func.dfg.value_type(args[0]))?;
+                    builder.store(rb, ty, addr, 0, value);
+                }
                 InstructionData::Jump { destination, .. } => {
                     let target = *block_map.get(&destination.block(&func.dfg.value_lists))?;
                     let args = block_args(func, &destination, &vmap)?;
@@ -194,6 +251,14 @@ pub fn export(rir: &RirFunction, sig: &Signature) -> Option<ClifFunction> {
 
     let mut func = ClifFunction::new();
     func.signature = sig.clone();
+
+    let mut slot_map: Vec<ClifStackSlot> = Vec::with_capacity(rir.stack_slots.len());
+    for slot in &rir.stack_slots {
+        let align_shift = slot.align.max(1).trailing_zeros() as u8;
+        let data =
+            ClifStackSlotData::new(StackSlotKind::ExplicitSlot, slot.size, align_shift);
+        slot_map.push(func.create_sized_stack_slot(data));
+    }
 
     let mut block_map: Vec<ClifBlock> = Vec::with_capacity(rir.blocks.len());
     let mut vmap: HashMap<RirValue, ClifValue> = HashMap::new();
@@ -320,6 +385,45 @@ pub fn export(rir: &RirFunction, sig: &Signature) -> Option<ClifFunction> {
                     }
                     func.layout.append_inst(ci, cb);
                     vmap.insert(*r, func.dfg.inst_results(ci)[0]);
+                }
+                RirInst::StackAddr(r, slot, offset) => {
+                    let cs = *slot_map.get(slot.0 as usize)?;
+                    let ci = func.dfg.make_inst(InstructionData::StackAddr {
+                        opcode: Opcode::StackAddr,
+                        stack_slot: cs,
+                        offset: (*offset).into(),
+                    });
+                    if func.dfg.make_inst_results(ci, types::I64) != 1 {
+                        return None;
+                    }
+                    func.layout.append_inst(ci, cb);
+                    vmap.insert(*r, func.dfg.inst_results(ci)[0]);
+                }
+                RirInst::Load(r, ty, addr, offset) => {
+                    let ct = map_type_to_clif(*ty)?;
+                    let flags = func.dfg.mem_flags.insert(MemFlagsData::new()).ok()?;
+                    let ci = func.dfg.make_inst(InstructionData::Load {
+                        opcode: Opcode::Load,
+                        flags,
+                        arg: *vmap.get(addr)?,
+                        offset: (*offset).into(),
+                    });
+                    if func.dfg.make_inst_results(ci, ct) != 1 {
+                        return None;
+                    }
+                    func.layout.append_inst(ci, cb);
+                    vmap.insert(*r, func.dfg.inst_results(ci)[0]);
+                }
+                RirInst::Store(ty, addr, offset, value) => {
+                    let _ = map_type_to_clif(*ty)?;
+                    let flags = func.dfg.mem_flags.insert(MemFlagsData::new()).ok()?;
+                    let ci = func.dfg.make_inst(InstructionData::Store {
+                        opcode: Opcode::Store,
+                        flags,
+                        args: [*vmap.get(value)?, *vmap.get(addr)?],
+                        offset: (*offset).into(),
+                    });
+                    func.layout.append_inst(ci, cb);
                 }
                 RirInst::Jump(target, args) => {
                     let bc = make_block_call(&mut func, block_map[target.0 as usize], args, &vmap)?;
@@ -555,8 +659,9 @@ fn map_floatcc_to_clif(cc: RirFloatCc) -> Option<ClifFloatCC> {
 mod tests {
     use super::*;
     use rakit_codegen::ir::{
-        Block, BlockArg, BlockCall, Function, InstructionData, Opcode, Type, Value, ValueList,
-        condcodes::IntCC, immediates::Imm64, types,
+        Block, BlockArg, BlockCall, Function, InstructionData, MemFlagsData, Opcode, StackSlot,
+        StackSlotData, StackSlotKind, Type, Value, ValueList, condcodes::IntCC,
+        immediates::Imm64, types,
     };
     use rakit_ir::{Val, run};
 
@@ -669,6 +774,68 @@ mod tests {
             blocks: [tb, eb],
         });
         func.layout.append_inst(inst, b);
+    }
+
+    fn stack_slot(func: &mut Function, size: u32, align_shift: u8) -> StackSlot {
+        func.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            size,
+            align_shift,
+        ))
+    }
+
+    fn stack_addr(func: &mut Function, b: Block, slot: StackSlot, offset: i32) -> Value {
+        let inst = func.dfg.make_inst(InstructionData::StackAddr {
+            opcode: Opcode::StackAddr,
+            stack_slot: slot,
+            offset: offset.into(),
+        });
+        assert_eq!(func.dfg.make_inst_results(inst, types::I64), 1);
+        func.layout.append_inst(inst, b);
+        func.dfg.inst_results(inst)[0]
+    }
+
+    fn store(func: &mut Function, b: Block, ty: Type, addr: Value, value: Value, offset: i32) {
+        assert_eq!(func.dfg.value_type(value), ty);
+        let flags = func.dfg.mem_flags.insert(MemFlagsData::new()).unwrap();
+        let inst = func.dfg.make_inst(InstructionData::Store {
+            opcode: Opcode::Store,
+            flags,
+            args: [value, addr],
+            offset: offset.into(),
+        });
+        func.layout.append_inst(inst, b);
+    }
+
+    fn load(func: &mut Function, b: Block, ty: Type, addr: Value, offset: i32) -> Value {
+        let flags = func.dfg.mem_flags.insert(MemFlagsData::new()).unwrap();
+        let inst = func.dfg.make_inst(InstructionData::Load {
+            opcode: Opcode::Load,
+            flags,
+            arg: addr,
+            offset: offset.into(),
+        });
+        assert_eq!(func.dfg.make_inst_results(inst, ty), 1);
+        func.layout.append_inst(inst, b);
+        func.dfg.inst_results(inst)[0]
+    }
+
+    #[test]
+    fn memory_roundtrip() {
+        let (mut f, e) = new_func(&[types::I64], &[types::I64]);
+        let x = f.dfg.block_params(e)[0];
+        let slot = stack_slot(&mut f, 16, 3);
+        let addr = stack_addr(&mut f, e, slot, 0);
+        store(&mut f, e, types::I64, addr, x, 0);
+        let y = load(&mut f, e, types::I64, addr, 0);
+        ret(&mut f, e, &[y]);
+
+        let mut rir = import(&f).expect("import");
+        assert_eq!(run(&rir, &[Val::I(42)]).unwrap(), vec![Val::I(42)]);
+        let _ = rakit_ir::optimize(&mut rir);
+        let out = export(&rir, &f.signature).expect("export");
+        let rir2 = import(&out).expect("re-import");
+        assert_eq!(run(&rir2, &[Val::I(42)]).unwrap(), vec![Val::I(42)]);
     }
 
     #[test]

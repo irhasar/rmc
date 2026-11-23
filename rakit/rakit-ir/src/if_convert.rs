@@ -230,11 +230,19 @@ fn analyze_arm(block: &BlockData, values: Vec<Value>) -> Option<ArmPlan> {
 
 fn is_cheap(inst: &Inst) -> bool {
     match inst {
+        Inst::Nop(..)
+        | Inst::Iconst(..)
+        | Inst::F32const(..)
+        | Inst::F64const(..)
+        | Inst::Copy(..)
+        | Inst::Icmp(..)
+        | Inst::Fcmp(..)
+        | Inst::Select(..) => true,
         Inst::Bin(_, op, _, _, _) => !matches!(
             op,
             BinOp::Sdiv | BinOp::Udiv | BinOp::Srem | BinOp::Urem | BinOp::Fdiv
         ),
-        _ => true,
+        _ => false,
     }
 }
 
@@ -308,7 +316,12 @@ fn clone_inst(
             remap(*x, map),
             remap(*y, map),
         ),
-        Inst::Jump(..) | Inst::Brif(..) | Inst::Return(..) => return None,
+        Inst::StackAddr(..)
+        | Inst::Load(..)
+        | Inst::Store(..)
+        | Inst::Jump(..)
+        | Inst::Brif(..)
+        | Inst::Return(..) => return None,
     };
     map.insert(old, new);
     Some(out)

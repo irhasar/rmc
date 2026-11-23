@@ -172,6 +172,30 @@ pub fn verify(func: &Function) -> Result<(), Vec<String>> {
                         errs.push(format!("select {r:?} type mismatch"));
                     }
                 }
+                Inst::StackAddr(r, slot, _) => {
+                    if slot.0 as usize >= func.stack_slots.len() {
+                        errs.push(format!("stack slot {slot:?} out of range"));
+                    }
+                    if ty_of(*r) != Some(Type::I64) {
+                        errs.push(format!("stack address {r:?} is not I64"));
+                    }
+                }
+                Inst::Load(r, ty, addr, _) => {
+                    if !ty_of(*addr).map(|t| t.is_int()).unwrap_or(false) {
+                        errs.push(format!("load address {addr:?} is not an integer pointer"));
+                    }
+                    if ty_of(*r) != Some(*ty) {
+                        errs.push(format!("load result {r:?} type mismatch"));
+                    }
+                }
+                Inst::Store(ty, addr, _, value) => {
+                    if !ty_of(*addr).map(|t| t.is_int()).unwrap_or(false) {
+                        errs.push(format!("store address {addr:?} is not an integer pointer"));
+                    }
+                    if ty_of(*value) != Some(*ty) {
+                        errs.push(format!("store value {value:?} type mismatch"));
+                    }
+                }
                 Inst::Jump(t, args) => {
                     check_args(&mut errs, func, *t, args, ty_of);
                 }

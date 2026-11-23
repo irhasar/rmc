@@ -24,6 +24,13 @@ impl Val {
         }
     }
 
+    fn as_u64(self) -> u64 {
+        match self {
+            Val::P(v) => v,
+            _ => self.as_i() as u64,
+        }
+    }
+
     fn as_f(self) -> f64 {
         match self {
             Val::I(v) => v as f64,
@@ -92,7 +99,84 @@ fn get(env: &[Option<Val>], v: Value) -> Result<Val, String> {
     env[v.0 as usize].ok_or_else(|| format!("value {v:?} read before it was defined"))
 }
 
-fn eval(env: &[Option<Val>], inst: &Inst) -> Result<Val, String> {
+fn size_of(ty: Type) -> usize {
+    match ty {
+        Type::I8 | Type::Bool => 1,
+        Type::I16 => 2,
+        Type::I32 | Type::F32 => 4,
+        Type::I64 | Type::F64 | Type::Ptr => 8,
+    }
+}
+
+fn stack_layout(func: &Function) -> (Vec<usize>, Vec<u8>) {
+    let mut bases = Vec::with_capacity(func.stack_slots.len());
+    let mut total = 0usize;
+    for slot in &func.stack_slots {
+        let align = slot.align.max(1) as usize;
+        total = (total + align - 1) & !(align - 1);
+        bases.push(total);
+        total += slot.size as usize;
+    }
+    (bases, vec![0u8; total.max(1)])
+}
+
+fn addr_of(base: u64, offset: i32) -> Result<usize, String> {
+    let a = base as i64 + offset as i64;
+    if a < 0 {
+        return Err(format!("negative address {a}"));
+    }
+    Ok(a as usize)
+}
+
+fn read_scalar(mem: &[u8], addr: usize, ty: Type) -> Result<Val, String> {
+    let size = size_of(ty);
+    let end = addr
+        .checked_add(size)
+        .ok_or_else(|| "address overflow".to_string())?;
+    if end > mem.len() {
+        return Err(format!("load at {addr} (+{size}) is out of bounds"));
+    }
+    let mut buf = [0u8; 8];
+    buf[..size].copy_from_slice(&mem[addr..end]);
+    Ok(match ty {
+        Type::I8 => Val::I(i8::from_le_bytes([buf[0]]) as i64),
+        Type::I16 => Val::I(i16::from_le_bytes(buf[..2].try_into().unwrap()) as i64),
+        Type::I32 => Val::I(i32::from_le_bytes(buf[..4].try_into().unwrap()) as i64),
+        Type::I64 => Val::I(i64::from_le_bytes(buf)),
+        Type::F32 => Val::F32(f32::from_le_bytes(buf[..4].try_into().unwrap())),
+        Type::F64 => Val::F64(f64::from_le_bytes(buf)),
+        Type::Bool => Val::B(buf[0] != 0),
+        Type::Ptr => Val::P(u64::from_le_bytes(buf)),
+    })
+}
+
+fn write_scalar(mem: &mut [u8], addr: usize, ty: Type, val: Val) -> Result<(), String> {
+    let size = size_of(ty);
+    let end = addr
+        .checked_add(size)
+        .ok_or_else(|| "address overflow".to_string())?;
+    if end > mem.len() {
+        return Err(format!("store at {addr} (+{size}) is out of bounds"));
+    }
+    let mut buf = [0u8; 8];
+    match ty {
+        Type::I8 | Type::Bool => buf[0] = val.as_i() as u8,
+        Type::I16 => buf[..2].copy_from_slice(&(val.as_i() as i16).to_le_bytes()),
+        Type::I32 => buf[..4].copy_from_slice(&(val.as_i() as i32).to_le_bytes()),
+        Type::I64 | Type::Ptr => buf = (val.as_u64() as i64).to_le_bytes(),
+        Type::F32 => buf[..4].copy_from_slice(&(val.as_f() as f32).to_le_bytes()),
+        Type::F64 => buf = val.as_f().to_le_bytes(),
+    }
+    mem[addr..end].copy_from_slice(&buf[..size]);
+    Ok(())
+}
+
+fn eval(
+    env: &[Option<Val>],
+    inst: &Inst,
+    mem: &mut [u8],
+    bases: &[usize],
+) -> Result<Val, String> {
     match inst {
         Inst::Nop(_, ty) => Ok(default_val(*ty)),
         Inst::Iconst(_, ty, v) => Ok(if *ty == Type::Bool {
@@ -116,6 +200,25 @@ fn eval(env: &[Option<Val>], inst: &Inst) -> Result<Val, String> {
         Inst::Select(_, _, c, x, y) => {
             if get(env, *c)?.as_bool() { get(env, *x) } else { get(env, *y) }
         }
+        Inst::StackAddr(_, slot, offset) => {
+            let base = *bases
+                .get(slot.0 as usize)
+                .ok_or_else(|| format!("stack slot {slot:?} out of range"))?;
+            let addr = addr_of(base as u64, *offset)?;
+            if addr > mem.len() {
+                return Err(format!("stack address {addr} is out of bounds"));
+            }
+            Ok(Val::P(addr as u64))
+        }
+        Inst::Load(_, ty, addr, offset) => {
+            let base = get(env, *addr)?.as_u64();
+            read_scalar(mem, addr_of(base, *offset)?, *ty)
+        }
+        Inst::Store(ty, addr, offset, value) => {
+            let base = get(env, *addr)?.as_u64();
+            write_scalar(mem, addr_of(base, *offset)?, *ty, get(env, *value)?)?;
+            Ok(Val::I(0))
+        }
         Inst::Jump(..) | Inst::Brif(..) | Inst::Return(..) => {
             Err("evaluating a terminator as a value".to_string())
         }
@@ -125,6 +228,7 @@ fn eval(env: &[Option<Val>], inst: &Inst) -> Result<Val, String> {
 /// Execute `func` with `args` and return its return values.
 pub fn run(func: &Function, args: &[Val]) -> Result<Vec<Val>, String> {
     let mut env: Vec<Option<Val>> = vec![None; func.values.len()];
+    let (bases, mut mem) = stack_layout(func);
 
     let entry_params = &func.block(func.entry).params;
     if entry_params.len() != args.len() {
@@ -156,7 +260,7 @@ pub fn run(func: &Function, args: &[Val]) -> Result<Vec<Val>, String> {
                     break;
                 }
                 _ => {
-                    let v = eval(&env, inst)?;
+                    let v = eval(&env, inst, &mut mem, &bases)?;
                     if let Some(r) = inst.result_value() {
                         env[r.0 as usize] = Some(v);
                     }

@@ -1,6 +1,8 @@
 //! An ergonomic builder for Rakit IR functions.
 
-use crate::ir::{BinOp, Block, BlockData, FloatCc, Function, Inst, IntCc, Type, Value};
+use crate::ir::{
+    BinOp, Block, BlockData, FloatCc, Function, Inst, IntCc, StackSlot, StackSlotData, Type, Value,
+};
 
 pub struct Builder {
     func: Function,
@@ -88,6 +90,28 @@ impl Builder {
         let r = self.new_value(ty);
         self.push(b, Inst::Select(r, ty, c, x, y));
         r
+    }
+
+    pub fn add_stack_slot(&mut self, size: u32, align: u32) -> StackSlot {
+        let s = StackSlot(self.func.stack_slots.len() as u32);
+        self.func.stack_slots.push(StackSlotData { size, align });
+        s
+    }
+
+    pub fn stack_addr(&mut self, b: Block, slot: StackSlot, offset: i32) -> Value {
+        let r = self.new_value(Type::I64);
+        self.push(b, Inst::StackAddr(r, slot, offset));
+        r
+    }
+
+    pub fn load(&mut self, b: Block, ty: Type, addr: Value, offset: i32) -> Value {
+        let r = self.new_value(ty);
+        self.push(b, Inst::Load(r, ty, addr, offset));
+        r
+    }
+
+    pub fn store(&mut self, b: Block, ty: Type, addr: Value, offset: i32, value: Value) {
+        self.push(b, Inst::Store(ty, addr, offset, value));
     }
 
     pub fn jump(&mut self, b: Block, target: Block, args: Vec<Value>) {

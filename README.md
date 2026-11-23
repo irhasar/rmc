@@ -117,6 +117,13 @@ luar atau tanpa preheader dilewati; instruksi yang bergantung pada nilai loop
 tidak dipindahkan. Pass berjalan sampai fixpoint agar rantai invariant ikut
 terangkat.
 
+Bridge RIR kini juga mengimpor stack slot tetap dan akses memori skalar:
+`stack_addr`, `load`, dan `store` (termasuk varian tanpa offset). Alamat
+direpresentasikan sebagai `I64`. Pass yang ada tetap konservatif: `gvn` dan
+`licm` tidak memindahkan akses memori, `if_convert` menolak lengan yang berisi
+load/store, dan DCE tidak membuang load/store. Interpreter memakai arena stack
+sederhana dengan pemeriksaan batas untuk menguji round-trip memori.
+
 Pipeline RIR sekarang:
 `simplify → optimize → div_test → if_convert → gvn → licm → optimize`.
 
