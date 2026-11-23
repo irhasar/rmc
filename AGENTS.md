@@ -1,5 +1,15 @@
 # AGENTS.md
 
+## Session (2026-11-23, Fase 2 step 11) — block merging in simplify
+- `simplify` now also merges a parameterless block with a single predecessor
+  when the predecessor ends in `jump` with no args: the block body is appended
+  to the predecessor and the block is removed (values stay defined).
+- Does not merge across a `brif` edge, a block with params, or a block with
+  multiple predecessors.
+- Tests: 46/46 (6 div_test + 7 gvn + 7 if_convert + 15 ir + 11 simplify).
+- End-to-end: `h` (loop), `pick` and `pick2` all log `simplify fired` with
+  `RAKIT_RIR=1 RAKIT_RIR_DEBUG=1`; outputs 30, `11 12 1`, `8 18`, identical.
+
 ## Session (2026-11-23, Fase 2 step 10) — global GVN
 - `gvn` is now global: computes predecessors, RPO and immediate dominators
   (Cooper-Harvey-Kennedy), inherits the expression table from the immediate

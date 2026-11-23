@@ -1,4 +1,4 @@
-use rakit_ir::ir::{Inst, Type};
+use rakit_ir::ir::{BinOp, Inst, Type};
 use rakit_ir::{run, simplify, verify, Builder, Val};
 
 #[test]
@@ -33,13 +33,9 @@ fn collapses_forwarding_block() {
     let mut f = b.into_func();
     assert_eq!(run(&f, &[Val::I(5)]).unwrap(), vec![Val::I(5)]);
     assert!(simplify::run(&mut f));
-    assert_eq!(f.blocks.len(), 2);
+    assert_eq!(f.blocks.len(), 1);
     assert!(verify(&f).is_ok(), "{:?}", verify(&f).err());
     assert_eq!(run(&f, &[Val::I(5)]).unwrap(), vec![Val::I(5)]);
-    assert!(matches!(
-        f.blocks[0].insts.last(),
-        Some(Inst::Jump(t, args)) if t.0 == 1 && args.is_empty()
-    ));
 }
 
 #[test]
@@ -57,13 +53,13 @@ fn collapses_forwarding_chain() {
 
     let mut f = b.into_func();
     assert!(simplify::run(&mut f));
-    assert_eq!(f.blocks.len(), 2);
+    assert_eq!(f.blocks.len(), 1);
     assert!(verify(&f).is_ok(), "{:?}", verify(&f).err());
     assert_eq!(run(&f, &[Val::I(5)]).unwrap(), vec![Val::I(5)]);
 }
 
 #[test]
-fn keeps_forwarder_with_used_nop() {
+fn merges_blocks_keeping_used_nop() {
     let mut b = Builder::new(vec![Type::I64], vec![]);
     let e = b.func().entry;
     let fwd = b.add_block(vec![]);
@@ -74,8 +70,10 @@ fn keeps_forwarder_with_used_nop() {
     b.ret(target, vec![v]);
 
     let mut f = b.into_func();
-    assert!(!simplify::run(&mut f));
-    assert_eq!(f.blocks.len(), 3);
+    assert!(simplify::run(&mut f));
+    assert_eq!(f.blocks.len(), 1);
+    assert!(verify(&f).is_ok(), "{:?}", verify(&f).err());
+    assert!(f.blocks[0].insts.iter().any(|i| matches!(i, Inst::Nop(..))));
 }
 
 #[test]
@@ -123,7 +121,7 @@ fn removes_unreachable_chain() {
 }
 
 #[test]
-fn keeps_entry_forwarder() {
+fn merges_entry_target() {
     let mut b = Builder::new(vec![Type::I64], vec![]);
     let e = b.func().entry;
     let target = b.add_block(vec![]);
@@ -132,8 +130,9 @@ fn keeps_entry_forwarder() {
     b.ret(target, vec![one]);
 
     let mut f = b.into_func();
-    assert!(!simplify::run(&mut f));
-    assert_eq!(f.blocks.len(), 2);
+    assert!(simplify::run(&mut f));
+    assert_eq!(f.blocks.len(), 1);
+    assert!(verify(&f).is_ok(), "{:?}", verify(&f).err());
     assert_eq!(run(&f, &[]).unwrap(), vec![Val::I(1)]);
 }
 
@@ -151,4 +150,66 @@ fn is_idempotent() {
     let mut f = b.into_func();
     assert!(simplify::run(&mut f));
     assert!(!simplify::run(&mut f));
+}
+
+#[test]
+fn merges_single_pred_chain_into_entry() {
+    let mut b = Builder::new(vec![Type::I64], vec![Type::I64]);
+    let e = b.func().entry;
+    let x = b.func().block(e).params[0];
+    let b1 = b.add_block(vec![]);
+    let b2 = b.add_block(vec![]);
+    b.jump(e, b1, vec![]);
+    let one = b.iconst(b1, Type::I64, 1);
+    let a = b.bin(b1, BinOp::Add, Type::I64, x, one);
+    b.jump(b1, b2, vec![]);
+    let one2 = b.iconst(b2, Type::I64, 1);
+    let c = b.bin(b2, BinOp::Add, Type::I64, a, one2);
+    b.ret(b2, vec![c]);
+
+    let mut f = b.into_func();
+    assert_eq!(run(&f, &[Val::I(2)]).unwrap(), vec![Val::I(4)]);
+    assert!(simplify::run(&mut f));
+    assert_eq!(f.blocks.len(), 1);
+    assert!(verify(&f).is_ok(), "{:?}", verify(&f).err());
+    assert_eq!(run(&f, &[Val::I(2)]).unwrap(), vec![Val::I(4)]);
+}
+
+#[test]
+fn does_not_merge_brif_target() {
+    let mut b = Builder::new(vec![Type::I64], vec![Type::Bool]);
+    let e = b.func().entry;
+    let c = b.func().block(e).params[0];
+    let t = b.add_block(vec![]);
+    let f = b.add_block(vec![]);
+    b.brif(e, c, t, vec![], f, vec![]);
+    let one = b.iconst(t, Type::I64, 1);
+    b.ret(t, vec![one]);
+    let two = b.iconst(f, Type::I64, 2);
+    b.ret(f, vec![two]);
+
+    let mut f = b.into_func();
+    assert!(!simplify::run(&mut f));
+    assert_eq!(f.blocks.len(), 3);
+}
+
+#[test]
+fn does_not_merge_two_preds() {
+    let mut b = Builder::new(vec![Type::I64], vec![Type::Bool]);
+    let e = b.func().entry;
+    let c = b.func().block(e).params[0];
+    let t = b.add_block(vec![]);
+    let f = b.add_block(vec![]);
+    let j = b.add_block(vec![]);
+    b.brif(e, c, t, vec![], f, vec![]);
+    let _one = b.iconst(t, Type::I64, 1);
+    b.jump(t, j, vec![]);
+    let _two = b.iconst(f, Type::I64, 2);
+    b.jump(f, j, vec![]);
+    let three = b.iconst(j, Type::I64, 3);
+    b.ret(j, vec![three]);
+
+    let mut f = b.into_func();
+    assert!(!simplify::run(&mut f));
+    assert_eq!(f.blocks.len(), 4);
 }

@@ -15,11 +15,16 @@ pub fn run(func: &mut Function) -> bool {
             changed = true;
             continue;
         }
-        let Some(b) = find_forwarder(func) else {
+        if let Some(b) = find_forwarder(func) {
+            redirect_to_target(func, b);
+            remove_blocks_and_values(func, &[b]);
+            changed = true;
+            continue;
+        }
+        let Some((p, b)) = find_merge(func) else {
             break;
         };
-        redirect_to_target(func, b);
-        remove_blocks_and_values(func, &[b]);
+        merge_blocks(func, p, b);
         changed = true;
     }
     changed
@@ -95,6 +100,56 @@ fn values_dead_outside(func: &Function, block: usize, defined: &HashSet<Value>) 
         }
     }
     true
+}
+
+fn predecessors(func: &Function) -> Vec<Vec<usize>> {
+    let mut preds = vec![Vec::new(); func.blocks.len()];
+    for (bi, block) in func.blocks.iter().enumerate() {
+        let Some(term) = block.insts.last() else {
+            continue;
+        };
+        match term {
+            Inst::Jump(t, _) => preds[t.0 as usize].push(bi),
+            Inst::Brif(_, t, _, f, _) => {
+                preds[t.0 as usize].push(bi);
+                preds[f.0 as usize].push(bi);
+            }
+            _ => {}
+        }
+    }
+    preds
+}
+
+fn find_merge(func: &Function) -> Option<(usize, usize)> {
+    let preds = predecessors(func);
+    for (bi, block) in func.blocks.iter().enumerate() {
+        if bi == func.entry.0 as usize || !block.params.is_empty() {
+            continue;
+        }
+        if preds[bi].len() != 1 {
+            continue;
+        }
+        let p = preds[bi][0];
+        if p == bi {
+            continue;
+        }
+        let Some(Inst::Jump(t, args)) = func.blocks[p].insts.last() else {
+            continue;
+        };
+        if t.0 as usize != bi || !args.is_empty() {
+            continue;
+        }
+        return Some((p, bi));
+    }
+    None
+}
+
+fn merge_blocks(func: &mut Function, p: usize, b: usize) {
+    let mut insts = std::mem::take(&mut func.blocks[b].insts);
+    let p_insts = &mut func.blocks[p].insts;
+    p_insts.pop();
+    p_insts.append(&mut insts);
+    remove_blocks(func, &[b]);
 }
 
 fn redirect_to_target(func: &mut Function, b: usize) {

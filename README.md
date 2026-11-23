@@ -105,6 +105,11 @@ terjangkau dari entry dan menggabungkan blok forwarder kosong
 maupun `brif`; blok dan nilai di-renumber. Forwarder yang hasil `nop`-nya
 dipakai di luar blok dibiarkan, dan blok entry tidak pernah dihapus.
 
+Selain itu, blok tanpa parameter dengan tepat satu predecessor digabung ke
+predecessor tersebut bila predecessor berakhir `jump` tanpa arg; isi blok
+dipindahkan dan bloknya dihapus. Penggabungan tidak dilakukan melewati edge
+`brif`, blok berparameter, atau blok dengan banyak predecessor.
+
 Pipeline RIR sekarang:
 `simplify → optimize → div_test → if_convert → gvn → optimize`.
 
