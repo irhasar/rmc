@@ -92,9 +92,11 @@ instruksi, tanpa div/rem, dan nilai arm tidak dipakai di luar arm. Dengan
 `RAKIT_RIR=1 RAKIT_NO_IFCONV=1`, `if c { x + 1 } else { x + 2 }` dikonversi di
 RIR dan output tetap sama.
 
-Pass `gvn` (`rakit-ir/src/gvn.rs`) melakukan value numbering lokal: instruksi
-murni duplikat dalam satu blok diganti `Copy` ke hasil pertama. Key-nya adalah
-opcode + tipe + operand, sehingga tipe atau operand berbeda tidak pernah
+Pass `gvn` (`rakit-ir/src/gvn.rs`) melakukan value numbering global: tabel
+ekspresi diwarisi sepanjang dominator tree, jadi instruksi murni duplikat
+diganti `Copy` ke hasil pertama hanya jika hasil itu mendominasi penggunaan.
+Key-nya adalah opcode + tipe + operand, sehingga tipe atau operand berbeda
+tidak pernah digabung; dua cabang yang tidak saling mendominasi juga tidak
 digabung.
 
 Pass `simplify` (`rakit-ir/src/simplify.rs`) membuang blok yang tidak

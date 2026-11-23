@@ -90,7 +90,7 @@ fn merges_duplicate_select() {
 }
 
 #[test]
-fn does_not_merge_across_blocks() {
+fn merges_across_dominating_blocks() {
     let mut b = Builder::new(vec![Type::I64], vec![Type::I64, Type::I64]);
     let e = b.func().entry;
     let x = b.func().block(e).params[0];
@@ -105,5 +105,73 @@ fn does_not_merge_across_blocks() {
 
     let mut f = b.into_func();
     assert_eq!(run(&f, &[Val::I(2), Val::I(3)]).unwrap(), vec![Val::I(5)]);
-    assert!(!gvn::run(&mut f));
+    assert!(gvn::run(&mut f));
+    assert!(verify(&f).is_ok(), "{:?}", verify(&f).err());
+    assert_eq!(run(&f, &[Val::I(2), Val::I(3)]).unwrap(), vec![Val::I(5)]);
+    assert!(f
+        .blocks
+        .iter()
+        .any(|b| b.insts.iter().any(|i| matches!(i, Inst::Copy(..)))));
+}
+
+#[test]
+fn does_not_merge_across_branches() {
+    let mut b = Builder::new(
+        vec![Type::I64],
+        vec![Type::I64, Type::I64, Type::Bool],
+    );
+    let e = b.func().entry;
+    let x = b.func().block(e).params[0];
+    let y = b.func().block(e).params[1];
+    let c = b.func().block(e).params[2];
+    let t = b.add_block(vec![]);
+    let f = b.add_block(vec![]);
+    let j = b.add_block(vec![Type::I64]);
+    b.brif(e, c, t, vec![], f, vec![]);
+    let a = b.bin(t, BinOp::Add, Type::I64, x, y);
+    b.jump(t, j, vec![a]);
+    let bv = b.bin(f, BinOp::Add, Type::I64, x, y);
+    b.jump(f, j, vec![bv]);
+    let p = b.func().block(j).params[0];
+    b.ret(j, vec![p]);
+
+    let mut func = b.into_func();
+    assert_eq!(
+        run(&func, &[Val::I(2), Val::I(3), Val::B(true)]).unwrap(),
+        vec![Val::I(5)]
+    );
+    assert!(!gvn::run(&mut func));
+}
+
+#[test]
+fn merges_in_join_dominated_by_entry() {
+    let mut b = Builder::new(
+        vec![Type::I64],
+        vec![Type::I64, Type::I64, Type::Bool],
+    );
+    let e = b.func().entry;
+    let x = b.func().block(e).params[0];
+    let y = b.func().block(e).params[1];
+    let c = b.func().block(e).params[2];
+    let t = b.add_block(vec![]);
+    let f = b.add_block(vec![]);
+    let j = b.add_block(vec![]);
+    let _a = b.bin(e, BinOp::Add, Type::I64, x, y);
+    b.brif(e, c, t, vec![], f, vec![]);
+    b.jump(t, j, vec![]);
+    b.jump(f, j, vec![]);
+    let bv = b.bin(j, BinOp::Add, Type::I64, x, y);
+    b.ret(j, vec![bv]);
+
+    let mut func = b.into_func();
+    assert_eq!(
+        run(&func, &[Val::I(2), Val::I(3), Val::B(true)]).unwrap(),
+        vec![Val::I(5)]
+    );
+    assert!(gvn::run(&mut func));
+    assert!(verify(&func).is_ok(), "{:?}", verify(&func).err());
+    assert_eq!(
+        run(&func, &[Val::I(2), Val::I(3), Val::B(false)]).unwrap(),
+        vec![Val::I(5)]
+    );
 }

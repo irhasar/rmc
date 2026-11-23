@@ -1,5 +1,17 @@
 # AGENTS.md
 
+## Session (2026-11-23, Fase 2 step 10) — global GVN
+- `gvn` is now global: computes predecessors, RPO and immediate dominators
+  (Cooper-Harvey-Kennedy), inherits the expression table from the immediate
+  dominator, and only merges an expression when the first result dominates it.
+- Unreachable blocks fall back to local numbering.
+- Tests: 43/43 (6 div_test + 7 gvn + 7 if_convert + 15 ir + 8 simplify). New:
+  merge across dominating blocks, no merge across sibling branches, merge in a
+  join dominated by the entry.
+- End-to-end: a loop that computes `x*y` before the loop and again inside it
+  logs `gvn fired` with `RAKIT_RIR=1 RAKIT_RIR_DEBUG=1` and prints 30,
+  identical to normal.
+
 ## Session (2026-11-23, Fase 2 step 9) — CFG simplify
 - New `rakit-ir/src/simplify.rs`: removes blocks unreachable from entry and
   collapses empty forwarding blocks (`nop*; jump target` with no params),
