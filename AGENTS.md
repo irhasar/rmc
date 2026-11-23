@@ -1,5 +1,19 @@
 # AGENTS.md
 
+## Session (2026-11-23, Fase 2 step 7) — `if_convert` migrated to RIR
+- New `rakit-ir/src/if_convert.rs`: converts a two-way diamond (`brif` to two
+  short arms that `jump` to a common join or both `return`) into a `select` in
+  the head, then removes the arms and their now-dead values (block and value
+  indices are renumbered).
+- Conservative limits: arms have no params, one predecessor, <= 8 insts, no
+  div/rem/fdiv, and no arm-defined value is used outside the arms.
+- `RirPass` runs it after `div_test` and re-runs `optimize`.
+- Tests: 27/27 (6 div_test + 6 if_convert + 15 ir; new: simple join diamond,
+  head-value arms, return arms, skip division, skip params, skip large arm).
+- End-to-end: `RAKIT_RIR=1 RAKIT_NO_IFCONV=1` on
+  `if c { x + 1 } else { x + 2 }` logs `[rir] if_convert fired` and prints
+  `11 12 1`, identical to the normal build.
+
 ## Session (2026-11-23, Fase 2 step 6) — narrow-type semantics + div_test
 - New `rakit-ir/src/int_sem.rs`: `width`/`mask`/`wrap`/`sign_extend`/
   `shift_amount` plus shared `eval_bin`/`eval_icmp`. Values are zero-extended

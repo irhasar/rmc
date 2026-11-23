@@ -1,0 +1,411 @@
+//! If-conversion of two-way diamonds on Rakit IR.
+//!
+//! A short `if cond { a } else { b }` that only computes a value lowers to a
+//! diamond: a `brif` from the head to a *then* and an *else* block, both of
+//! which `jump` to a common *join* that receives the chosen value as a
+//! parameter. When the arms are small and side-effect-free, the diamond is
+//! equivalent to a `select` in the head, which Rakit lowers to a `cmove`.
+//!
+//! The rewrite is deliberately conservative: both arms must be single-
+//! predecessor, single-successor, side-effect-free blocks that end in a `jump`
+//! to the same join, carry no block parameters, and define no value that is used
+//! outside them.
+
+use std::collections::{HashMap, HashSet};
+
+use crate::ir::{BinOp, Block, BlockData, Function, Inst, Type, Value};
+
+/// Cap on the number of instructions an arm may contain.
+const MAX_ARM_INSTS: usize = 8;
+
+pub fn run(func: &mut Function) -> bool {
+    let mut changed = false;
+    while convert_one(func) {
+        changed = true;
+    }
+    changed
+}
+
+struct ArmPlan {
+    insts: Vec<Inst>,
+    value: Value,
+    defined: HashSet<Value>,
+}
+
+fn convert_one(func: &mut Function) -> bool {
+    let (preds, succs) = cfg(func);
+    let block_count = func.blocks.len();
+    for head in 0..block_count {
+        let Some(Inst::Brif(cond, then_b, then_args, else_b, else_args)) =
+            func.blocks[head].insts.last().cloned()
+        else {
+            continue;
+        };
+        let (tb, eb) = (then_b.0 as usize, else_b.0 as usize);
+        if tb >= block_count || eb >= block_count {
+            continue;
+        }
+        if then_b == else_b || tb == head || eb == head {
+            continue;
+        }
+        if !then_args.is_empty() || !else_args.is_empty() {
+            continue;
+        }
+        if !func.blocks[tb].params.is_empty() || !func.blocks[eb].params.is_empty() {
+            continue;
+        }
+        if preds[tb] != 1 || preds[eb] != 1 {
+            continue;
+        }
+        let Some(then_end) = arm_end(&func.blocks[tb]) else {
+            continue;
+        };
+        let Some(else_end) = arm_end(&func.blocks[eb]) else {
+            continue;
+        };
+        let (join, then_value, else_value, join_ty, is_return) = match (&then_end, &else_end) {
+            (ArmEnd::Jump(tj, tv), ArmEnd::Jump(ej, ev)) => {
+                if tj != ej || succs[tb] != 1 || succs[eb] != 1 {
+                    continue;
+                }
+                let jb = tj.0 as usize;
+                if jb >= block_count || jb == head || jb == tb || jb == eb {
+                    continue;
+                }
+                if func.blocks[jb].params.len() != 1 {
+                    continue;
+                }
+                (
+                    Some(*tj),
+                    *tv,
+                    *ev,
+                    func.values[func.blocks[jb].params[0].0 as usize],
+                    false,
+                )
+            }
+            (ArmEnd::Return(tv), ArmEnd::Return(ev)) => {
+                if succs[tb] != 0 || succs[eb] != 0 || func.ret.len() != 1 {
+                    continue;
+                }
+                (None, *tv, *ev, func.ret[0], true)
+            }
+            _ => continue,
+        };
+        let Some(then_plan) = analyze_arm(&func.blocks[tb], then_value) else {
+            continue;
+        };
+        let Some(else_plan) = analyze_arm(&func.blocks[eb], else_value) else {
+            continue;
+        };
+        if !values_dead_outside(func, tb, eb, &then_plan, &else_plan) {
+            continue;
+        }
+        if uses_other_arm(&then_plan, &else_plan.defined)
+            || uses_other_arm(&else_plan, &then_plan.defined)
+        {
+            continue;
+        }
+
+        let mut removed_values = HashSet::new();
+        removed_values.extend(then_plan.defined.iter().copied());
+        removed_values.extend(else_plan.defined.iter().copied());
+
+        let mut then_map = HashMap::new();
+        let Some(mut then_new) = clone_arm(func, &then_plan, &mut then_map) else {
+            continue;
+        };
+        let mut else_map = HashMap::new();
+        let Some(mut else_new) = clone_arm(func, &else_plan, &mut else_map) else {
+            continue;
+        };
+        let then_val = remap(then_plan.value, &then_map);
+        let else_val = remap(else_plan.value, &else_map);
+        let sel = new_value(func, join_ty);
+
+        let head_block = &mut func.blocks[head];
+        head_block.insts.pop();
+        head_block.insts.append(&mut then_new);
+        head_block.insts.append(&mut else_new);
+        head_block
+            .insts
+            .push(Inst::Select(sel, join_ty, cond, then_val, else_val));
+        if is_return {
+            head_block.insts.push(Inst::Return(vec![sel]));
+        } else {
+            head_block
+                .insts
+                .push(Inst::Jump(join.expect("jump arm has a join"), vec![sel]));
+        }
+        remove_blocks(func, &[tb, eb]);
+        remove_values(func, &removed_values);
+        return true;
+    }
+    false
+}
+
+fn cfg(func: &Function) -> (Vec<usize>, Vec<usize>) {
+    let n = func.blocks.len();
+    let mut preds = vec![0usize; n];
+    let mut succs = vec![0usize; n];
+    for (bi, block) in func.blocks.iter().enumerate() {
+        let Some(term) = block.insts.last() else {
+            continue;
+        };
+        match term {
+            Inst::Jump(t, _) => {
+                preds[t.0 as usize] += 1;
+                succs[bi] += 1;
+            }
+            Inst::Brif(_, t, _, f, _) => {
+                preds[t.0 as usize] += 1;
+                preds[f.0 as usize] += 1;
+                succs[bi] += 2;
+            }
+            _ => {}
+        }
+    }
+    (preds, succs)
+}
+
+enum ArmEnd {
+    Jump(Block, Value),
+    Return(Value),
+}
+
+fn arm_end(block: &BlockData) -> Option<ArmEnd> {
+    match block.insts.last()? {
+        Inst::Jump(t, args) if args.len() == 1 => Some(ArmEnd::Jump(*t, args[0])),
+        Inst::Return(args) if args.len() == 1 => Some(ArmEnd::Return(args[0])),
+        _ => None,
+    }
+}
+
+fn analyze_arm(block: &BlockData, value: Value) -> Option<ArmPlan> {
+    let n = block.insts.len();
+    if n == 0 {
+        return None;
+    }
+    let mut insts = Vec::new();
+    let mut defined = HashSet::new();
+    for inst in &block.insts[..n - 1] {
+        if inst.is_terminator() {
+            return None;
+        }
+        if insts.len() >= MAX_ARM_INSTS {
+            return None;
+        }
+        if !is_cheap(inst) {
+            return None;
+        }
+        if let Some(r) = inst.result_value() {
+            defined.insert(r);
+        }
+        insts.push(inst.clone());
+    }
+    Some(ArmPlan {
+        insts,
+        value,
+        defined,
+    })
+}
+
+fn is_cheap(inst: &Inst) -> bool {
+    match inst {
+        Inst::Bin(_, op, _, _, _) => !matches!(
+            op,
+            BinOp::Sdiv | BinOp::Udiv | BinOp::Srem | BinOp::Urem | BinOp::Fdiv
+        ),
+        _ => true,
+    }
+}
+
+fn values_dead_outside(
+    func: &Function,
+    then_block: usize,
+    else_block: usize,
+    then_plan: &ArmPlan,
+    else_plan: &ArmPlan,
+) -> bool {
+    let mut defined = HashSet::new();
+    defined.extend(then_plan.defined.iter().copied());
+    defined.extend(else_plan.defined.iter().copied());
+    for (bi, block) in func.blocks.iter().enumerate() {
+        if bi == then_block || bi == else_block {
+            continue;
+        }
+        for inst in &block.insts {
+            if inst.operands().iter().any(|v| defined.contains(v)) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn uses_other_arm(plan: &ArmPlan, other: &HashSet<Value>) -> bool {
+    plan.insts
+        .iter()
+        .any(|inst| inst.operands().iter().any(|v| other.contains(v)))
+        || other.contains(&plan.value)
+}
+
+fn clone_arm(
+    func: &mut Function,
+    plan: &ArmPlan,
+    map: &mut HashMap<Value, Value>,
+) -> Option<Vec<Inst>> {
+    let mut out = Vec::with_capacity(plan.insts.len());
+    for inst in &plan.insts {
+        out.push(clone_inst(func, inst, map)?);
+    }
+    Some(out)
+}
+
+fn clone_inst(
+    func: &mut Function,
+    inst: &Inst,
+    map: &mut HashMap<Value, Value>,
+) -> Option<Inst> {
+    let old = inst.result_value()?;
+    let ty = *func.values.get(old.0 as usize)?;
+    let new = new_value(func, ty);
+    let out = match inst {
+        Inst::Nop(_, ty) => Inst::Nop(new, *ty),
+        Inst::Iconst(_, ty, v) => Inst::Iconst(new, *ty, *v),
+        Inst::F32const(_, v) => Inst::F32const(new, *v),
+        Inst::F64const(_, v) => Inst::F64const(new, *v),
+        Inst::Copy(_, ty, x) => Inst::Copy(new, *ty, remap(*x, map)),
+        Inst::Bin(_, op, ty, x, y) => Inst::Bin(new, *op, *ty, remap(*x, map), remap(*y, map)),
+        Inst::Icmp(_, cc, ty, x, y) => {
+            Inst::Icmp(new, *cc, *ty, remap(*x, map), remap(*y, map))
+        }
+        Inst::Fcmp(_, cc, ty, x, y) => {
+            Inst::Fcmp(new, *cc, *ty, remap(*x, map), remap(*y, map))
+        }
+        Inst::Select(_, ty, c, x, y) => Inst::Select(
+            new,
+            *ty,
+            remap(*c, map),
+            remap(*x, map),
+            remap(*y, map),
+        ),
+        Inst::Jump(..) | Inst::Brif(..) | Inst::Return(..) => return None,
+    };
+    map.insert(old, new);
+    Some(out)
+}
+
+fn remap(v: Value, map: &HashMap<Value, Value>) -> Value {
+    *map.get(&v).unwrap_or(&v)
+}
+
+fn new_value(func: &mut Function, ty: Type) -> Value {
+    let v = Value(func.values.len() as u32);
+    func.values.push(ty);
+    v
+}
+
+fn remove_blocks(func: &mut Function, remove: &[usize]) {
+    let remove: HashSet<usize> = remove.iter().copied().collect();
+    let mut map = vec![None; func.blocks.len()];
+    let mut next = 0u32;
+    for (old, slot) in map.iter_mut().enumerate() {
+        if !remove.contains(&old) {
+            *slot = Some(next);
+            next += 1;
+        }
+    }
+    let old_blocks = std::mem::take(&mut func.blocks);
+    let mut blocks = Vec::with_capacity(next as usize);
+    for (old, mut block) in old_blocks.into_iter().enumerate() {
+        if remove.contains(&old) {
+            continue;
+        }
+        for inst in &mut block.insts {
+            match inst {
+                Inst::Jump(t, _) => {
+                    t.0 = map[t.0 as usize].expect("branch to removed block");
+                }
+                Inst::Brif(_, t, _, f, _) => {
+                    t.0 = map[t.0 as usize].expect("branch to removed block");
+                    f.0 = map[f.0 as usize].expect("branch to removed block");
+                }
+                _ => {}
+            }
+        }
+        blocks.push(block);
+    }
+    func.blocks = blocks;
+    func.entry.0 = map[func.entry.0 as usize].expect("entry block was removed");
+}
+
+fn remove_values(func: &mut Function, removed: &HashSet<Value>) {
+    let mut map = vec![None; func.values.len()];
+    let mut next = 0u32;
+    for (old, slot) in map.iter_mut().enumerate() {
+        if !removed.contains(&Value(old as u32)) {
+            *slot = Some(Value(next));
+            next += 1;
+        }
+    }
+    let old_values = std::mem::take(&mut func.values);
+    func.values = old_values
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| !removed.contains(&Value(*i as u32)))
+        .map(|(_, ty)| ty)
+        .collect();
+    for block in &mut func.blocks {
+        for p in &mut block.params {
+            *p = map[p.0 as usize].expect("block param removed");
+        }
+        for inst in &mut block.insts {
+            remap_inst_values(inst, &map);
+        }
+    }
+}
+
+fn remap_inst_values(inst: &mut Inst, map: &[Option<Value>]) {
+    fn r(map: &[Option<Value>], v: &mut Value) {
+        *v = map[v.0 as usize].expect("value removed but still used");
+    }
+    match inst {
+        Inst::Nop(v, _)
+        | Inst::Iconst(v, _, _)
+        | Inst::F32const(v, _)
+        | Inst::F64const(v, _)
+        | Inst::Copy(v, _, _)
+        | Inst::Bin(v, _, _, _, _)
+        | Inst::Icmp(v, _, _, _, _)
+        | Inst::Fcmp(v, _, _, _, _)
+        | Inst::Select(v, _, _, _, _) => r(map, v),
+        _ => {}
+    }
+    match inst {
+        Inst::Nop(..) | Inst::Iconst(..) | Inst::F32const(..) | Inst::F64const(..) => {}
+        Inst::Copy(_, _, x) => r(map, x),
+        Inst::Bin(_, _, _, x, y) | Inst::Icmp(_, _, _, x, y) | Inst::Fcmp(_, _, _, x, y) => {
+            r(map, x);
+            r(map, y);
+        }
+        Inst::Select(_, _, c, x, y) => {
+            r(map, c);
+            r(map, x);
+            r(map, y);
+        }
+        Inst::Jump(_, args) | Inst::Return(args) => {
+            for a in args {
+                r(map, a);
+            }
+        }
+        Inst::Brif(c, _, ta, _, fa) => {
+            r(map, c);
+            for a in ta {
+                r(map, a);
+            }
+            for a in fa {
+                r(map, a);
+            }
+        }
+    }
+}

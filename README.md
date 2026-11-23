@@ -83,6 +83,13 @@ zero-extended per lebar tipe: operasi unsigned langsung benar, operasi signed
 melakukan sign-extend, dan shift memakai `width-1`. Interpreter dan constant
 folder memakai modul yang sama, sehingga `I8/I16/I32` konsisten.
 
+Pass RIR `if_convert` (`rakit-ir/src/if_convert.rs`) mengubah diamond `brif` →
+dua arm pendek → join/return menjadi `select` di blok head, lalu menghapus arm
+dan nilai yang menjadi mati. Batasannya konservatif: arm tanpa parameter, satu
+predecessor, maksimal 8 instruksi, tanpa div/rem, dan nilai arm tidak dipakai
+di luar arm. Dengan `RAKIT_RIR=1 RAKIT_NO_IFCONV=1`,
+`if c { x + 1 } else { x + 2 }` dikonversi di RIR dan output tetap sama.
+
 ## Build
 
 Prasyarat: toolchain `nightly-2026-11-17` dengan komponen `rust-src`,
