@@ -168,7 +168,11 @@ pub fn import(func: &CgFunction) -> Option<RirFunction> {
                 InstructionData::Unary { opcode, arg } => {
                     let r = single_result(func, inst)?;
                     let ty = map_type_to_rir(func.dfg.value_type(r))?;
-                    let x = as_int(&mut builder, rb, lookup(func, &vmap, arg)?, ty);
+                    let x = if opcode == Opcode::Sextend {
+                        as_width(&mut builder, rb, lookup(func, &vmap, arg)?, ty, true)
+                    } else {
+                        as_int(&mut builder, rb, lookup(func, &vmap, arg)?, ty)
+                    };
                     let v = if opcode == Opcode::Ineg {
                         let zero = builder.iconst(rb, ty, 0);
                         builder.bin(rb, BinOp::Sub, ty, zero, x)
@@ -181,7 +185,8 @@ pub fn import(func: &CgFunction) -> Option<RirFunction> {
                 InstructionData::Binary { opcode, args } => {
                     let r = single_result(func, inst)?;
                     let ty = map_type_to_rir(func.dfg.value_type(r))?;
-                    let x = as_int(&mut builder, rb, lookup(func, &vmap, args[0])?, ty);
+                    let signed = matches!(opcode, Opcode::Sdiv | Opcode::Srem | Opcode::Sshr);
+                    let x = as_width(&mut builder, rb, lookup(func, &vmap, args[0])?, ty, signed);
                     let y = if matches!(opcode, Opcode::Umin | Opcode::Umax) {
                         as_int(&mut builder, rb, lookup(func, &vmap, args[1])?, ty)
                     } else {
@@ -189,7 +194,7 @@ pub fn import(func: &CgFunction) -> Option<RirFunction> {
                         if matches!(op, BinOp::Shl | BinOp::Shr | BinOp::Ushr) {
                             as_width(&mut builder, rb, lookup(func, &vmap, args[1])?, ty, false)
                         } else {
-                            as_int(&mut builder, rb, lookup(func, &vmap, args[1])?, ty)
+                            as_width(&mut builder, rb, lookup(func, &vmap, args[1])?, ty, signed)
                         }
                     };
                     let v = match opcode {
@@ -213,7 +218,7 @@ pub fn import(func: &CgFunction) -> Option<RirFunction> {
                     let r = single_result(func, inst)?;
                     let ty = map_type_to_rir(func.dfg.value_type(args[0]))?;
                     let signed = matches!(cc, RirIntCc::Slt | RirIntCc::Sle | RirIntCc::Sgt | RirIntCc::Sge);
-                    let x = as_int(&mut builder, rb, lookup(func, &vmap, args[0])?, ty);
+                    let x = as_width(&mut builder, rb, lookup(func, &vmap, args[0])?, ty, signed);
                     let y = as_width(&mut builder, rb, lookup(func, &vmap, args[1])?, ty, signed);
                     let v = builder.icmp(rb, cc, ty, x, y);
                     map_value(func, &mut vmap, r, v);
@@ -728,9 +733,27 @@ pub fn export(rir: &RirFunction, sig: &Signature) -> Option<CgFunction> {
                 }
                 RirInst::Unary(r, op, ty, x) => {
                     let ct = map_type_to_cg(*ty)?;
+                    let arg = *vmap.get(x)?;
+                    let at = func.dfg.value_type(arg);
+                    let opcode = match op {
+                        RirUnOp::Uextend | RirUnOp::Sextend | RirUnOp::Ireduce => {
+                            if at == ct {
+                                vmap.insert(*r, arg);
+                                continue;
+                            }
+                            let widening = at.bits() < ct.bits();
+                            match op {
+                                RirUnOp::Uextend if widening => Opcode::Uextend,
+                                RirUnOp::Sextend if widening => Opcode::Sextend,
+                                RirUnOp::Ireduce if !widening => Opcode::Ireduce,
+                                _ => return None,
+                            }
+                        }
+                        _ => map_unop_to_cg(*op)?,
+                    };
                     let ci = func.dfg.make_inst(InstructionData::Unary {
-                        opcode: map_unop_to_cg(*op)?,
-                        arg: *vmap.get(x)?,
+                        opcode,
+                        arg,
                     });
                     if func.dfg.make_inst_results(ci, ct) != 1 {
                         return None;
@@ -1054,7 +1077,13 @@ fn int_bits(ty: RirType) -> Option<u32> {
 
 fn as_width(builder: &mut Builder, block: RirBlock, v: RirValue, ty: RirType, signed: bool) -> RirValue {
     let src = builder.func().ty(v);
-    if src == ty || !src.is_int() || !ty.is_int() {
+    if src == ty {
+        return v;
+    }
+    if src == RirType::Bool {
+        return as_int(builder, block, v, ty);
+    }
+    if !src.is_int() || !ty.is_int() {
         return v;
     }
     let (Some(from), Some(to)) = (int_bits(src), int_bits(ty)) else {
@@ -1681,6 +1710,13 @@ mod tests {
         func.dfg.inst_results(inst)[0]
     }
 
+    fn unary(func: &mut Function, b: Block, op: Opcode, ty: Type, x: Value) -> Value {
+        let inst = func.dfg.make_inst(InstructionData::Unary { opcode: op, arg: x });
+        assert_eq!(func.dfg.make_inst_results(inst, ty), 1);
+        func.layout.append_inst(inst, b);
+        func.dfg.inst_results(inst)[0]
+    }
+
     fn icmp(func: &mut Function, b: Block, cc: IntCC, x: Value, y: Value) -> Value {
         let inst = func.dfg.make_inst(InstructionData::IntCompare {
             opcode: Opcode::Icmp,
@@ -1872,6 +1908,30 @@ mod tests {
         let out = export(&rir, &f.signature).expect("export bool truthy");
         let rir2 = import(&out).expect("re-import bool truthy");
         assert_eq!(run(&rir2, &[]).unwrap(), vec![Val::I(2)]);
+    }
+
+    #[test]
+    fn signed_extension_and_compare_roundtrip() {
+        let (mut f, e) = new_func(&[], &[types::I64]);
+        let x = iconst(&mut f, e, types::I8, -1);
+        let ext = unary(&mut f, e, Opcode::Sextend, types::I64, x);
+        ret(&mut f, e, &[ext]);
+        let rir = import(&f).expect("import sextend");
+        assert_eq!(run(&rir, &[]).unwrap(), vec![Val::I(-1)]);
+        let out = export(&rir, &f.signature).expect("export sextend");
+        let rir2 = import(&out).expect("re-import sextend");
+        assert_eq!(run(&rir2, &[]).unwrap(), vec![Val::I(-1)]);
+
+        let (mut f, e) = new_func(&[], &[types::I8]);
+        let x = iconst(&mut f, e, types::I8, -1);
+        let zero = iconst(&mut f, e, types::I8, 0);
+        let cond = icmp(&mut f, e, IntCC::SignedLessThan, x, zero);
+        ret(&mut f, e, &[cond]);
+        let rir = import(&f).expect("import signed compare");
+        assert_eq!(run(&rir, &[]).unwrap(), vec![Val::I(1)]);
+        let out = export(&rir, &f.signature).expect("export signed compare");
+        let rir2 = import(&out).expect("re-import signed compare");
+        assert_eq!(run(&rir2, &[]).unwrap(), vec![Val::I(1)]);
     }
 
     #[test]

@@ -188,7 +188,7 @@ fn write_scalar(mem: &mut [u8], addr: usize, ty: Type, val: Val) -> Result<(), S
     Ok(())
 }
 
-fn eval(env: &[Option<Val>], inst: &Inst, mem: &mut [u8], bases: &[usize]) -> Result<Val, String> {
+fn eval(func: &crate::ir::Function, env: &[Option<Val>], inst: &Inst, mem: &mut [u8], bases: &[usize]) -> Result<Val, String> {
     match inst {
         Inst::Nop(_, ty) => Ok(default_val(*ty)),
         Inst::Iconst(_, ty, v) => {
@@ -211,7 +211,10 @@ fn eval(env: &[Option<Val>], inst: &Inst, mem: &mut [u8], bases: &[usize]) -> Re
                 crate::ir::UnOp::Uextend | crate::ir::UnOp::Bint => {
                     Ok(Val::I(int_sem::wrap(*ty, v.as_u64() as i64)))
                 }
-                crate::ir::UnOp::Sextend => Ok(Val::I(int_sem::wrap(*ty, v.as_i()))),
+                crate::ir::UnOp::Sextend => Ok(Val::I(int_sem::wrap(
+                    *ty,
+                    int_sem::sign_extend(func.ty(*x), v.as_i()),
+                ))),
                 crate::ir::UnOp::Ireduce => Ok(Val::I(int_sem::wrap(*ty, v.as_i()))),
                 crate::ir::UnOp::Bnot => Ok(Val::I(int_sem::wrap(*ty, !v.as_i()))),
                 crate::ir::UnOp::Bitcast => Ok(Val::I(int_sem::wrap(*ty, v.as_i()))),
@@ -353,7 +356,7 @@ pub fn run_with_indirect(
                     }
                 }
                 _ => {
-                    let v = eval(&env, inst, &mut mem, &bases)?;
+                    let v = eval(func, &env, inst, &mut mem, &bases)?;
                     if let Some(r) = inst.result_value() {
                         env[r.0 as usize] = Some(v);
                     }
