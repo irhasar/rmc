@@ -140,3 +140,83 @@ fn icmp_folding_and_select() {
     assert!(verify(&f).is_ok(), "{:?}", verify(&f).err());
     assert_eq!(run(&f, &[]).unwrap(), vec![Val::I(10)]);
 }
+
+#[test]
+fn icmp_same_operand_folds_to_true() {
+    let mut b = Builder::new(vec![Type::I64], vec![Type::I64]);
+    let e = b.func().entry;
+    let x = b.func().block(e).params[0];
+    let cond = b.icmp(e, IntCc::Eq, Type::I64, x, x);
+    let t = b.add_block(vec![]);
+    let f = b.add_block(vec![]);
+    b.brif(e, cond, t, vec![], f, vec![]);
+    let one = b.iconst(t, Type::I64, 1);
+    b.ret(t, vec![one]);
+    let two = b.iconst(f, Type::I64, 2);
+    b.ret(f, vec![two]);
+
+    let mut func = b.into_func();
+    assert!(verify(&func).is_ok(), "{:?}", verify(&func).err());
+    assert_eq!(run(&func, &[Val::I(42)]).unwrap(), vec![Val::I(1)]);
+    assert!(optimize(&mut func));
+    assert!(verify(&func).is_ok(), "{:?}", verify(&func).err());
+    assert_eq!(run(&func, &[Val::I(42)]).unwrap(), vec![Val::I(1)]);
+    assert!(!func.blocks[0].insts.iter().any(|i| matches!(i, Inst::Icmp(..))));
+    assert!(matches!(func.blocks[0].terminator().unwrap(), Inst::Jump(t2, _) if *t2 == t));
+}
+
+#[test]
+fn select_same_arms_folds() {
+    let mut b = Builder::new(vec![Type::I64], vec![Type::I64, Type::I64]);
+    let e = b.func().entry;
+    let x = b.func().block(e).params[0];
+    let y = b.func().block(e).params[1];
+    let cond = b.icmp(e, IntCc::Eq, Type::I64, x, y);
+    let sel = b.select(e, Type::I64, cond, x, x);
+    b.ret(e, vec![sel]);
+
+    let mut f = b.into_func();
+    assert!(optimize(&mut f));
+    assert!(verify(&f).is_ok(), "{:?}", verify(&f).err());
+    assert_eq!(run(&f, &[Val::I(7), Val::I(9)]).unwrap(), vec![Val::I(7)]);
+    assert!(!f.blocks[0].insts.iter().any(|i| matches!(i, Inst::Select(..))));
+}
+
+#[test]
+fn bin_same_operand_folds() {
+    let mut b = Builder::new(vec![Type::I64], vec![Type::I64]);
+    let e = b.func().entry;
+    let x = b.func().block(e).params[0];
+    let sub = b.bin(e, BinOp::Sub, Type::I64, x, x);
+    let and = b.bin(e, BinOp::And, Type::I64, x, x);
+    let sum = b.bin(e, BinOp::Add, Type::I64, sub, and);
+    b.ret(e, vec![sum]);
+
+    let mut f = b.into_func();
+    assert!(optimize(&mut f));
+    assert!(verify(&f).is_ok(), "{:?}", verify(&f).err());
+    assert_eq!(run(&f, &[Val::I(123)]).unwrap(), vec![Val::I(123)]);
+    assert!(!f.blocks[0].insts.iter().any(|i| matches!(
+        i,
+        Inst::Bin(_, BinOp::Sub, ..) | Inst::Bin(_, BinOp::And, ..)
+    )));
+}
+
+#[test]
+fn brif_to_same_target_folds_to_jump() {
+    let mut b = Builder::new(vec![Type::I64], vec![Type::I64, Type::I64]);
+    let e = b.func().entry;
+    let x = b.func().block(e).params[0];
+    let y = b.func().block(e).params[1];
+    let cond = b.icmp(e, IntCc::Eq, Type::I64, x, y);
+    let t = b.add_block(vec![]);
+    b.brif(e, cond, t, vec![], t, vec![]);
+    let five = b.iconst(t, Type::I64, 5);
+    b.ret(t, vec![five]);
+
+    let mut f = b.into_func();
+    assert!(optimize(&mut f));
+    assert!(verify(&f).is_ok(), "{:?}", verify(&f).err());
+    assert_eq!(run(&f, &[Val::I(1), Val::I(2)]).unwrap(), vec![Val::I(5)]);
+    assert!(matches!(f.blocks[0].terminator().unwrap(), Inst::Jump(t2, _) if *t2 == t));
+}

@@ -44,6 +44,7 @@ impl Pass for RirPass {
         if !changed && std::env::var_os("RAKIT_RIR_FORCE").is_none() {
             if debug {
                 eprintln!("[rir] no-change {:?}", pctx.ctx.func.name);
+                eprintln!("{}", pctx.ctx.func.display());
             }
             return false;
         }

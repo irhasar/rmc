@@ -66,6 +66,11 @@ sisanya, sehingga fungsi yang tidak didukung dibiarkan apa adanya. Pass
 dengan `RAKIT_RIR=1`. `RAKIT_RIR_FORCE=1` memaksa export ulang tanpa perubahan
 (untuk validasi), `RAKIT_RIR_DEBUG=1` mencetak keputusan per fungsi.
 
+Optimizer RIR memakai identitas yang belum tentu ada di egraph Cranelift:
+`x - x`, `x ^ x`, `x & x`, `x | x`, `icmp x, x`, `select(c, x, x)`, dan
+`brif` ke target yang sama. Dengan `RAKIT_RIR=1` ini benar-benar mengubah kode
+(mis. `x & x` → `x`) dan output tetap sama dengan build normal.
+
 ## Build
 
 Prasyarat: toolchain `nightly-2026-11-17` dengan komponen `rust-src`,

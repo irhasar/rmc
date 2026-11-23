@@ -1,5 +1,20 @@
 # AGENTS.md
 
+## Session (2026-11-23, Fase 2 step 3) — RIR-only folds that fire end-to-end
+- `rakit-ir/src/opt.rs` now also folds, for integer types:
+  `x - x -> 0`, `x ^ x -> 0`, `x & x -> x`, `x | x -> x`, `icmp x, x` to
+  true/false per condition, `select(c, x, x) -> x`, and
+  `brif(c, b, args, b, args) -> jump b`.
+- Unit tests: `cargo test --manifest-path rakit-ir/Cargo.toml` -> 11/11
+  (4 new: icmp same operand, select same arms, bin same operand, brif same
+  target).
+- End-to-end: `RAKIT_RIR=1` on `x & x` / `x | x` logs `[rir] optimized` and the
+  binary prints the same output as the normal build (`1 2 0 0 5 6`). cg_clif
+  already folds `x ^ x`, `x - x`, `x << 0` and `if c { x } else { x }`, so only
+  `&`/`|` reach RIR here.
+- Debug: `RAKIT_RIR_DEBUG=1` also dumps the CLIF of `no-change` functions,
+  which is how the surviving `band`/`bor` were located.
+
 ## Session (2026-11-23, Fase 2 step 2) — CLIF<->RIR bridge + optional `RirPass`
 - `rakit-opt/src/rir.rs`: `import(&Function) -> Option<rakit_ir::Function>` and
   `export(&rir, &Signature) -> Option<Function>` for a conservative scalar

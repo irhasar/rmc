@@ -141,36 +141,58 @@ fn fold(func: &mut Function) -> bool {
             let inst = func.blocks[bi].insts[ii].clone();
             let replacement = match inst {
                 Inst::Bin(r, op, ty, x, y) => {
-                    let cx = consts.get(&x).copied();
-                    let cy = consts.get(&y).copied();
-                    match (cx, cy) {
-                        (Some(a), Some(b)) => {
-                            eval_bin(op, ty, a, b).and_then(|c| const_inst(r, ty, c))
-                        }
-                        (None, Some(Const::I(0))) => match op {
-                            BinOp::Add | BinOp::Sub | BinOp::Or | BinOp::Xor | BinOp::Shl
-                            | BinOp::Shr | BinOp::Ushr => Some(Inst::Copy(r, ty, x)),
-                            BinOp::Mul => Some(Inst::Iconst(r, ty, 0)),
-                            BinOp::And => Some(Inst::Iconst(r, ty, 0)),
+                    if x == y && ty.is_int() {
+                        match op {
+                            BinOp::Sub | BinOp::Xor => Some(Inst::Iconst(r, ty, 0)),
+                            BinOp::And | BinOp::Or => Some(Inst::Copy(r, ty, x)),
                             _ => None,
-                        },
-                        (Some(Const::I(0)), None) => match op {
-                            BinOp::Add | BinOp::Or | BinOp::Xor => Some(Inst::Copy(r, ty, y)),
-                            BinOp::Mul | BinOp::And => Some(Inst::Iconst(r, ty, 0)),
-                            _ => None,
-                        },
-                        (None, Some(Const::I(1))) if op == BinOp::Mul => {
-                            Some(Inst::Copy(r, ty, x))
                         }
-                        _ => None,
+                    } else {
+                        let cx = consts.get(&x).copied();
+                        let cy = consts.get(&y).copied();
+                        match (cx, cy) {
+                            (Some(a), Some(b)) => {
+                                eval_bin(op, ty, a, b).and_then(|c| const_inst(r, ty, c))
+                            }
+                            (None, Some(Const::I(0))) => match op {
+                                BinOp::Add | BinOp::Sub | BinOp::Or | BinOp::Xor | BinOp::Shl
+                                | BinOp::Shr | BinOp::Ushr => Some(Inst::Copy(r, ty, x)),
+                                BinOp::Mul => Some(Inst::Iconst(r, ty, 0)),
+                                BinOp::And => Some(Inst::Iconst(r, ty, 0)),
+                                _ => None,
+                            },
+                            (Some(Const::I(0)), None) => match op {
+                                BinOp::Add | BinOp::Or | BinOp::Xor => Some(Inst::Copy(r, ty, y)),
+                                BinOp::Mul | BinOp::And => Some(Inst::Iconst(r, ty, 0)),
+                                _ => None,
+                            },
+                            (None, Some(Const::I(1))) if op == BinOp::Mul => {
+                                Some(Inst::Copy(r, ty, x))
+                            }
+                            _ => None,
+                        }
                     }
                 }
-                Inst::Icmp(r, cc, _ty, x, y) => match (consts.get(&x), consts.get(&y)) {
-                    (Some(Const::I(a)), Some(Const::I(b))) => {
-                        Some(Inst::Iconst(r, Type::Bool, eval_icmp(cc, *a, *b) as i64))
+                Inst::Icmp(r, cc, ty, x, y) => {
+                    if x == y && ty.is_int() {
+                        let v = matches!(
+                            cc,
+                            IntCc::Eq
+                                | IntCc::Sle
+                                | IntCc::Sge
+                                | IntCc::Ule
+                                | IntCc::Uge
+                        );
+                        Some(Inst::Iconst(r, Type::Bool, v as i64))
+                    } else {
+                        match (consts.get(&x), consts.get(&y)) {
+                            (Some(Const::I(a)), Some(Const::I(b))) => {
+                                Some(Inst::Iconst(r, Type::Bool, eval_icmp(cc, *a, *b) as i64))
+                            }
+                            _ => None,
+                        }
                     }
-                    _ => None,
-                },
+                }
                 Inst::Fcmp(r, cc, _ty, x, y) => {
                     let a = match consts.get(&x) {
                         Some(Const::F32(v)) => Some(*v as f64),
@@ -189,26 +211,38 @@ fn fold(func: &mut Function) -> bool {
                         _ => None,
                     }
                 }
-                Inst::Select(r, ty, c, x, y) => match consts.get(&c) {
-                    Some(Const::I(v)) => {
-                        Some(Inst::Copy(r, ty, if *v != 0 { x } else { y }))
+                Inst::Select(r, ty, c, x, y) => {
+                    if x == y {
+                        Some(Inst::Copy(r, ty, x))
+                    } else {
+                        match consts.get(&c) {
+                            Some(Const::I(v)) => {
+                                Some(Inst::Copy(r, ty, if *v != 0 { x } else { y }))
+                            }
+                            _ => None,
+                        }
                     }
-                    _ => None,
-                },
+                }
                 Inst::Copy(r, ty, x) => match consts.get(&x) {
                     Some(c) => const_inst(r, ty, *c),
                     None => None,
                 },
-                Inst::Brif(c, t, targs, f, fargs) => match consts.get(&c) {
-                    Some(Const::I(v)) => {
-                        if *v != 0 {
-                            Some(Inst::Jump(t, targs))
-                        } else {
-                            Some(Inst::Jump(f, fargs))
+                Inst::Brif(c, t, targs, f, fargs) => {
+                    if t == f && targs == fargs {
+                        Some(Inst::Jump(t, targs))
+                    } else {
+                        match consts.get(&c) {
+                            Some(Const::I(v)) => {
+                                if *v != 0 {
+                                    Some(Inst::Jump(t, targs))
+                                } else {
+                                    Some(Inst::Jump(f, fargs))
+                                }
+                            }
+                            _ => None,
                         }
                     }
-                    _ => None,
-                },
+                }
                 _ => None,
             };
             if let Some(new) = replacement {
