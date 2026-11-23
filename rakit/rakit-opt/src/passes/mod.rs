@@ -54,6 +54,14 @@ impl Pass for RirPass {
         if debug && mem_changed {
             eprintln!("[rir] mem_forward fired");
         }
+        let sroa_changed = rakit_ir::sroa::run(&mut rir_func);
+        if sroa_changed {
+            rakit_ir::optimize(&mut rir_func);
+            changed = true;
+        }
+        if debug && sroa_changed {
+            eprintln!("[rir] sroa fired");
+        }
         let div_changed = rakit_ir::div_test::run(&mut rir_func);
         if div_changed {
             rakit_ir::optimize(&mut rir_func);

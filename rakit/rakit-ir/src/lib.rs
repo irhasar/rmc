@@ -29,6 +29,7 @@ pub mod interp;
 pub mod ir;
 pub mod opt;
 pub mod simplify;
+pub mod sroa;
 pub mod verify;
 
 pub use builder::Builder;

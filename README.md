@@ -136,8 +136,16 @@ diperlakukan sebagai seluruh slot, sehingga `a[i]` hanya di-forward saat
 ekspresi alamatnya identik. Pass dilewati seluruhnya bila ada alamat yang
 escape, store ke alamat tak dikenal, atau akses konstanta di luar batas slot.
 
+Pass `sroa` (`rakit-ir/src/sroa.rs`) mempromosikan stack slot skalar menjadi
+nilai SSA. Slot hanya dipromosikan bila alamatnya tidak escape dan semua akses
+berupa load/store skalar dengan offset konstan. Phi dibuat sebagai block
+parameter di dominance-frontier join, lalu rename pada dominator tree mengganti
+load dengan nilai SSA saat ini dan membuang store. Slot dengan alamat dinamis,
+load sebelum store, atau akses yang saling tumpang tindih tidak dipromosikan.
+Slot yang tidak lagi punya `StackAddr` dihapus dan slot lain dinomori ulang.
+
 Pipeline RIR sekarang:
-`simplify → optimize → mem_forward → optimize → div_test → if_convert → gvn → licm → optimize`.
+`simplify → optimize → mem_forward → optimize → sroa → optimize → div_test → if_convert → gvn → licm → optimize`.
 
 ## Build
 

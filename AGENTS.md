@@ -1,5 +1,18 @@
 # AGENTS.md
 
+## Session (2026-11-23, Fase 2 step 17) — SROA
+- New `rakit-ir/src/sroa.rs`: promote non-escaping scalar slots with constant
+  load/store keys. Phi nodes are added as block params at dominance-frontier
+  joins, then a dominator-tree rename replaces loads and drops stores.
+- Skip dynamic addresses, load-before-store, overlapping access ranges, and
+  phis at the entry block. Remove slots with no remaining `StackAddr` and
+  renumber the rest.
+- Wire into `RirPass` after `mem_forward`/`optimize`:
+  `simplify -> optimize -> mem_forward -> optimize -> sroa -> optimize ->
+  div_test -> if_convert -> gvn -> licm -> optimize`.
+- Tests: 71 RIR (7 sroa) + 8 bridge; `./y.sh build` exit 0; h17-h21 outputs
+  unchanged (`30/24/11/11/42`).
+
 ## Session (2026-11-23, Fase 2 step 16) — liveness DSE
 - `mem_forward::dse` now uses byte-range liveness across the CFG:
   per-block `used`/`defined`, `live-in`/`live-out` fixed point, then a

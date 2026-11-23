@@ -16,7 +16,7 @@ use crate::ir::{BinOp, Function, Inst, Type, Value};
 type Facts = BTreeMap<Key, (Value, Type)>;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-enum Key {
+pub(crate) enum Key {
     Const { slot: u32, offset: i64 },
     Dyn { slot: u32, base: Value, offset: i64 },
 }
@@ -42,7 +42,7 @@ pub fn run(func: &mut Function) -> bool {
     changed
 }
 
-fn size_of(ty: Type) -> u32 {
+pub(crate) fn size_of(ty: Type) -> u32 {
     match ty {
         Type::I8 | Type::Bool => 1,
         Type::I16 => 2,
@@ -51,7 +51,7 @@ fn size_of(ty: Type) -> u32 {
     }
 }
 
-fn definitions(func: &Function) -> HashMap<Value, Inst> {
+pub(crate) fn definitions(func: &Function) -> HashMap<Value, Inst> {
     let mut defs = HashMap::new();
     for blk in &func.blocks {
         for inst in &blk.insts {
@@ -157,7 +157,7 @@ fn add_expr(
     }
 }
 
-fn escaping_slots(func: &Function, defs: &HashMap<Value, Inst>) -> Vec<bool> {
+pub(crate) fn escaping_slots(func: &Function, defs: &HashMap<Value, Inst>) -> Vec<bool> {
     let mut escaping = vec![false; func.stack_slots.len()];
     for blk in &func.blocks {
         for inst in &blk.insts {
@@ -185,7 +185,7 @@ fn escaping_slots(func: &Function, defs: &HashMap<Value, Inst>) -> Vec<bool> {
     escaping
 }
 
-fn key_of(
+pub(crate) fn key_of(
     defs: &HashMap<Value, Inst>,
     func: &Function,
     addr: Value,
