@@ -23,23 +23,6 @@ indexmap = "2.0.0"
 libloading = { version = "0.9.0", optional = true }
 smallvec = "1.8.1"
 
-# Uncomment to use an unreleased version of rakit
-#[patch.crates-io]
-#rakit-codegen = { git = "https://github.com/bytecodealliance/wasmtime.git", branch = "release-50.0.0" }
-#rakit-frontend = { git = "https://github.com/bytecodealliance/wasmtime.git", branch = "release-50.0.0" }
-#rakit-module = { git = "https://github.com/bytecodealliance/wasmtime.git", branch = "release-50.0.0" }
-#rakit-native = { git = "https://github.com/bytecodealliance/wasmtime.git", branch = "release-50.0.0" }
-#rakit-jit = { git = "https://github.com/bytecodealliance/wasmtime.git", branch = "release-50.0.0" }
-#rakit-object = { git = "https://github.com/bytecodealliance/wasmtime.git", branch = "release-50.0.0" }
-
-# Uncomment to use local checkout of rakit
-#rakit-codegen = { path = "../wasmtime/rakit/codegen" }
-#rakit-frontend = { path = "../wasmtime/rakit/frontend" }
-#rakit-module = { path = "../wasmtime/rakit/module" }
-#rakit-native = { path = "../wasmtime/rakit/native" }
-#rakit-jit = { path = "../wasmtime/rakit/jit" }
-#rakit-object = { path = "../wasmtime/rakit/object" }
-
 # Local modifications to rakit-object: emit each function into a uniquely
 # named section so that `--gc-sections` can discard dead code (see vendor/).
 #
