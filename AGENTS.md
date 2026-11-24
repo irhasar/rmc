@@ -202,6 +202,45 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
       Output equality alone is insufficient: with `RAKIT_NO_VECTORIZE=1` the
       output still matches but `pmuludq` is absent. Removed the committed
       `rustc-ice-*.txt` dumps and gitignored them.
+  - **M3.2 LANDED: dynamic trip bound + vectorize every loop.** `match_header`
+    now accepts a **loop-invariant runtime bound** (`n` may be a function
+    parameter / any value defined outside the loop, not just an `iconst`); the
+    existing `i+4 <= n` gate and `|dst-src| >= n*4` disjointness guard already
+    work for any runtime `n` (runtime `n == 0` falls through to the scalar tail).
+    `do_vectorize` now vectorizes **every** matching loop in a function (over a
+    snapshot of the original blocks), not just the first: the inliner/unroller
+    can duplicate one loop many times into a function, and vectorizing only the
+    first left the rest scalar. Measured on `bench/l3/ktime.rs` (kernel with a
+    runtime `n` parameter), median of 5: kernel **73.3 → 25.5 ms** (LLVM
+    23.3 ms — was 3.15×, now ~1.09×), `sum` matches; all four L3 checksums
+    unchanged. New `bench/tests/t_vectorize_dyn.rs` (opaque `black_box` bound →
+    runtime path, `pmuludq` asserted). Gate: suite **65 / 25,368 / 0**;
+    `allaxes` 15 progs all `ok` with **no runtime regression** (p1–p9/h_*).
+  - **M3.2 review fixes (literal vs runtime bound, overflow, tests).** A literal
+    bound is now `Bound::Const` and is **rematerialized in the guard**, so it
+    needs no dominating definition: with `RAKIT_NO_LICM=1` the egraph
+    rematerializes the constant into the loop header, which the earlier
+    `defined_outside` check wrongly rejected (constant-trip loops regressed to
+    scalar). Runtime bounds (`Bound::Runtime`) still require loop-invariance.
+    The guard also routes to scalar when `n >= 2^62`, so `n*4` cannot wrap.
+    Tests: `t_vectorize_dyn` covers runtime zero-trip / sub-vector (tail4) /
+    remainder (n=1001) / overlap (dst=src+1); `t_vectorize_multi` (two loops in
+    one function) asserts **>=4 `pmuludq`** (an early exit after the first match
+    would leave the second scalar); `regressions.sh` compiles `t_vectorize_unit`
+    with `RAKIT_NO_LICM=1` and requires `pmuludq`.
+  - **M3.2 review round 2 (orientation + test attribution).** The matcher now
+    accepts both `i < n` (`ult i, n`) and the commuted `n > i` (`ugt n, i`): a
+    **standalone** dynamic loop lowers to `ugt` and was silently rejected (only
+    loops inlined into `main` used `ult`). Tests hardened: `t_vectorize_multi`
+    puts two loops in one **address-taken** `#[no_mangle] fn two_loops`, so
+    `regressions.sh` counts `pmuludq` **inside `two_loops`** (>=4) rather than
+    binary-wide (a vector multiply elsewhere could mask a scalar loop); the
+    `RAKIT_NO_LICM=1` check now also **runs** the binary and compares its output,
+    not just the disassembly — and that compile/run/output check is
+    **unconditional** (only the `pmuludq` disassembly is gated on `objdump`), so
+    runtime coverage is not skipped when no disassembler is present. Known miss (correct, scalar): a bound that the
+    egraph rematerializes into the header (e.g. `n & mask`) is not hoisted, so
+    that loop is not vectorized.
 
 ## Session (2026-11-24, branch `rakit-exp7`) — p9 reloads are real, but NOT soundly hoistable with the existing flags (alias tags don't move loads)
 

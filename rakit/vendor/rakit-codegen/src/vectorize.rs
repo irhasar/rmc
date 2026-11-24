@@ -5,7 +5,8 @@
 //! before the egraph, where the induction is still a stack slot, so this must
 //! live in the backend.
 //!
-//! Target: header `H(i: i64)` brifs on a constant trip `i < n`; single-block
+//! Target: header `H(i: i64)` brifs on a trip `i < n` (constant or a
+//! loop-invariant runtime bound); single-block
 //! body `B` computes `c[i] = (a[i] ^ b[i]) * K` for loop-invariant base
 //! pointers, `addr = base + (i << 2)` (u32 lanes), then `i += 1` and jumps `H`.
 //!
@@ -45,31 +46,47 @@ pub fn enabled() -> bool {
     }
 }
 
-/// Vectorize at most one canonical loop in `func`. Returns whether the CFG
-/// changed (the caller must recompute cfg/domtree when it did).
+/// Vectorize every canonical loop in `func`. Returns whether the CFG changed
+/// (the caller must recompute cfg/domtree when it did).
+///
+/// We iterate a snapshot of the original blocks: `apply` only *adds* blocks and
+/// keeps the scalar header/body (as the tail), so each original header is
+/// matched at most once and the freshly created vector blocks are never
+/// revisited. This matters because the inliner/unroller can duplicate the same
+/// loop many times into one function (e.g. a constant-trip outer loop unrolled
+/// 20x); vectorizing only the first copy leaves the rest scalar.
 pub fn do_vectorize(func: &mut Function) -> bool {
-    let Some(plan) = find_plan(func) else { return false };
-    apply(func, plan);
-    true
+    let headers: Vec<Block> = func.layout.blocks().collect();
+    let mut changed = false;
+    for h in headers {
+        if !func.layout.is_block_inserted(h) {
+            continue;
+        }
+        if let Some(plan) = match_header(func, h) {
+            apply(func, plan);
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Trip bound: a literal is rematerialized in the generated blocks (so it need
+/// not be defined outside the loop — the egraph may rematerialize constants in
+/// the header); a runtime value must be loop-invariant.
+#[derive(Clone, Copy)]
+enum Bound {
+    Const(i64),
+    Runtime(Value),
 }
 
 struct Plan {
     h: Block,
     preheader: Block,
-    n: i64,
+    n: Bound,
     base_a: Value,
     base_b: Value,
     base_c: Value,
     k: i64,
-}
-
-fn find_plan(func: &Function) -> Option<Plan> {
-    for h in func.layout.blocks().collect::<Vec<_>>() {
-        if let Some(plan) = match_header(func, h) {
-            return Some(plan);
-        }
-    }
-    None
 }
 
 fn match_header(func: &Function, h: Block) -> Option<Plan> {
@@ -84,13 +101,14 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
         return None;
     };
     let (cc, cx, cy) = icmp_parts(dfg, cond)?;
-    if cc != IntCC::UnsignedLessThan || dfg.resolve_aliases(cx) != i {
-        return None;
-    }
-    let n = iconst_i64(dfg, cy)?;
-    if n <= 0 {
-        return None;
-    }
+    // Accept `i < n` (`ult i, n`) and the commuted `n > i` (`ugt n, i`): the
+    // frontend picks either orientation depending on context (a standalone
+    // dynamic loop lowers to `ugt`), and both mean "run while i < n".
+    let n_side = match cc {
+        IntCC::UnsignedLessThan if dfg.resolve_aliases(cx) == i => cy,
+        IntCC::UnsignedGreaterThan if dfg.resolve_aliases(cy) == i => cx,
+        _ => return None,
+    };
     let s0 = blocks[0].block(&dfg.value_lists);
     let s1 = blocks[1].block(&dfg.value_lists);
     // The body must be the *true* edge of `i < n` (the loop runs while i < n).
@@ -100,6 +118,27 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
         return None;
     }
     let b = s0;
+    // Trip bound: a literal is rematerialized in the guard, so it does not need
+    // a dominating definition (the egraph rematerializes cheap constants at use
+    // sites, which can put the constant inside the loop header — e.g. with
+    // RAKIT_NO_LICM=1). A runtime bound must be loop-invariant (defined outside
+    // H/B) and of type i64. The `i+4 <= n` gate and `|dst-src| >= n*4` guard
+    // work for any runtime n; n == 0 falls through to the scalar tail.
+    let nv = dfg.resolve_aliases(n_side);
+    let n = if let Some(c) = iconst_i64(dfg, nv) {
+        // n*4 must not overflow the span computation (see the guard's n<2^62 check).
+        if c <= 0 || c >= (1i64 << 62) {
+            return None;
+        }
+        Bound::Const(c)
+    } else {
+        if nv == i || dfg.value_type(nv) != types::I64
+            || !defined_outside(dfg, &func.layout, nv, h, b)
+        {
+            return None;
+        }
+        Bound::Runtime(nv)
+    };
     // The scalar header runs once per iteration; the vector loop bypasses it for
     // the vectorized prefix, so it must be effect-free (pure arithmetic + the
     // comparison only).
@@ -298,8 +337,11 @@ fn apply(func: &mut Function, p: Plan) {
     {
         let mut cur = FuncCursor::new(func).at_bottom(g);
         let zero = cur.ins().iconst(types::I64, 0);
-        let n = cur.ins().iconst(types::I64, p.n);
         let four = cur.ins().iconst(types::I64, 4);
+        let n = match p.n {
+            Bound::Const(c) => cur.ins().iconst(types::I64, c),
+            Bound::Runtime(v) => v,
+        };
         let lbytes = cur.ins().imul(n, four);
         let (pa, pb, pc) = (p.base_a, p.base_b, p.base_c);
         let mut ov = None;
@@ -315,6 +357,11 @@ fn apply(func: &mut Function, p: Plan) {
             });
         }
         let ov = ov.unwrap();
+        // `n*4` is only a faithful span when n < 2^62; for a larger runtime n the
+        // multiply wraps, so fall back to the scalar loop (treat as overlapping).
+        let lim = cur.ins().iconst(types::I64, 1i64 << 62);
+        let big = cur.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, n, lim);
+        let ov = cur.ins().bor(ov, big);
         cur.ins().brif(ov, h, &[zero.into()], vh, &[zero.into()]);
     }
 
@@ -322,7 +369,10 @@ fn apply(func: &mut Function, p: Plan) {
         let mut cur = FuncCursor::new(func).at_bottom(vh);
         let four = cur.ins().iconst(types::I64, 4);
         let nxt = cur.ins().iadd(vh_i, four);
-        let n = cur.ins().iconst(types::I64, p.n);
+        let n = match p.n {
+            Bound::Const(c) => cur.ins().iconst(types::I64, c),
+            Bound::Runtime(v) => v,
+        };
         let cond = cur.ins().icmp(IntCC::UnsignedLessThanOrEqual, nxt, n);
         cur.ins().brif(cond, vb, &[vh_i.into()], h, &[vh_i.into()]);
     }

@@ -67,13 +67,19 @@ tail 6121779849389533154
 u8 2907005038580616411'
 check t_vectorize_unit 'unit 12776226417588255163'
 check t_vectorize_guard 'guard 17715399688492003866 tail4=true'
+check t_vectorize_dyn $'dyn 12776226417588255163 n=1000
+zero 12342691297999224719 unchanged=true
+small 17715399688492003866 tail4=true
+rem 6121779849389533154
+overlap 12968996556249723189'
+check t_vectorize_multi 'm1 12776226417588255163 m2 15151514424346961891'
 
 # Output equality alone cannot prove the vectorizer ran. Each fixture below
 # contains exactly one xor+imul loop, so a packed multiply (SSE2 lowering of
 # i32x4.imul) in the binary proves *that* loop was vectorized (a tail loop
 # elsewhere cannot satisfy the check). t_vectorize_guard (n=3) proves the SIMD
 # guard/body is generated even though it runs zero vector iterations.
-for fx in t_vectorize_unit t_vectorize_guard; do
+for fx in t_vectorize_unit t_vectorize_guard t_vectorize_dyn t_vectorize_multi; do
     if command -v objdump >/dev/null 2>&1; then
         if ! objdump -d "$TMP/${fx}_M" --no-show-raw-insn 2>/dev/null | grep -q pmuludq; then
             echo "[regression] $fx: no packed multiply (loop not vectorized / guard not generated)" >&2
@@ -83,6 +89,41 @@ for fx in t_vectorize_unit t_vectorize_guard; do
         echo "[regression] $fx: objdump unavailable, skipping SIMD assertion" >&2
     fi
 done
+
+# Two eligible loops in one function must BOTH vectorize (2 pmuludq each -> >=4);
+# an early exit after the first match would leave the second scalar (2).
+if command -v objdump >/dev/null 2>&1; then
+    mc=$(objdump -d --disassemble=two_loops "$TMP/t_vectorize_multi_M" --no-show-raw-insn 2>/dev/null | grep -c pmuludq)
+    if [ "$mc" -lt 4 ]; then
+        echo "[regression] t_vectorize_multi: only $mc pmuludq (expected >=4; a later loop stayed scalar)" >&2
+        fail=1
+    fi
+fi
+
+# A constant trip bound must still vectorize when the egraph rematerializes the
+# literal in the loop header (RAKIT_NO_LICM=1): the literal is rematerialized in
+# the guard, so it needs no dominating definition. Compile/run/output always run
+# (no disassembler needed); only the SIMD check is gated on objdump.
+if ! env -u RAKIT_HOST_LLVM RAKIT_NO_LICM=1 "$ROOT/rakit/dist/bin/rustc-rakit" --target "$TARGET" -C opt-level=3 "$BENCH/tests/t_vectorize_unit.rs" -o "$TMP/u_nolicm" --edition 2021 >"$TMP/u_nolicm.compile" 2>&1; then
+    echo "[regression] t_vectorize_unit NO_LICM=1: compile failed" >&2
+    cat "$TMP/u_nolicm.compile" >&2
+    fail=1
+elif ! "$TMP/u_nolicm" >"$TMP/u_nolicm.out" 2>&1; then
+    echo "[regression] t_vectorize_unit NO_LICM=1: run failed" >&2
+    cat "$TMP/u_nolicm.out" >&2
+    fail=1
+elif [ "$(cat "$TMP/u_nolicm.out")" != "unit 12776226417588255163" ]; then
+    echo "[regression] t_vectorize_unit NO_LICM=1: wrong output" >&2
+    printf 'expected:\nunit 12776226417588255163\nactual:\n%s\n' "$(cat "$TMP/u_nolicm.out")" >&2
+    fail=1
+elif command -v objdump >/dev/null 2>&1; then
+    if ! objdump -d "$TMP/u_nolicm" --no-show-raw-insn 2>/dev/null | grep -q pmuludq; then
+        echo "[regression] t_vectorize_unit NO_LICM=1: no pmuludq (constant bound lost vectorization)" >&2
+        fail=1
+    fi
+else
+    echo "[regression] t_vectorize_unit NO_LICM=1: objdump unavailable, skipping SIMD assertion" >&2
+fi
 
 if [ "$fail" -eq 0 ]; then
     echo "[regression] all fixtures passed"
