@@ -8,6 +8,7 @@ pub mod rotate;
 pub mod sincos;
 pub mod store_forward;
 pub mod unroll;
+pub mod vectorize;
 
 use crate::pass::{Pass, PassCtx};
 use crate::passtime;
@@ -161,5 +162,17 @@ impl Pass for SincosPass {
         passtime::time(passtime::SINCOS, || {
             sincos::run(&mut *pctx.module, &mut pctx.ctx.func, pctx.analyses)
         })
+    }
+}
+
+pub struct VectorizePass;
+
+impl Pass for VectorizePass {
+    fn name(&self) -> &'static str {
+        "vectorize"
+    }
+
+    fn run(&mut self, pctx: &mut PassCtx<'_>) -> bool {
+        vectorize::run(&mut pctx.ctx.func)
     }
 }

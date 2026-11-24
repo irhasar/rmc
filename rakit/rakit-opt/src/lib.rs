@@ -16,5 +16,5 @@ pub use analyses::Analyses;
 pub use pass::{Pass, PassCtx, PassManager};
 pub use passes::{
     DivTestPass, IfConvertPass, RecLoopPass, RotatePass, SincosPass, StoreForwardPass,
-    UnrollPass,
+    UnrollPass, VectorizePass,
 };
