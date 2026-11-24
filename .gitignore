@@ -1,14 +1,19 @@
-/compiler/target/
-__pycache__/
-*.pyc
-
-# Stray build artifacts
-/a.out
-compiler/c.bin
-compiler/c.err
-
-# rustc codegen-backend build artifacts
-backend/target/
-
-# rustc incremental-compilation directories (never commit build outputs)
-/off/
+# Build artifacts (not tracked)
+/build/
+/dist/
+/target/
+/out/
+bench/out/
+rakit/build/
+rakit/dist/
+rakit/target/
+cg_clif_upstream/build/
+cg_clif_upstream/dist/
+cg_clif_upstream/target/
+tools/sampler
+extbench/out/
+extbench/crateworks/
+rakit/rakit-ir/target/
+rakit/rakit-ir/Cargo.lock
+rakit/rakit-opt/target/
+rakit/rakit-opt/Cargo.lock

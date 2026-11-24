@@ -1,3348 +1,2738 @@
+## Session (2026-11-24, branch `rakit-exp6`) — M1 premise re-checked: reload cause is UNVERIFIED (diagnose first)
+
+A review corrected several overclaims about *why* residual loads survive.
+Corrected facts, recorded so the next step is a **diagnosis**, not a big
+alias-region build:
+
+- **The alias-analysis switch is dead code.** `enable_alias_analysis = true`
+  (`settings.rs:501`) is **never read**. The egraph — and the `AliasAnalysis` it
+  builds (`context.rs:389`) — runs whenever `opt_level != OptLevel::None`
+  (`context.rs:192-195`). So "the flag makes it ON" was wrong; it runs because we
+  optimize at all.
+- **What was actually measured (scoped, not generalized).** The block-local CSE
+  pass in `rakit-exp5` produced **byte-identical** binaries (PR #16). That
+  establishes no gain for **that** pass only: it keyed on an **identical SSA
+  address value**, and the alias lookup itself requires matching address values
+  (`alias_analysis.rs:1353-1392`). It does **not** show that all safe load CSE is
+  useless — a pass that proves **address equivalence** (two distinct
+  `block_addr`/`stack_addr`/`iadd` values denoting the same location) could find
+  matches the exact-Value lookup misses. So a CSE is **not ruled out**, but it is
+  also **not shown to help**; it must be justified by evidence (see diagnosis).
+- **But the cause of the *surviving* reloads is UNVERIFIED.** `process_inst`
+  (`alias_analysis.rs:1353-1389`) aliases a load only when a known value matches
+  the same `MemoryLoc` — same SSA `address`, `last_store`/memory state, extent —
+  *and* the def dominates; and `has_memory_fence_semantics`
+  (`alias_analysis.rs:93-105`) treats **Call/CallIndirect/TryCall** as fences
+  that block movement. Region tags are therefore **neither necessary nor
+  sufficient**; the blocker could be a differing SSA address, a memory-state
+  mismatch, dominance, or a call fence. The earlier bounds-check investigation
+  (REPORT.md:2790-2802) does **not** establish which requirement blocks the
+  length loads.
+- **The p9 reload attribution is UNVERIFIED.** The cited conclusion
+  (REPORT.md:1187-1196) does not analyze p9, and the hoisting experiment
+  (REPORT.md:2812-2827) concerns frontend-emitted header loads. Calling p9's
+  per-iteration reloads "regalloc spills of loop invariants" needs before/after
+  register-allocation evidence, which we do not have.
+- **A frontend-only alias-region change would not even cover stack accesses.**
+  `Pointer::load` / `Pointer::store` (`src/pointer.rs:109-131`) **discard the
+  caller's `flags`** for the `PointerBase::Stack` arm (they call
+  `stack_load`/`stack_store`), and those builders
+  (`vendor/rakit-codegen-meta/src/gen_inst.rs:1489-1528`) emit **fresh
+  `set_notrap()` flags**. Tagging load/store callers in `src/` leaves stack
+  accesses untagged; any flag-based plan must also thread flags through
+  `pointer.rs` (and the stack builders).
+
+**Revised next step — DIAGNOSE before building.** Instrument
+`process_inst`/`MemoryState` to log *why* a specific known reload is not
+eliminated (different SSA address? `last_store` mismatch? call fence?
+dominance?), e.g. the `Range::end` vs `v.len()` loads in p4 and the p9 header
+loads, and gather pre/post-regalloc evidence for p9. Only after isolating the
+actual blocker should we choose among alias-region propagation, an address-based
+CSE, or regalloc work. Do **not** implement a standalone load-CSE pass or a
+frontend-only alias-region change on the current evidence.
+
+## Project kickoff (2026-11-24, branch `rakit-exp5`) — p4 loop autovectorizer (milestone plan)
+
+Started "opsi 2" (the big backend project) targeting `p4_simd` (M ~83 ms vs LLVM
+~57 ms). p4 has three loops; only two are vectorizable:
+- L1 `a[i]=sin(i as f32); b[i]=cos(i as f32)` — **libcall-bound, not
+  vectorizable**; sincos fusion already helps. Ignore.
+- L2 `s += a[i]*b[i] + abs(a[i]-b[i])` — elementwise + horizontal reduction.
+- L3 `c[i] = (a[i].to_bits() ^ b[i].to_bits()).wrapping_mul(2654435761)` —
+  elementwise map, `u32`. Read Rakit CLIF now: the loops **are unrolled 128x**
+  (huge single-block bodies) but remain **scalar** — LLVM's win is real SIMD
+  (`mulps/addps/andps/pmulld`), not unrolling.
+
+**Why this is a project, not a pass:** a correct loop vectorizer needs, in
+order:
+1. **Alias/no-aliasing proof** for the three distinct `Vec` data pointers
+   (`a`,`b`,`c` in L2/L3). Without `noalias` the loads/stores of different Vecs
+   may alias; a vectorized read-ahead or reordered store would be wrong. Rust
+   does mark `&mut` `noalias`, but these are raw `Vec` derefs through bounds
+   checks — the evidence isn't in the CLIF today. (This is the same wall as
+   §25 bounds-check elimination.)
+2. **Bounds-check elimination** for `for i in 0..n { v[i] }` with `v.len()==n`:
+   §25 showed the guard compares the `Range::end` block param against a
+   *separately reloaded* `v.len()`, so the two must first be CSE'd (needs a
+   load-value-numbering that proves no store to the Vec header between them).
+3. **Loop legality + widening**: single induction var (step 1), pure elementwise
+   body, no calls/traps, contiguous access, then build `i32x4`/`f32x4`
+   loads/stores, splat the constant, vector `bxor`/`imulx`/`fmulx`/`fabsx`, and
+   a horizontal reduce for L2 **only if it preserves the f32 addition order**
+   (see the ordering caveat below); scalar tail for `n % lanes`.
+4. **Codegen support check**: `pmulld` is SSE4.1 — must be feature-gated;
+   verify vector `bxor`/`imul` (`pmulld`) lower in `rakit-codegen`.
+
+**Float-reduction ordering is a hard constraint (not optional).** p4's L2 is
+`s += a[i]*b[i] + (a[i]-b[i]).abs()` on `f32`. Rust does **not** permit
+reassociating floating-point additions, so a lane-wise (horizontal) reduction
+that regroups them is **not a legal transform** — it can change the printed
+result. L2 may only be vectorized in a way that keeps the exact addition order
+(e.g. no regroup across lanes), or left scalar. The safe first real target is
+**L3** (`u32` xor-mul), which has no ordering constraint; L1 (sin/cos) is
+libcall-bound.
+
+**Milestones (each its own commit, each validated by the full gate: build,
+15/15 stdout identical to LLVM, suite 65/25,368/0, allaxes 45/45):**
+- M1: load-value-numbering / redundant-load CSE + `v.len()==n` proof (enables
+  bounds-check elimination) — also helps p2.
+- M2: bounds-check elimination for `0..v.len()` loops (retire §25's blocker).
+- M3: legality analysis + a **map-only (no reduction)** vectorizer for L3
+  (`u32` xor-mul map) as the first real target (simplest body, no reduction).
+- M4: L2 reduction (horizontal), tails, `f32x4`.
+- M5: tune; measure vs LLVM.
+
+Each milestone is independently landable and correctness-gated; none is
+attempted blindly. Do **not** land a vectorizer without the alias proof (M1) —
+reordering loads/stores of possibly-aliasing Vecs silently corrupts results.
+
+### M1 first attempt — blocked by debug value-labels (reverted)
+Wrote `rakit-opt/src/passes/load_cse.rs`: block-local redundant-load elimination
+(merge a `load` with an earlier same-address/type/offset/flags `load` in the same
+block when no store/call/side-effect lies between; this IR has **no volatile
+flag**, so it is semantically safe in a store-free stretch). Note the egraph has **two** load-elimination paths: the
+flags-gated GVN (`readonly+notrap+can_move`, which Rust `Vec` loads are not) and
+a separate **alias-analysis** path (`OptResult::AliasedLoad`,
+`egraph/mod.rs:549-565`) that replaces a load with an earlier load or stored
+value regardless of those flags — the latter is why the block-local pass was
+redundant. It
+**ICE'd compiling `core`**: `change_to_alias` inserts a
+`ValueLabelAssignments::Alias` entry keyed by the *removed* value
+(`dfg.rs:270-271`), and the machinst value-label emitter then does
+`self.value_regs[val]... .only_reg().unwrap()` on an empty reg set
+(`machinst/lower.rs:1064`). Guarding on a pre-existing label is not enough —
+`change_to_alias` creates the entry itself. Safe load elimination that removes a
+value therefore needs the value-label machinery to follow/relocate alias labels
+(or debuginfo to be dropped for the merged value), which is a real M1 sub-task,
+not a drop-in pass. **Reverted** (no ICE shipped); this is the first concrete
+blocker to solve for M1.
+- **Resolved & then found redundant.** The ICE is fixable: after
+  `change_to_alias`, drop the merged value's debug label and
+  `layout.remove_inst` the now-dead load so the value-label scan never visits a
+  value with no register. That builds `core` and passes output checks — but the
+  resulting binaries are **byte-identical with and without the pass** on
+  p1–p9 (value neutral). So the egraph/MIR already eliminates *same-block*
+  redundant loads; the remaining redundancy is **cross-block** (the guard's
+  length reload vs the bounds-check length reload). Block-local load CSE is
+  therefore a no-op pass that only costs compile time → **reverted**. Conclusion
+  for M1: it must be a **cross-block** load CSE / value numbering with dominance
+  plus a no-store-on-path proof — the same alias/analysis wall as §25, i.e. the
+  genuinely hard part. Do not re-add a block-local-only version.
+
+## Session (2026-11-24, branch `rakit-exp5`) — x64 omit-FP: execution-correct but UNWIND-INVALID, RUNTIME-NEUTRAL (reverted)
+
+- **Outcome:** implemented full omit-frame-pointer for x64 (mirroring RISC-V),
+  built the whole sysroot with it, validated **execution output only** (unwind
+  is NOT correct — see the unwind bullet), measured **neutral on runtime**, and
+  **reverted**. This closes the biggest open runtime lever from the `rakit-exp4`
+  blocker map — don't re-attempt it for runtime.
+- **Recipe (execution works; unwind still needs the extra change below; kept for
+  reference, reverted):**
+  - `isa/x64/abi.rs` `compute_frame_layout`: `setup_area_size = if
+    flags.preserve_frame_pointers() {16} else {8}`, and **pad `clobber_size +=
+    8`** when omitting. Dropping the 8-byte `push %rbp` leaves the frame 8 bytes
+    short of the 16-byte call-site alignment, so add the missing 8 to the
+    clobber area — it is reserved *above* the spill/fixed slots, so no slot
+    offset shifts.
+  - `isa/x64/abi.rs` `gen_prologue_frame_setup` / `gen_epilogue_frame_restore`:
+    early-return an empty vector when `!flags.preserve_frame_pointers()`.
+  - **Unwind must ALSO change — the recipe as written is not a correct build.**
+    Even with no frame setup, `gen_clobber_save` still emits
+    `UnwindInst::DefineNewFrame` in `gen_clobber_save` (`x64/abi.rs:652`; `DefineNewFrame` at line 707) and the System V encoder
+    sets `CallFrameInstruction::CfaRegister(fp)` when `mr.fp()` exists
+    (`isa/unwind/systemv.rs:209-220`) — it tells the unwinder the CFA is in RBP
+    even though the function never set RBP. So the omit-FP build would produce
+    **wrong backtraces / broken unwinding**; a correct build must also suppress
+    `DefineNewFrame`/CFA-register for non-FP frames (e.g. clear `mr.fp()`).
+    Because of this the omit-FP experiment is **not fully correct**, and the
+    "outputs identical" check below proves only execution, never unwind.
+  - Incoming stack args RBP → RSP in **both** lowering paths (they must agree):
+    `args.rs` `SyntheticAmode::finalize` (`sp_offset = tail_args_size +
+    setup_area_size + clobber_size + fixed_frame_storage_size +
+    outgoing_args_size; addr = rsp + sp_offset - offset`) and
+    `external.rs` `From<SyntheticAmode> for asm::Amode` (`base: Gpr::RSP`, same
+    `-offset`); `emit.rs` `incoming_arg_offset = tail_args_size +
+    setup_area_size + clobber_size + fixed_frame_storage_size +
+    outgoing_args_size`. (Same formula as `isa/riscv64/inst/args.rs:142-151`.)
+- **Correctness — EXECUTION ONLY (unwind is NOT correct, see the unwind bullet
+  above).** After `rm -rf build/stdlib_target`
+  (the backend `.so` is not fingerprinted, so std keeps the old lowering
+  otherwise) and a full rebuild, **all 15 bench outputs are byte-identical to
+  LLVM**; a 10-arg `i64` fn and a 10-arg `f64` fn (stack-passed args) print
+  `883500 784500`, identical to LLVM — i.e. the new RSP-relative incoming-arg
+  path is right. Hot user/core fns confirmed FP-less in disasm: `fib` and
+  `SipHasher::write` compile to `sub $N,%rsp; ...` with **no** `push %rbp` /
+  `mov %rsp,%rbp`.
+- **Runtime A/B (cpu ms, 21 reps, FP → omit-FP):** p1 100→102, p3 55→56,
+  p4 83→83, p2 48→48, p8 21→20, p9 33→34. Most are within the ±3% band, **but
+  p8's −4.8% (21→20) is above it**; with only 15–21 reps a single clamped A/B
+  does **not** establish that as a real win — treat p8 as inconclusive/noise
+  until measured with many more reps and unrounded medians. Artifact size
+  ±0.0% (e.g. p2 4143368→4141728 B).
+- **Why reverted:** neutral on every axis yet it carries real correctness risk
+  for code we don't exercise: `emit.rs:1893` `emit_return_call_common_sequence`
+  **asserts** `preserve_frame_pointers()` (so `return_call` would ICE), and
+  `verifier/mod.rs:660` rejects `get_frame_pointer`/`get_return_address` without
+  FP. Net: no upside, real downside — not worth landing.
+- **Conclusion:** the x64 frame-pointer prologue/epilogue (~6 instructions per
+  call: `push rbp; mov rsp,rbp` … `mov rbp,rsp; pop rbp`) is **not** a
+  bottleneck on these workloads — they are compute/memory/vectorization bound,
+  and even call-heavy `p3` (`fib`) is call-*latency* bound, so the prologue
+  instructions hide under the call latency. Remaining backend levers are
+  a loop vectorizer (p4), which is large.
+- **Addendum — p8 is already near-optimal (so "regalloc cycle" was a red
+  herring).** Disassembling `p8_minmax`'s hot loop: state `(i, a, mn)` is carried
+  entirely in registers (`rax`=i, `r10`=a, `r8`=mn) with **no stack traffic** —
+  `imul a*C; or $1,%rax; add a; cmp; mov %r10,%rax; cmovb %r8,%rax; mov
+  %rax,%r8; mov %rcx,%rax; jmp` (~10 instrs/iter). The only copies are the
+  min-reduction (`mov/cmovb/mov`), which are needed because `a` (in `r10`) must
+  survive for the next iteration while `mn` is updated. So the residual p8 gap
+  (M ~20 ms vs LLVM ~18 ms) is not a removable spill/cycle — it is inherent to
+  the scalar recurrence; LLVM's edge is elsewhere. Do not chase a "parallel-copy
+  cycle" in p8.
+- **Standing scoreboard, grounded in the full matrix below (`prog | bk |
+  Cwall | Ccpu | Crss | size(B) | Rwall | Rcpu | Rrss`):** M's compile is faster
+  than **LLVM** but **slower than upstream cg_clif (U)** — `h_arith` Cwall U **88**
+  ms vs M **100** ms. M's **artifact size is smallest** in that matrix (e.g.
+  `h_arith` size L 4617128 / U 5839120 / M **4078672** B). Runtime M wins only
+  **p5/p6/p7**, **loses p1/p2/p3/p4**, and the `h_*` rows are **not uniformly
+  ties** — `h_mem` Rcpu L **3** ms vs M **4** ms (M loses runtime CPU to LLVM).
+  Do not state "M wins compile" or "ties h_*" without the full L/U/M matrix
+  (Cwall/Ccpu/Crss/size + Rwall/Rcpu/Rrss) to back it. Closing p1 (memory-operand constants + branchy saturating cast +
+  serial int↔float chain), p2 (hashbrown/sort codegen depth), p3 (call-latency /
+  middle-end), p4 (a real loop autovectorizer) is a **months-scale backend
+  effort** comparable to LLVM's own middle-end, not an incremental pass.
+
+## Session (2026-11-24, branch `rakit-exp4`) — runtime probe (no pass-level win), x64 omit-FP blocker map
+
+- **Branch:** from `replace-main-with-cgclif-experiments` after PR #14 merged
+  (`7ffa4b6`).
+- **`p1_arith` — full all-axes (matrix below):** run wall/cpu = LLVM **81/81**,
+  cg_clif upstream **108/107**, Rakit **101/101** ms. Rakit **beats upstream**
+  and loses to LLVM. **Knob A/B is supplementary (not an L/U/M comparison):**
+  disabling a single pass barely moves it — `RAKIT_NO_IFCONV` 101/101,
+  `RAKIT_NO_DIVTEST` 105/105, `RAKIT_NO_STORE_FWD` 103/103, `RAKIT_NO_LANES`
+  102/101, `RAKIT_NO_SINCOS` 101/101 (default 103/101). So the residual is
+  **codegen, not a pass**: Rakit keeps constants as memory operands
+  (`imul 0xf2(%rip)`, `cmp 0xe6(%rip)`, `mulsd 0xd7(%rip)`, `movabs $0x43e0...`
+  reloaded each iteration) where LLVM hoists them once to registers, and the
+  saturating `f as u64` is a **branchy** multi-`jmp` sequence vs LLVM's
+  two-`cvttsd2si` branchless form (matches the earlier negative result:
+  branchless `emit` regressed because the constants are materialised after
+  LICM).
+- **`p2_mem` cross-block budget is not the limiter:** full row L 17/16,
+  U 157/157, M 47/49 ms; `RAKIT_SF_CBE_MAX=1e9` gives the same M 49/48 as the
+  default 16384. `cross_block_entry` is already an RPO single sweep with an
+  early-meet bail.
+- **No RSS axis to win (from the matrix):** run peak RSS ties across backends
+  (p2 11.1/11.1/10.8 MB, p1 11.1/10.8/11.1 MB); compile RSS is M ~ U and
+  slightly above L (p1 106.0/108.8/109.2 MB).
+- **x64 omit-frame-pointer blocker map (NOT attempted; all must be fixed
+  together or it miscompiles — two earlier naive attempts segfaulted):**
+  - `vendor/rakit-codegen/src/isa/x64/abi.rs:955` — `let setup_area_size = 16`
+    is **hardcoded** (`// RBP, return address`); must be 8 with no frame
+    pointer.
+  - `isa/x64/abi.rs:538-568` `gen_prologue_frame_setup` unconditionally emits
+    `push %rbp; mov %rsp,%rbp` (+ `Unwind::PushFrameRegs`); `:571-588`
+    `gen_epilogue_frame_restore` unconditionally emits `mov %rbp,%rsp; pop
+    %rbp`.
+  - **Incoming stack arguments are RBP-relative — ordinary calls, not just
+    `return_call`:** `isa/x64/inst/external.rs:338-356` lowers
+    `SyntheticAmode::IncomingArg { offset }` to an `Amode::ImmReg` with
+    `base: Gpr::RBP` and `simm32 = -offset`, whereas local
+    `SyntheticAmode::SlotOffset` uses `base: Gpr::RSP`. So **any callee whose
+    arguments spill to the stack (e.g. >6 register args, or any stack-passed
+    arg) reads them via RBP**; omitting the frame pointer breaks such
+    **ordinary calls**, not only `return_call`. This is **fixable by mirroring
+    RISC-V**, which already lowers `AMode::IncomingArg` **SP-relative** from the
+    frame layout (`isa/riscv64/inst/args.rs:142-151`:
+    `sp_offset = tail_args_size + setup_area_size + clobber_size +
+    fixed_frame_storage_size + outgoing_args_size`, then `sp_offset - off`).
+    The earlier claim that "RSP moves within a function" is **wrong for
+    clobbers/slots**: `isa/x64/abi.rs:714-729` (`gen_clobber_save`) reserves
+    `fixed_frame_storage_size + clobber_size + outgoing_args_size` **once in the
+    prologue** with a single `sub rsp`, then stores clobbers at fixed RSP
+    offsets, so those SP offsets are constant. RSP is only adjusted
+    transiently for outgoing call args and for the `tail_args_size` growth of a
+    `return_call` — both folded into the RISC-V formula above.
+  - `isa/x64/abi.rs:673` `gen_clobber_save` additionally does rbp-relative
+    surgery when a `return_call` grows the incoming-arg area.
+  - `isa/x64/inst/emit.rs:1893` `emit_return_call_common_sequence` **asserts**
+    `preserve_frame_pointers()` — `return_call` needs FP (latent ICE if
+    default-on and tail calls are emitted).
+  - `verifier/mod.rs:660` rejects `get_frame_pointer`/`get_return_address`
+    without FP (backtrace machinery).
+  - `rbp` is callee-save (`is_callee_save_systemv`) and its *only* save today is
+    the prologue push, so omit-FP must guarantee regalloc never allocates `rbp`
+    (or save it via `gen_clobber_save`).
+  - s390x/riscv64 already gate `setup_area_size`/prologue on
+    `flags.preserve_frame_pointers()` (`isa/s390x/abi.rs:761,789,973`,
+    `isa/riscv64/abi.rs:664`); x64 never implemented it. On x64 the extra piece
+    is the SP-relative incoming-arg lowering above (RISC-V's is the template);
+    the remaining gates are the `return_call` FP assert and the
+    `get_frame_pointer` verifier.
+- **Landed (safe, byte-identical):** the unroller's remaining per-function env
+  reads (`RAKIT_UNROLL_DEBUG`, `RAKIT_LANE_DEBUG`, `RAKIT_NO_NARROW_FCVT`,
+  `RAKIT_NO_LANES`) now go through cached `OnceLock` tunables, completing the
+  "cache every knob in `tunables.rs`" discipline and removing global
+  `std::env` map locks from the hottest per-function pass. **Neutral** on
+  measurement (p2 knob A/B 164/228 vs 172/236 ms, noise; synthetic 800-function
+  file 157/210 vs 157/213). The M-vs-U compile gap in the matrix (p2 compile M
+  159/216 vs U 124/166) is the documented price of the extra passes, not this
+  change.
+- **Conclusion:** every remaining runtime gap (p1 codegen constants + branchy
+  cast, p2 hash/sort codegen, p3 frame-pointer/call overhead, p4 vectorizer,
+  p8 regalloc parallel-copy cycle, p9 libcall GOT reload) needs vendored
+  backend work; safe pass-level micro-optimisation is exhausted.
+- **Verification:** `./y.sh build` exit 0; 15/15 bench binaries md5-identical to
+  the PR #14 build; `./y.sh test --sysroot rakit` -> 65 suites / 25,368 passed /
+  0 failed; `bench/allaxes.sh` 45/45 rows `ok` (stdout matches LLVM).
+
+### Full all-axes matrix (`bench/allaxes.sh`, CREPS=3 RREPS=7) — this build
+L = LLVM, U = cg_clif upstream, M = modified Rakit. Compile = wall / cpu ms /
+peak RSS MB / artifact bytes. Run = wall / cpu ms / peak RSS MB. All stdout
+matched LLVM. Run wall is contention-sensitive; compare with run cpu.
+
+| prog | bk | Cwall | Ccpu | Crss | size(B) | Rwall | Rcpu | Rrss |
+|------|----|------:|-----:|-----:|--------:|------:|-----:|-----:|
+| h_arith | L | 117 | 141 | 117.6 | 4617128 | 2 | 2 | 10.8 |
+| h_arith | U | 88 | 115 | 120.0 | 5839120 | 2 | 2 | 11.1 |
+| h_arith | M | 100 | 129 | 120.6 | 4078672 | 2 | 2 | 11.0 |
+| h_branch | L | 118 | 143 | 118.1 | 4616832 | 2 | 2 | 11.0 |
+| h_branch | U | 88 | 116 | 120.3 | 5837264 | 2 | 2 | 10.9 |
+| h_branch | M | 103 | 135 | 120.4 | 4077008 | 2 | 2 | 11.0 |
+| h_calls | L | 116 | 139 | 118.5 | 4616872 | 2 | 2 | 11.0 |
+| h_calls | U | 88 | 115 | 120.7 | 5837792 | 2 | 2 | 11.0 |
+| h_calls | M | 102 | 131 | 120.9 | 4077368 | 2 | 2 | 11.0 |
+| h_float | L | 126 | 149 | 117.2 | 4637984 | 2 | 2 | 10.8 |
+| h_float | U | 91 | 119 | 119.8 | 5861024 | 3 | 2 | 11.0 |
+| h_float | M | 104 | 132 | 120.1 | 4118168 | 2 | 2 | 11.1 |
+| h_mem | L | 260 | 419 | 137.8 | 4646848 | 3 | 3 | 10.8 |
+| h_mem | U | 130 | 179 | 135.8 | 5959856 | 9 | 9 | 11.1 |
+| h_mem | M | 170 | 245 | 137.1 | 4166120 | 5 | 4 | 10.8 |
+| h_simd | L | 140 | 163 | 124.1 | 4617704 | 2 | 2 | 11.0 |
+| h_simd | U | 98 | 127 | 125.9 | 5843736 | 4 | 3 | 11.0 |
+| h_simd | M | 112 | 142 | 126.0 | 4081096 | 2 | 2 | 11.0 |
+| p1_arith | L | 91 | 112 | 106.0 | 4635232 | 81 | 81 | 11.1 |
+| p1_arith | U | 78 | 101 | 108.8 | 5877944 | 108 | 107 | 10.8 |
+| p1_arith | M | 87 | 111 | 109.2 | 4146112 | 101 | 101 | 11.1 |
+| p2_mem | L | 244 | 373 | 132.9 | 4639888 | 17 | 16 | 11.1 |
+| p2_mem | U | 124 | 166 | 132.0 | 5936144 | 157 | 157 | 11.1 |
+| p2_mem | M | 159 | 216 | 133.0 | 4143368 | 47 | 49 | 10.8 |
+| p3_calls | L | 98 | 119 | 116.0 | 4612368 | 37 | 36 | 11.0 |
+| p3_calls | U | 87 | 112 | 117.5 | 5820136 | 117 | 117 | 11.0 |
+| p3_calls | M | 103 | 123 | 118.1 | 4067048 | 55 | 55 | 11.1 |
+| p4_simd | L | 106 | 125 | 116.4 | 4636096 | 56 | 56 | 48.2 |
+| p4_simd | U | 92 | 115 | 118.2 | 5892376 | 157 | 156 | 49.5 |
+| p4_simd | M | 104 | 129 | 118.8 | 4152736 | 84 | 83 | 48.8 |
+| p5_inline | L | 82 | 104 | 104.8 | 4609368 | 58 | 57 | 11.1 |
+| p5_inline | U | 77 | 100 | 107.3 | 5813704 | 895 | 894 | 10.8 |
+| p5_inline | M | 83 | 108 | 108.0 | 4059960 | 6 | 6 | 11.0 |
+| p6_scalar | L | 81 | 99 | 101.3 | 4609368 | 58 | 57 | 11.1 |
+| p6_scalar | U | 75 | 97 | 103.6 | 5813688 | 904 | 905 | 11.0 |
+| p6_scalar | M | 82 | 104 | 104.1 | 4059960 | 6 | 6 | 11.0 |
+| p7_branchy | L | 83 | 101 | 105.2 | 4609520 | 43 | 43 | 11.0 |
+| p7_branchy | U | 77 | 100 | 107.6 | 5813800 | 100 | 100 | 10.7 |
+| p7_branchy | M | 87 | 111 | 108.1 | 4060120 | 35 | 35 | 10.8 |
+| p8_minmax | L | 84 | 101 | 105.1 | 4609544 | 18 | 17 | 11.0 |
+| p8_minmax | U | 78 | 100 | 107.3 | 5813752 | 38 | 38 | 11.1 |
+| p8_minmax | M | 85 | 107 | 107.9 | 4060088 | 20 | 20 | 10.8 |
+| p9_u64f32 | L | 95 | 114 | 110.8 | 4635448 | 30 | 30 | 17.8 |
+| p9_u64f32 | U | 86 | 109 | 113.7 | 5886872 | 76 | 76 | 18.8 |
+| p9_u64f32 | M | 97 | 120 | 114.2 | 4149744 | 34 | 34 | 18.2 |
+
+## Session (2026-11-24, branch `rakit-exp3`) — instrumentation + per-function guards (marginal), runtime walls re-confirmed
+
+- **Branch:** from `replace-main-with-cgclif-experiments` after PR #13 merged
+  (`f35f743`).
+- **Runtime exploration (disassembly-backed, all architectural):**
+  - `p8` (20 vs L 18): the lane transform already uses the efficient per-lane
+    scheme (forcing advanced by a constant `slope`, 1 imul/iter). The residual
+    gap is a **regalloc parallel-copy cycle** on the lane loop's 6 params: the
+    back edge ends in `mov %rdx,%r13; mov %r12,%rdx; mov %r10,%r12; mov
+    %r13,%r10; mov %rbx,%rcx` (a 3-cycle + 1), whereas LLVM's per-lane state
+    needs no shuffles. Factor sweep F=2/4/6/8 = 21/23/22/23 ms (F=2 best). Not
+    pass-fixable; it is register allocation.
+  - `p9` (33 vs 30): 85% `sinf`. LLVM hoists the GOT entry to `%r15` once
+    (`mov sinf@GOT,%r15`) then `call *%r15`; Rakit reloads `mov
+    sinf@GOT,%rax` **every iteration**. The GOT load is emitted by ISel at the
+    call site (post-CLIF), so Rakit's LICM cannot hoist it. Architectural.
+  - `p1` (101 vs 82): `f += sqrt(i)*0.5` is a serial f64 add chain; LLVM
+    pipelines the independent `sqrt`s by unrolling a **multi-block** body.
+  - `p3` (57 vs 37): `fib` is 71%. M matches LLVM's loop shape (1 call/iter) but
+    every call pays the **frame pointer** (`push rbp; mov rsp,rbp` + `mov
+    rbp,rsp; pop rbp`) and spill-to-stack callee saves instead of `push`; LLVM
+    omits the frame pointer (`push r14; push rbx; push rax`). This is the
+    documented x64 `preserve_frame_pointers` trap (naive fixes segfault via
+    `setup_area_size`).
+- **Landed (safe, byte-identical — all 15 bench binaries md5-match the prior
+  build; output unchanged):**
+  - `passtime`: new `REC_LOOP`/`SINCOS` slots (ACC 7→9) so those passes are now
+    timed and visible (`rec_loop=0.2ms sincos=0.4ms` on p2/h_mem cgu.1).
+  - `RecLoopPass`/`SincosPass` adapters: check their disable switch first, run
+    the pass inside the timer, and return the pass's **real** result.
+    `rec_loop::run`/`sincos::run` now return whether they rewrote / fused
+    anything. **No opcode pre-scan** for these two: `rec_loop::try_match` already
+    rejects non-recursive functions at the entry terminator (O(1)) and
+    `sincos::run` already does a single cheap walk, so a full `Call` scan in
+    front would be slower for call-free straight-line functions.
+  - `unroll::run`: skip `collapse_forwarders` and the loop `analyze` for
+    **single-block** functions (no second block to forward to; a loop needs a
+    back edge across blocks). `narrow_uint_fcvt` still runs. The
+    `RAKIT_UNROLL_DEBUG` IR dump now runs **before** `narrow_uint_fcvt`, so
+    single-block functions are still dumped and the conversion diagnostics
+    `narrow_uint_fcvt` prints have the function header above them.
+  - Review follow-ups: `rec_loop::try_match` now checks `is_self(fr1)` right
+    after the first `call_sub`, before scanning the second arm (logically
+    identical; `call_sub` reads `jump_target` first, so `return`-terminated
+    shapes bail O(1) with **no** instruction scan). `sincos::run` site discovery
+    iterates the layout directly instead of snapshotting blocks/insts into
+    `Vec`s (no per-function allocation, call-free ones included).
+- **Honest measurement:** these guards are **marginal**. A synthetic file with
+  **800** single-block leaf functions compiles 144/197 ms with the guards vs
+  145/198 ms without (~1 ms, within noise) — tiny functions are cheap per pass;
+  the pass cost lives in the few large multi-block functions (store_forward
+  ~9 ms is genuine work). The 15-program bench compile is unchanged.
+- **Conclusion:** safe compile micro-optimisation is exhausted; the remaining
+  runtime gaps need backend work (x64 omit-frame-pointer done correctly,
+  regalloc coalescing, a loop vectorizer, GOT-load hoisting) — each a
+  multi-session, correctness-critical change, not a pass-sized tweak.
+- **Verification:** `./y.sh build` exit 0; `bench/allaxes.sh` 45/45 `ok`;
+  `./y.sh test --sysroot rakit` → 65 suites / 25,368 passed / 0 failed.
+
+### Full all-axes matrix (`bench/allaxes.sh`, CREPS=3 RREPS=7)
+L = LLVM, U = cg_clif upstream, M = modified Rakit. Compile = wall / cpu ms /
+peak RSS MB / artifact bytes. Run = wall / cpu ms / peak RSS MB. All stdout
+matched LLVM. Run wall is contention-sensitive; compare with run cpu.
+
+| prog | bk | Cwall | Ccpu | Crss | size(B) | Rwall | Rcpu | Rrss |
+|------|----|------:|-----:|-----:|--------:|------:|-----:|-----:|
+| h_arith | L | 119 | 145 | 117.7 | 4617128 | 2 | 2 | 11.0 |
+| h_arith | U | 92 | 117 | 120.2 | 5839120 | 2 | 2 | 11.1 |
+| h_arith | M | 103 | 134 | 120.8 | 4078672 | 2 | 2 | 10.8 |
+| h_branch | L | 126 | 142 | 118.0 | 4616832 | 2 | 2 | 10.8 |
+| h_branch | U | 92 | 119 | 120.2 | 5837264 | 2 | 2 | 10.8 |
+| h_branch | M | 101 | 130 | 120.6 | 4077008 | 2 | 2 | 11.0 |
+| h_calls | L | 119 | 140 | 118.5 | 4616872 | 2 | 2 | 11.1 |
+| h_calls | U | 89 | 118 | 120.7 | 5837792 | 2 | 2 | 11.0 |
+| h_calls | M | 101 | 127 | 120.9 | 4077368 | 3 | 2 | 11.1 |
+| h_float | L | 127 | 150 | 116.9 | 4637984 | 2 | 2 | 11.1 |
+| h_float | U | 90 | 126 | 119.9 | 5861024 | 3 | 2 | 11.1 |
+| h_float | M | 106 | 139 | 119.9 | 4118168 | 2 | 2 | 11.1 |
+| h_mem | L | 265 | 428 | 137.4 | 4646848 | 3 | 3 | 11.0 |
+| h_mem | U | 140 | 189 | 136.2 | 5959856 | 9 | 9 | 11.1 |
+| h_mem | M | 174 | 240 | 137.4 | 4166120 | 5 | 4 | 11.1 |
+| h_simd | L | 142 | 167 | 124.0 | 4617704 | 2 | 2 | 11.1 |
+| h_simd | U | 99 | 128 | 125.7 | 5843736 | 4 | 3 | 11.1 |
+| h_simd | M | 111 | 141 | 126.4 | 4081096 | 3 | 2 | 11.0 |
+| p1_arith | L | 86 | 104 | 105.7 | 4635232 | 82 | 81 | 11.1 |
+| p1_arith | U | 79 | 101 | 108.8 | 5877944 | 108 | 108 | 11.0 |
+| p1_arith | M | 90 | 112 | 109.5 | 4146112 | 101 | 100 | 11.1 |
+| p2_mem | L | 244 | 378 | 133.9 | 4639888 | 17 | 16 | 11.0 |
+| p2_mem | U | 131 | 173 | 132.2 | 5936144 | 155 | 156 | 10.8 |
+| p2_mem | M | 160 | 220 | 133.5 | 4143368 | 48 | 48 | 10.8 |
+| p3_calls | L | 103 | 129 | 116.2 | 4612368 | 37 | 36 | 11.0 |
+| p3_calls | U | 86 | 114 | 117.6 | 5820136 | 116 | 115 | 10.8 |
+| p3_calls | M | 95 | 120 | 118.1 | 4067048 | 56 | 56 | 10.8 |
+| p4_simd | L | 108 | 129 | 116.6 | 4636096 | 56 | 56 | 48.2 |
+| p4_simd | U | 95 | 120 | 118.2 | 5892376 | 156 | 156 | 49.5 |
+| p4_simd | M | 106 | 129 | 118.7 | 4152736 | 84 | 83 | 48.8 |
+| p5_inline | L | 82 | 103 | 104.7 | 4609368 | 58 | 57 | 11.0 |
+| p5_inline | U | 79 | 102 | 107.5 | 5813704 | 892 | 891 | 11.1 |
+| p5_inline | M | 84 | 107 | 108.0 | 4059960 | 7 | 6 | 11.1 |
+| p6_scalar | L | 84 | 103 | 101.3 | 4609368 | 58 | 57 | 10.8 |
+| p6_scalar | U | 77 | 98 | 103.7 | 5813688 | 902 | 902 | 11.1 |
+| p6_scalar | M | 85 | 111 | 104.1 | 4059960 | 6 | 6 | 11.0 |
+| p7_branchy | L | 85 | 105 | 104.9 | 4609520 | 43 | 42 | 10.8 |
+| p7_branchy | U | 79 | 107 | 107.6 | 5813800 | 101 | 100 | 11.1 |
+| p7_branchy | M | 86 | 111 | 108.4 | 4060120 | 36 | 36 | 11.1 |
+| p8_minmax | L | 84 | 104 | 105.2 | 4609544 | 18 | 17 | 11.1 |
+| p8_minmax | U | 79 | 101 | 107.2 | 5813752 | 39 | 40 | 10.8 |
+| p8_minmax | M | 86 | 110 | 108.2 | 4060088 | 20 | 20 | 11.1 |
+| p9_u64f32 | L | 95 | 114 | 110.7 | 4635448 | 30 | 30 | 17.6 |
+| p9_u64f32 | U | 87 | 110 | 113.8 | 5886872 | 77 | 76 | 18.8 |
+| p9_u64f32 | M | 96 | 120 | 114.2 | 4149744 | 34 | 33 | 18.2 |
+
+## Session (2026-11-24, branch `rakit-exp2`) — opcode pre-scans for cheap passes
+
+- **Branch:** created from `replace-main-with-cgclif-experiments` after PR #12
+  merged (`cb273bf`).
+- **Runtime exploration first (all architectural):**
+  - `p8` lane-factor sweep on the current tree: F=2/4/6/8 → **21/23/22/23 ms**
+    (L 18). F=2 still best; ≥4 spills. The residual gap is the forcing term being
+    recomputed per super-iteration (`lea`/`add`) instead of advanced by a
+    constant add as LLVM does. Closing it needs the deferred per-lane carried
+    state rewrite (AGENTS "LCG lane transform — next step"), not a factor tweak.
+  - `p9` disasm: loop is `xorps;cvtsi2ss;call sinf;` then reloads `a.ptr`/`a.len`
+    from `0x8/0x10(%rsp)` every iteration (regalloc keeps loop-invariants on the
+    stack) plus a `mov sinf@GOT` per iter. 85% is `sinf`; the reloads are L1 hits —
+    the documented wall, no pass-sized win.
+  - `p1` disasm: `f += sqrt(i)*0.5` is a serial f64 add chain; LLVM pipelines the
+    independent `sqrt`s by unrolling a multi-block body. Needs a multi-block
+    unroller, out of scope.
+- **Landed: opcode pre-scans in the pass adapters** (`passes/mod.rs`). Each cheap
+  pass did expensive setup (a use-count map, a CFG build, callee-name
+  resolution) for *every* function before finding nothing. New `has_opcode`
+  helper (opcode-only walk) gates them on a necessary condition:
+  - `div_test`: skip unless the function has an `Opcode::Urem`.
+  - `if_convert`: skip unless it has ≥3 blocks **and** an `Opcode::Brif`.
+  - `sincos`: skip unless it has an `Opcode::Call`.
+  All three are necessary conditions (no `urem`/`brif`/call ⇒ the pass cannot
+  fire), so the IR is unchanged. The disable switches (`RAKIT_NO_DIVTEST`,
+  `RAKIT_NO_IFCONV`) are checked **before** the scan, so a disabled pass costs
+  nothing; and the pre-scan runs **inside** the `passtime::time` region so the
+  reported per-pass time includes the scan. The adapters return the optimizer's
+  own result: `div_test::run` and `if_convert::run` now return whether they
+  actually rewrote (so a function with no `urem` candidate or no convertible
+  diamond yields `false`), and a prefilter rejection also returns `false` — so
+  `Pass::run`'s "did the function change" answer is truthful. `passtime::enabled()`
+  memoises `RAKIT_PASS_TIME` in a `OnceLock`, so the extra `time()` calls for
+  skipped functions do not re-read the environment in a normal build.
+  - **Byte-identical:** all 15 bench programs md5-match the pre-change build.
+  - **A/B compile (median, reps=15, same session):** `p2_mem` 158→**155** wall
+    (cpu 217→217), `h_mem` 168→**165** (238→233), `p4_simd` 107→**105**
+    (132→128). Scan-inclusive `div_test` per-pass on `p2_mem`/`h_mem` cgu.1:
+    1.7/2.1 → **0.6** ms (the 0.4 quoted earlier excluded the scan).
+- **Measurement caveat (wall vs cpu):** **runtime is unchanged on CPU time**;
+  wall time is sensitive to machine contention and must be read with CPU time.
+  One allaxes pass showed `p1_arith` M at **261 ms wall / 101 ms CPU** (a
+  scheduling stall); an isolated 20-rep re-measure gives **101/100 ms** and the
+  clean re-run matrix below shows 101/100. Judge runtime by CPU (and by a clean
+  re-run), not a single wall sample.
+- **Verification:** `./y.sh build` exit 0; `./y.sh test --sysroot rakit` → 65
+  suites / 25,368 passed / 0 failed; `bench/allaxes.sh` (CREPS=3 RREPS=7) →
+  45/45 rows `ok`. Runtime (CPU) and sizes unchanged (matrix below).
+
+### Full all-axes matrix (`bench/allaxes.sh`, CREPS=3 RREPS=7)
+L = LLVM, U = cg_clif upstream, M = modified Rakit. Compile = wall / cpu (user+sys)
+ms / peak RSS MB / artifact bytes. Run = wall / cpu ms / peak RSS MB. All stdout
+matched LLVM. (Run wall is contention-sensitive; compare with run cpu.)
+
+| prog | bk | Cwall | Ccpu | Crss | size(B) | Rwall | Rcpu | Rrss |
+|------|----|------:|-----:|-----:|--------:|------:|-----:|-----:|
+| h_arith | L | 148 | 154 | 117.7 | 4617128 | 193 | 2 | 10.8 |
+| h_arith | U | 92 | 119 | 120.0 | 5839120 | 2 | 2 | 11.0 |
+| h_arith | M | 104 | 132 | 120.6 | 4078672 | 2 | 2 | 11.0 |
+| h_branch | L | 122 | 149 | 118.1 | 4616832 | 2 | 2 | 11.1 |
+| h_branch | U | 91 | 121 | 120.3 | 5837264 | 2 | 2 | 10.8 |
+| h_branch | M | 103 | 131 | 120.5 | 4077008 | 2 | 2 | 11.0 |
+| h_calls | L | 118 | 143 | 118.8 | 4616872 | 2 | 2 | 11.1 |
+| h_calls | U | 92 | 122 | 120.8 | 5837792 | 3 | 2 | 10.8 |
+| h_calls | M | 103 | 133 | 120.8 | 4077368 | 2 | 2 | 10.8 |
+| h_float | L | 128 | 152 | 117.0 | 4637984 | 2 | 2 | 10.7 |
+| h_float | U | 95 | 125 | 119.7 | 5861024 | 3 | 3 | 11.0 |
+| h_float | M | 103 | 132 | 120.0 | 4118168 | 2 | 2 | 11.0 |
+| h_mem | L | 276 | 441 | 138.3 | 4646848 | 3 | 3 | 11.0 |
+| h_mem | U | 139 | 191 | 136.1 | 5959856 | 10 | 9 | 11.1 |
+| h_mem | M | 172 | 245 | 137.8 | 4166120 | 5 | 4 | 10.7 |
+| h_simd | L | 145 | 168 | 124.2 | 4617704 | 2 | 2 | 11.0 |
+| h_simd | U | 102 | 128 | 125.7 | 5843736 | 4 | 3 | 11.0 |
+| h_simd | M | 112 | 140 | 126.2 | 4081096 | 2 | 2 | 11.0 |
+| p1_arith | L | 89 | 110 | 105.8 | 4635232 | 82 | 83 | 11.1 |
+| p1_arith | U | 88 | 105 | 108.6 | 5877944 | 108 | 108 | 11.0 |
+| p1_arith | M | 90 | 115 | 109.4 | 4146112 | 101 | 100 | 11.0 |
+| p2_mem | L | 254 | 395 | 133.9 | 4639888 | 17 | 17 | 11.0 |
+| p2_mem | U | 139 | 183 | 132.3 | 5936144 | 159 | 156 | 11.0 |
+| p2_mem | M | 161 | 219 | 133.6 | 4143368 | 50 | 49 | 11.0 |
+| p3_calls | L | 101 | 126 | 116.2 | 4612368 | 37 | 37 | 11.0 |
+| p3_calls | U | 89 | 115 | 117.8 | 5820136 | 116 | 116 | 10.7 |
+| p3_calls | M | 112 | 134 | 118.7 | 4067048 | 56 | 55 | 10.8 |
+| p4_simd | L | 109 | 130 | 116.6 | 4636096 | 56 | 56 | 48.2 |
+| p4_simd | U | 94 | 118 | 118.2 | 5892376 | 157 | 155 | 49.5 |
+| p4_simd | M | 106 | 130 | 119.0 | 4152736 | 84 | 84 | 48.8 |
+| p5_inline | L | 84 | 104 | 104.8 | 4609368 | 58 | 58 | 10.8 |
+| p5_inline | U | 80 | 103 | 107.4 | 5813704 | 892 | 891 | 11.0 |
+| p5_inline | M | 84 | 109 | 108.0 | 4059960 | 7 | 6 | 10.8 |
+| p6_scalar | L | 83 | 102 | 101.2 | 4609368 | 58 | 57 | 11.1 |
+| p6_scalar | U | 77 | 98 | 103.7 | 5813688 | 903 | 901 | 10.9 |
+| p6_scalar | M | 83 | 105 | 104.2 | 4059960 | 7 | 6 | 10.8 |
+| p7_branchy | L | 85 | 103 | 105.2 | 4609520 | 43 | 42 | 10.8 |
+| p7_branchy | U | 79 | 102 | 107.6 | 5813800 | 102 | 102 | 11.0 |
+| p7_branchy | M | 88 | 109 | 108.1 | 4060120 | 36 | 35 | 11.0 |
+| p8_minmax | L | 87 | 106 | 105.2 | 4609544 | 18 | 18 | 10.7 |
+| p8_minmax | U | 80 | 102 | 107.3 | 5813752 | 38 | 38 | 10.8 |
+| p8_minmax | M | 87 | 110 | 107.9 | 4060088 | 21 | 20 | 11.1 |
+| p9_u64f32 | L | 97 | 117 | 110.9 | 4635448 | 31 | 30 | 17.8 |
+| p9_u64f32 | U | 108 | 116 | 113.6 | 5886872 | 77 | 76 | 18.8 |
+| p9_u64f32 | M | 99 | 124 | 114.5 | 4149744 | 34 | 34 | 18.2 |
+
+## Session (2026-11-24, branch `rakit-further-experiments`) — compile-axis wins
+
+- **Goal shift:** the runtime gaps left (p2/h_mem hash+sort, p4 autovectorization,
+  p1 saturating f64→u64) are the documented architectural wall, so this branch
+  targets the **compile axis**, where M still loses to upstream U on `p2`/`h_mem`
+  because the custom passes run on every function. Runtime and size are unchanged
+  (full matrix below).
+- **What the guards save (and don't):** only pass *execution*. The pipeline is
+  `RecLoop, StoreForward, DivTest, IfConvert, Unroll, Rotate, Sincos`, and
+  `DivTest`/`Unroll` always report a change, so `PassManager::run` has already
+  cleared the analysis cache right before `IfConvert`/`Rotate`. A guard that skips
+  those passes therefore preserves no cached CFG — `invalidate()` stays
+  unconditional; the saving is not rebuilding the CFG / walking bodies inside the
+  skipped pass.
+- **Structural pass guards** (`passes/mod.rs`): `if_convert` skips functions with
+  fewer than 3 blocks (a two-way diamond needs `then_block != else_block`, i.e.
+  head + two distinct arms) and `rotate` skips single-block functions (no distinct
+  latch). Both are **provably no-ops** on the skipped shapes.
+  - **NOT guarded: `unroll`.** `unroll::run` also performs the loop-independent
+    `narrow_uint_fcvt` rewrite (zero-extension / constant-mask proofs and the
+    dominator bound proofs), which applies to single-block functions too, so an
+    earlier single-block guard there was wrong and was removed.
+  - **Zero IR change, proven empirically:** with vs without the remaining guards,
+    the binaries for all 15 bench programs are **byte-identical** (md5).
+- **Rotate reorder** (`rotate.rs`): the cheap structural rejection (header must
+  have non-empty params and some arm must pass them through unchanged) now runs
+  *before* the region reachability walk. Most `brif` blocks are plain if/else
+  heads with no params, so this skips the walk. Rotate pass time on `p2_mem`/
+  `h_mem` cgu.1 drops 2.2–3.0 ms → **0.3–0.4 ms**; accepted loops are identical,
+  so the binary is byte-identical.
+- **Compile measurements vs the pre-guard tree** (median, reps≥7, wall/cpu ms):
+  `p2_mem` 161→159 / 223→219, `h_mem` 172→168 / 244→237, `p4_simd` 104→103 /
+  130→127 (~1–3%). Full three-way matrix below.
+- **Verification:** `./y.sh build` exit 0; `./y.sh test --sysroot rakit` → 65
+  suites / 25,368 passed / 0 failed; `bench/allaxes.sh` (CREPS=3 RREPS=7) →
+  45/45 rows `ok` (stdout validated vs LLVM). `fib` still rotated; p3 output
+  byte-identical.
+
+### Full all-axes matrix (`bench/allaxes.sh`, CREPS=3 RREPS=7)
+L = stock LLVM nightly, U = cg_clif upstream, M = modified Rakit. Compile =
+wall ms / cpu ms (user+sys) / peak RSS MB / artifact bytes. Run = wall ms /
+cpu ms / peak RSS MB. All stdout matched LLVM.
+
+| prog | bk | Cwall | Ccpu | Crss | size(B) | Rwall | Rcpu | Rrss |
+|------|----|------:|-----:|-----:|--------:|------:|-----:|-----:|
+| h_arith | L | 120 | 144 | 117.7 | 4617128 | 2 | 2 | 10.8 |
+| h_arith | U | 94 | 127 | 120.2 | 5839120 | 2 | 2 | 11.0 |
+| h_arith | M | 102 | 129 | 120.7 | 4078672 | 2 | 2 | 11.0 |
+| h_branch | L | 119 | 145 | 118.3 | 4616832 | 2 | 2 | 11.1 |
+| h_branch | U | 90 | 118 | 120.3 | 5837264 | 2 | 2 | 11.0 |
+| h_branch | M | 101 | 129 | 120.9 | 4077008 | 2 | 2 | 11.0 |
+| h_calls | L | 118 | 143 | 118.6 | 4616872 | 2 | 2 | 10.8 |
+| h_calls | U | 92 | 123 | 120.8 | 5837792 | 2 | 2 | 11.0 |
+| h_calls | M | 102 | 131 | 121.1 | 4077368 | 2 | 2 | 11.1 |
+| h_float | L | 128 | 151 | 116.9 | 4637984 | 2 | 2 | 11.0 |
+| h_float | U | 92 | 119 | 120.1 | 5861024 | 3 | 2 | 10.8 |
+| h_float | M | 112 | 132 | 120.2 | 4118168 | 2 | 2 | 10.8 |
+| h_mem | L | 273 | 442 | 138.2 | 4646848 | 3 | 3 | 11.0 |
+| h_mem | U | 146 | 200 | 136.0 | 5959856 | 10 | 9 | 10.8 |
+| h_mem | M | 170 | 241 | 137.4 | 4166120 | 5 | 4 | 11.1 |
+| h_simd | L | 146 | 170 | 124.3 | 4617704 | 2 | 2 | 11.0 |
+| h_simd | U | 101 | 130 | 125.4 | 5843736 | 4 | 4 | 11.1 |
+| h_simd | M | 112 | 141 | 126.3 | 4081096 | 3 | 2 | 10.8 |
+| p1_arith | L | 86 | 105 | 105.7 | 4635232 | 81 | 81 | 11.1 |
+| p1_arith | U | 82 | 105 | 108.9 | 5877944 | 108 | 108 | 10.8 |
+| p1_arith | M | 86 | 109 | 109.5 | 4146112 | 101 | 101 | 10.8 |
+| p2_mem | L | 250 | 383 | 133.6 | 4639888 | 17 | 17 | 11.0 |
+| p2_mem | U | 132 | 176 | 132.1 | 5936144 | 156 | 157 | 11.1 |
+| p2_mem | M | 163 | 223 | 133.7 | 4143368 | 49 | 48 | 10.8 |
+| p3_calls | L | 103 | 123 | 116.2 | 4612368 | 37 | 37 | 10.8 |
+| p3_calls | U | 92 | 119 | 117.7 | 5820136 | 116 | 115 | 11.0 |
+| p3_calls | M | 96 | 124 | 118.2 | 4067048 | 56 | 55 | 11.0 |
+| p4_simd | L | 109 | 129 | 116.5 | 4636096 | 55 | 55 | 48.2 |
+| p4_simd | U | 94 | 120 | 118.0 | 5892376 | 157 | 155 | 49.4 |
+| p4_simd | M | 104 | 129 | 119.0 | 4152736 | 85 | 85 | 48.8 |
+| p5_inline | L | 82 | 102 | 104.8 | 4609368 | 58 | 57 | 11.0 |
+| p5_inline | U | 77 | 107 | 107.5 | 5813704 | 895 | 894 | 11.1 |
+| p5_inline | M | 84 | 108 | 108.4 | 4059960 | 7 | 6 | 11.1 |
+| p6_scalar | L | 82 | 99 | 101.2 | 4609368 | 58 | 57 | 11.1 |
+| p6_scalar | U | 77 | 98 | 103.8 | 5813688 | 902 | 902 | 10.7 |
+| p6_scalar | M | 83 | 104 | 104.3 | 4059960 | 6 | 6 | 11.0 |
+| p7_branchy | L | 83 | 104 | 105.3 | 4609520 | 43 | 42 | 11.0 |
+| p7_branchy | U | 78 | 101 | 107.4 | 5813800 | 100 | 100 | 10.8 |
+| p7_branchy | M | 86 | 106 | 108.5 | 4060120 | 35 | 35 | 11.0 |
+| p8_minmax | L | 84 | 103 | 104.9 | 4609544 | 18 | 18 | 11.0 |
+| p8_minmax | U | 79 | 101 | 107.3 | 5813752 | 39 | 39 | 11.0 |
+| p8_minmax | M | 84 | 108 | 108.0 | 4060088 | 20 | 20 | 11.1 |
+| p9_u64f32 | L | 96 | 113 | 110.6 | 4635448 | 30 | 29 | 17.8 |
+| p9_u64f32 | U | 86 | 109 | 113.8 | 5886872 | 76 | 76 | 18.9 |
+| p9_u64f32 | M | 94 | 118 | 114.3 | 4149744 | 33 | 33 | 18.2 |
+
+## Session (2026-11-24) — loop rotation pass (LANDED locally, p3 −5%)
+
+- **New pass** `rakit-opt/src/passes/rotate.rs`, wired in `src/base.rs` after
+  `unroll` and before `sincos`. Rakit lowers a guarded loop to a header that
+  tests at the top plus a latch that `jump`s back, so every iteration costs a
+  test *and* an unconditional back-jump. Rotation makes the body its own back
+  edge: the header becomes a one-shot guard, and the latch branches
+  `brif(cond2, body(next), exit(...))` with the test recomputed from the latch's
+  next-state arguments. One branch per iteration, no header re-entry.
+- **Where it fires:** only call-bound loops by default (`RAKIT_ROTATE_ALL=1`
+  widens it; that regressed `p8_minmax` +15.7% by disturbing the unroller's lane
+  loop, so it stays off). The win is the recursive-to-loop `fib` kernel:
+  `p3_calls` 59 → 56 ms (−5%), the `h_calls` heldout small. All other runtime
+  rows are within noise.
+- **Soundness model (local, not loop-analysis):** the rewrite replaces
+  `jump H(next)` with the expansion of H's `brif` at `params = next`. That is
+  valid only if (a) H does nothing but a `brif` on one `icmp`, (b) the body arm
+  passes the header params through unchanged, (c) `next` is positional to H's
+  params, and (d) the recomputed test and exit edge depend only on H params
+  (→ `next`), constants, or values defined outside the loop. Each is gated.
+- **The bug that cost the round:** Rakit's frontend lets a block read a
+  *dominating* block's values, so the loop body often reads the header's block
+  parameters (`v1`) directly instead of the body block's own params. The first
+  version bypassed the header and left `v1` pinned at the entry value →
+  **infinite loop**. Caught by `coretests::ptr::align_offset_zst` (100% CPU,
+  7+ min) after `./y.sh test`. Fix `header_values_escape`: reject the loop if
+  either arm's subgraph reads a header parameter or non-constant header result
+  (`dfg.inst_args` + branch args, aliases resolved). Constants are fine (same
+  every iteration). Minimal repro: the `--test` build of that test at
+  `-C opt-level=0` hangs; without rotation it passes.
+- **Second guard `header_has_effects`:** skipping the header also skips any
+  call/store/trapping op/volatile load in it, so only pure non-terminator header
+  instructions are allowed (modelled on `if_convert`'s `is_speculatable`).
+- **Compile cost removed:** the first version walked the successor subgraph for
+  every `brif` block (O(V²) on branchy functions; +6–9 ms CPU on `p2_mem`).
+  A loop header must be the target of some `jump`, so `run()` collects
+  `jump_targets` once and only walks headers in that set. Compile cost is now 0
+  (`p2_mem` 158/218 ms with and without rotation).
+- **Knobs:** `RAKIT_NO_ROTATE` (off switch), `RAKIT_ROTATE_ALL` (widen, off).
+- **Verification:** `./y.sh build` exit 0; `./y.sh test --sysroot rakit` →
+  65 suites / 25,368 passed / 0 failed (needs `./y.sh prepare` for
+  rand/regex/graviola first); `bench/allaxes.sh` 45/45 rows `ok` (output
+  validated vs LLVM). `p3` output byte-identical; `fib` disasm has no back-`jmp`.
+- **Negative result (do not re-try):** widening the gate to also rotate loops
+  with a conditional body but no call (`RAKIT_NO_ROTATE_BRIF`-style) is neutral
+  under interleaved A/B (p4 −0.7%, h_branch −2.1%, everything else ≤±0.4%, i.e.
+  drift). The earlier apparent p4 −5.2% was measurement drift between runs, not
+  the gate. Call-only stays the default; the `rotate_brif` knob was removed.
+
+## Session (2026-11-23) — `rakit-ir` removed, `rakit-opt` kept
+- **Decision:** delete the separate RIR crate and its CLIF↔RIR bridge. Keep
+  `rakit-opt` as the production pass layer; it owns the passes that produce the
+  real wins (rec_loop, store_forward, div_test, if_convert, unroll, sincos,
+  inliner).
+- **Evidence:** `RAKIT_NO_RIR=1` made `p3_calls` 93.8 → 56.8 ms. Isolating the
+  RIR passes showed `simplify` was the trigger: `RAKIT_NO_RIR_SIMPLIFY=1` gave
+  59.6 ms. p1/p2/p4–p9 were neutral. RIR changed `fib` so CLIF `rec_loop` no
+  longer matched.
+- **Removed:** `rakit-ir/` (IR, verifier, interpreter, tests, toy ISel/regalloc),
+  `rakit-opt/src/rir.rs`, `RirPass`, RIR inliner bodies, RIR tunables, custom
+  backend path, and the `rakit-ir` dependency.
+- **Kept:** `rakit-opt` pass manager, shared analyses, `passtime`, and all
+  first-party CLIF passes. `rakit-codegen` remains the generic optimizer/backend.
+- **Docs:** README architecture section rewritten; RIR knobs removed.
+- **Verification:** `./y.sh build` exit 0; `./y.sh test --sysroot rakit` 65
+  suites / 25,368 passed / 0 failed; `rakit-codegen` 202, `rakit-opt` 2;
+  regressions pass; heldout outputs match LLVM; allaxes p3 93.8 → 59 ms.
+
 # AGENTS.md
 
-Repository-specific notes for future sessions. Keep this file current.
+## Session (2026-11-24) — all-axes output validation, strict held-out args
+- **Bug fixed:** `allaxes.sh` timed discovered held-out programs without
+  checking stdout. `bench/validate.sh` now holds the shared step: `--capture`
+  runs L, `--compare` requires exit 0 and byte-identical stdout+stderr for U/M;
+  validation uses the same args as the timed runs. `measure.py --expect REF`
+  checks stdout+stderr on each warmup, every timed repetition, and one
+  post-measurement verification run. Timed repetitions must be captured too:
+  discarding them to `/dev/null` lets a zero-exit mismatch in a timed run pass
+  unnoticed. The later verification run is excluded from runs, medians, and
+  RSS. Only fully validated rows print runtime timings. Runtime failure rows
+  carry no runtime numbers; compile failure rows keep compile wall/CPU/RSS
+  (size `-`). Harnesses exit nonzero.
+- **Strict inputs:** all `bench/progs/h_*.rs` use `arg<T>(index, fallback)`;
+  a present-but-unparsable argument prints `invalid argument ...` and exits 2.
+  `INPUTS=100:65536` now fails `h_simd` validation instead of silently using 7.
+- **h_branch:** scales `threshold & 0xF` into the top nibble. Default inputs
+  7/11/13 now alternate arms (~5k/21k/60k transitions) instead of one low hit.
+- **measure.py:** CLI now `sys.exit(1)` when any warmup/rep fails or `--expect`
+  output mismatches. With `--expect`, an invalid result prints only the stderr
+  diagnostic, not a text timing summary; `--json` still carries `exit`,
+  `output_ok`, and `valid`.
+- **Verification:** build 0; regressions pass; `allaxes` h_branch/h_simd match
+  LLVM; negative mismatch/exit-7 and invalid-seed cases all return rc 1 with no
+  timing rows. Compiler suite unchanged (65/25,368/0).
 
-## What this is
+## Session (2026-11-23) — rec_loop effect guard, analysis cache, held-out harness
+- **Bug fixed:** `RecLoopPass` deleted base-case side effects. `try_match` only
+  checked the base block's return value; `rewrite` removes five blocks, so a
+  static store in the base block disappeared. `deleted_blocks_are_safe` now
+  rejects any non-matched call/load/store/trapping op or escaping value in the
+  removed blocks. Regression `bench/tests/t_rec_loop_effects.rs`: old guard
+  prints `55 false false`, fixed prints `55 true true`.
+- **Analysis cache is live:** `if_convert`, `sincos`, `unroll` (fcvt narrowing)
+  and `store_forward` now read `PassCtx::analyses` instead of rebuilding CFG/dom.
+  `if_convert` invalidates after each rewrite; `unroll` after forwarder collapse;
+  the pass manager invalidates after every pass.
+- **Held-out harness:** programs moved to `bench/progs/h_*.rs` (auto-discovered
+  by `allaxes.sh`), with small argv fallbacks. Rakit column uses
+  `env -u RAKIT_HOST_LLVM`; all backends get `--target <host>`. Mismatch/failed
+  validation rows are `INVALID`, never `ok`; timed-run failures set exit 1.
+  `measure.py` now reports failure if *any* rep/warmup fails. `h_branch` starts
+  below threshold and compares before updating, so both arms run.
+- **Verification:** build 0; 65 suites / 25,368 passed / 0 failed; regressions
+  pass; heldout all inputs match LLVM; allaxes 15 programs compile/run.
 
-`rmc` is an experimental ahead-of-time compiler for a small Rust subset. It emits
-x86-64 assembly directly, then assembles and links it in-process into a static
-ELF64 executable (`src/elf.rs`) against a freestanding assembly runtime (raw
-Linux syscalls, no libc, no LLVM, no external crates, and by default no `as` or
-`ld`). `--binutils` restores the old `as`+`ld` path. The `bench/` directory
-compares it against real `rustc`.
+> Historical notes below predate the RIR removal. Entries mentioning `rakit-ir`,
+> `RIR`, `RirPass`, or `RAKIT_RIR_*` are archival and no longer describe the tree.
 
-## Build and run
 
-```sh
-export RUSTUP_HOME=/workspace/.rustup          # toolchain lives here
-export PATH=/workspace/.cargo/bin:$PATH        # rustc/cargo are installed here
-cargo build --release --manifest-path compiler/Cargo.toml
+## Session (2026-11-23, Fase 2 step 19) — calls
+- `Inst::Call(Option<Value>, u32, Vec<Value>)` plus `Function.externals`
+  (`External { namespace, index, params, ret }`). Builder `call`.
+- Bridge imports/exports CLIF `Call` for `ExternalName::User` with 0/1 returns;
+  other external kinds or multi-returns are refused.
+- DCE keeps calls; verifier checks target/arity/types; interpreter reports
+  external calls as unsupported. Addresses passed to calls escape, so
+  `mem_forward`/SROA leave those slots alone.
+- Tests: 75 RIR (2 call) + 9 bridge; h23 (`f -> g`) prints 42 with RIR;
+  h20-h22 unchanged; `./y.sh build` exit 0.
 
-# compile a program
-./compiler/target/release/rmc bench/rust/fib.rs -o /tmp/fib
-/tmp/fib 30
+## Session (2026-11-23, Fase 2 step 18) — I128 memory
+- `Type::I128` and `Val::I128(u128)` added. Interpreter reads/writes 16 bytes;
+  `int_sem` rejects I128 arithmetic (no i64 representation).
+- `mem_forward`/`sroa` use 16-byte size; bridge maps CLIF `I128`.
+- Tests: 73 RIR (4 memory, 8 sroa) + 8 bridge; `./y.sh build` exit 0; h22
+  (`u128` array) prints 42 with `sroa fired`; h20/h21 unchanged.
 
-# inspect generated assembly
-./compiler/target/release/rmc bench/rust/fib.rs --emit-asm
+## Session (2026-11-23, Fase 2 step 17) — SROA
+- New `rakit-ir/src/sroa.rs`: promote non-escaping scalar slots with constant
+  load/store keys. Phi nodes are added as block params at dominance-frontier
+  joins, then a dominator-tree rename replaces loads and drops stores.
+- Skip dynamic addresses, load-before-store, overlapping access ranges, and
+  phis at the entry block. Remove slots with no remaining `StackAddr` and
+  renumber the rest.
+- Wire into `RirPass` after `mem_forward`/`optimize`:
+  `simplify -> optimize -> mem_forward -> optimize -> sroa -> optimize ->
+  div_test -> if_convert -> gvn -> licm -> optimize`.
+- Tests: 71 RIR (7 sroa) + 8 bridge; `./y.sh build` exit 0; h17-h21 outputs
+  unchanged (`30/24/11/11/42`).
 
-# full benchmark suite (writes binaries to /tmp/rmcbench)
-python3 bench/run.py
+## Session (2026-11-23, Fase 2 step 16) — liveness DSE
+- `mem_forward::dse` now uses byte-range liveness across the CFG:
+  per-block `used`/`defined`, `live-in`/`live-out` fixed point, then a
+  backward scan removes stores whose bytes are not live after them.
+- Dynamic store/load covers the whole slot. Stores overwritten later in the
+  same block or a successor are now removed; stores read in a successor stay.
+- Tests: 64 RIR (11 mem_forward) + 8 bridge; `./y.sh build` exit 0; h20/h21
+  unchanged (`11`/`42`).
 
-# benchmark suite, also recording the dated result to the repo
-python3 bench/run.py --markdown bench/RESULTS.md
+## Session (2026-11-23, Fase 2 step 15) — dynamic addresses
+- `mem_forward` now recognizes `Copy`, `Add` with constants, `Select`, and
+  `StackAddr + dynamic index`. `Const` and `Dyn` keys are matched separately.
+- A dynamic store kills all facts for its slot; a dynamic load disables DSE for
+  that slot. Constant stores are removed only without a dynamic load; dynamic
+  stores only when the slot has no loads.
+- Tests: 61 RIR (8 mem_forward) + 8 bridge; `./y.sh build` exit 0; h21
+  (`as_mut_ptr().add(i & 3)`) prints 42 and logs `mem_forward fired`.
 
-# differential test suite: rmc vs rustc on twin programs
-python3 tests/run.py -v
+## Session (2026-11-23, Fase 2 step 14) — store forwarding + DSE
+- New `rakit-ir/src/mem_forward.rs`: track direct `StackAddr` values and
+  `Copy` aliases, require non-escaping private slots and in-bounds accesses.
+- Forward `store` -> later `load` within and across blocks using a
+  must-analysis over predecessors; replace loads with `Copy`.
+- Remove stores whose byte ranges are never loaded anywhere (conservative
+  global DSE), then let `optimize` clean up.
+- Wire into `RirPass` after `simplify`/`optimize`:
+  `simplify -> optimize -> mem_forward -> optimize -> div_test -> if_convert
+  -> gvn -> licm -> optimize`.
+- Tests: 58 RIR (5 mem_forward) + 8 bridge; `./y.sh build` exit 0; h20/h19
+  print 11 and log `mem_forward fired`.
 
-# differential fuzzer: random programs vs rustc (reproducible seeds)
-python3 tools/fuzz.py --mode expr --n 500 --seed 1
-python3 tools/fuzz.py --mode stmt --n 500 --seed 1
-python3 tools/fuzz.py --mode opt --n 500 --seed 1
-python3 tools/fuzz.py --mode arith --n 500 --seed 1
-python3 tools/fuzz.py --mode nest --n 500 --seed 1
-python3 tools/fuzz.py --mode pat --n 500 --seed 1
-python3 tools/fuzz.py --mode order --n 500 --seed 1
-python3 tools/fuzz.py --mode shift --n 500 --seed 1
-python3 tools/fuzz.py --mode cast --n 500 --seed 1
-python3 tools/fuzz.py --mode assoc --n 500 --seed 1
-python3 tools/fuzz.py --mode ref --n 500 --seed 1
-python3 tools/fuzz.py --mode update --n 500 --seed 1
-python3 tools/fuzz.py --mode letdestr --n 500 --seed 1
-python3 tools/fuzz.py --mode fordestr --n 500 --seed 1
-python3 tools/fuzz.py --mode nestpat --n 500 --seed 1
-python3 tools/fuzz.py --mode arrpat --n 500 --seed 1
-python3 tools/fuzz.py --mode parampat --n 500 --seed 1
-python3 tools/fuzz.py --mode enumpat --n 500 --seed 1
-python3 tools/fuzz.py --mode atpat --n 500 --seed 1
-python3 tools/fuzz.py --mode tuple --n 500 --seed 1
-python3 tools/fuzz.py --mode intmeth --n 500 --seed 1
-python3 tools/fuzz.py --mode nestedfn --n 500 --seed 1
-python3 tools/fuzz.py --mode typealias --n 500 --seed 1
-python3 tools/fuzz.py --mode printfmt --n 500 --seed 1
-python3 tools/fuzz.py --mode ptr --n 500 --seed 1
-python3 tools/fuzz.py --mode char --n 500 --seed 1
-python3 tools/fuzz.py --mode semi --n 500 --seed 1
-python3 tools/fuzz.py --mode boolbit --n 500 --seed 1
-python3 tools/fuzz.py --mode localconst --n 500 --seed 1
-python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
+## Session (2026-11-23, Fase 2 step 13) — memory bridge
+- RIR: `StackSlot`/`StackSlotData`, `Function.stack_slots`, `Inst::StackAddr`,
+  `Inst::Load`, `Inst::Store` (scalar, constant offset); builder helpers.
+- Bridge `rakit-opt/src/rir.rs` imports fixed stack slots and
+  `stack_addr`/`load`/`store`/`load_no_offset`/`store_no_offset`; export
+  recreates slots and memory ops. Addresses are `I64`.
+- Interpreter: stack-slot arena with bounds checks; `Val::P` addresses.
+- Verifier checks slot range, address type, load/store types.
+- Passes stay conservative: GVN/LICM skip memory ops; if-convert rejects arms
+  with memory; DCE keeps loads/stores.
+- Tests: 53 RIR (3 memory) + 8 bridge; `./y.sh build` exit 0; h19 (array via
+  `get_unchecked`) imports, logs simplify/gvn, prints 11 like LLVM.
 
-# robustness / soundness: rmc must error cleanly, never crash
-python3 tools/fuzz.py --mode robust
-python3 tools/fuzz.py --mode reject
-python3 tools/fuzz.py --mode mutate --n 500 --seed 1
+## Session (2026-11-23, Fase 2 step 12) — LICM
+- New `rakit-ir/src/licm.rs`: finds natural loops from back edges + dominators,
+  requires a unique outside predecessor ending in `jump` to the header, and
+  hoists pure instructions whose operands are defined outside the loop and
+  dominate the preheader.
+- Skips div/rem/fdiv (speculation), loops without a preheader, and loops whose
+  preheader does not dominate the whole body. Runs to a fixpoint so invariant
+  chains hoist in successive rounds.
+- Shared `predecessors/rpo/dominators/dominates` moved into `cfg_util`; `gvn`
+  and `simplify` now use them.
+- `RirPass` order:
+  `simplify -> optimize -> div_test -> if_convert -> gvn -> licm -> optimize`.
+- Tests: 50/50 (6 div_test + 7 gvn + 7 if_convert + 15 ir + 4 licm +
+  11 simplify).
+- End-to-end: `k` (x*y only inside a loop) logs `licm fired` and prints 24;
+  `h` logs `gvn fired` + `licm fired` and prints 30, both identical.
+
+## Session (2026-11-23, Fase 2 step 11) — block merging in simplify
+- `simplify` now also merges a parameterless block with a single predecessor
+  when the predecessor ends in `jump` with no args: the block body is appended
+  to the predecessor and the block is removed (values stay defined).
+- Does not merge across a `brif` edge, a block with params, or a block with
+  multiple predecessors.
+- Tests: 46/46 (6 div_test + 7 gvn + 7 if_convert + 15 ir + 11 simplify).
+- End-to-end: `h` (loop), `pick` and `pick2` all log `simplify fired` with
+  `RAKIT_RIR=1 RAKIT_RIR_DEBUG=1`; outputs 30, `11 12 1`, `8 18`, identical.
+
+## Session (2026-11-23, Fase 2 step 10) — global GVN
+- `gvn` is now global: computes predecessors, RPO and immediate dominators
+  (Cooper-Harvey-Kennedy), inherits the expression table from the immediate
+  dominator, and only merges an expression when the first result dominates it.
+- Unreachable blocks fall back to local numbering.
+- Tests: 43/43 (6 div_test + 7 gvn + 7 if_convert + 15 ir + 8 simplify). New:
+  merge across dominating blocks, no merge across sibling branches, merge in a
+  join dominated by the entry.
+- End-to-end: a loop that computes `x*y` before the loop and again inside it
+  logs `gvn fired` with `RAKIT_RIR=1 RAKIT_RIR_DEBUG=1` and prints 30,
+  identical to normal.
+
+## Session (2026-11-23, Fase 2 step 9) — CFG simplify
+- New `rakit-ir/src/simplify.rs`: removes blocks unreachable from entry and
+  collapses empty forwarding blocks (`nop*; jump target` with no params),
+  redirecting both `jump` and `brif` edges; blocks/values are renumbered.
+- Forwarders whose `nop` result is used outside are left alone. The entry block
+  is never collapsed.
+- Shared `cfg_util::{remove_blocks, remove_values}` moved out of `if_convert`.
+- `RirPass` order:
+  `simplify -> optimize -> div_test -> if_convert -> gvn -> optimize`.
+- Tests: 41/41 (6 div_test + 5 gvn + 7 if_convert + 15 ir + 8 simplify).
+- End-to-end: `pick` with `RAKIT_RIR=1 RAKIT_RIR_DEBUG=1` logs
+  `simplify fired` (dead block removed) then `if_convert fired`; output
+  `11 12 1`, identical to normal.
+
+## Session (2026-11-23, Fase 2 step 8) — multi-value if_convert + local GVN
+- `if_convert` now handles joins/returns carrying any number of values
+  (including zero), not just one. Two identical `if`s compile to a two-param
+  join; the pass emits one `select` per join param.
+- New `rakit-ir/src/gvn.rs`: local value numbering keyed by opcode/type/operands;
+  duplicate pure instructions become `Copy` of the first result. `Hash` derives
+  added to `Type`, `BinOp`, `IntCc`, `FloatCc`.
+- `RirPass` order: `optimize -> div_test -> if_convert -> gvn -> optimize`.
+- Tests: 33/33 (6 div_test + 5 gvn + 7 if_convert + 15 ir). New: two-value
+  join, duplicate add/constant/select, different types, cross-block non-merge.
+- End-to-end: `pick2(c,x,y) = { let a = if c {x} else {y}; let b = ...; a+b }`
+  with `RAKIT_RIR=1 RAKIT_RIR_DEBUG=1` logs `if_convert fired` then
+  `gvn fired`, prints `8 18`, identical to normal.
+
+## Session (2026-11-23, Fase 2 step 7) — `if_convert` migrated to RIR
+- New `rakit-ir/src/if_convert.rs`: converts a two-way diamond (`brif` to two
+  short arms that `jump` to a common join or both `return`) into a `select` in
+  the head, then removes the arms and their now-dead values (block and value
+  indices are renumbered).
+- Conservative limits: arms have no params, one predecessor, <= 8 insts, no
+  div/rem/fdiv, and no arm-defined value is used outside the arms.
+- `RirPass` runs it after `div_test` and re-runs `optimize`.
+- Tests: 27/27 (6 div_test + 6 if_convert + 15 ir; new: simple join diamond,
+  head-value arms, return arms, skip division, skip params, skip large arm).
+- End-to-end: `RAKIT_RIR=1 RAKIT_NO_IFCONV=1` on
+  `if c { x + 1 } else { x + 2 }` logs `[rir] if_convert fired` and prints
+  `11 12 1`, identical to the normal build.
+
+## Session (2026-11-23, Fase 2 step 6) — narrow-type semantics + div_test
+- New `rakit-ir/src/int_sem.rs`: `width`/`mask`/`wrap`/`sign_extend`/
+  `shift_amount` plus shared `eval_bin`/`eval_icmp`. Values are zero-extended
+  bit patterns per type; signed ops sign-extend, shifts mask by `width-1`.
+- `interp.rs` and `opt.rs` now use `int_sem` for integers, so `I8/I16/I32`
+  arithmetic wraps and signed compares are correct in both execution and
+  constant folding.
+- `div_test` now covers `I8/I16/I32/I64` and computes a width-specific inverse
+  (`C^-1 mod 2^bits`) and threshold (`(2^bits-1)/odd`).
+- Tests: `cargo test --manifest-path rakit-ir/Cargo.toml` -> 21/21 (6 div_test
+  + 15 ir; new: narrow wrap/sign-extend, shift amount, I32 wrap, narrow
+  constant folding, narrow inverse, narrow div_test).
+- End-to-end: `RAKIT_RIR=1 RAKIT_NO_DIVTEST=1` on `u32 % 3` and `u8 % 3` logs
+  `[rir] div_test fired` for both and prints `1 2 4294967295 1 2`, identical
+  to the normal build.
+
+## Session (2026-11-23, Fase 2 step 5) — `div_test` covers even divisors in RIR
+- `rakit-ir/src/div_test.rs` now also handles `C = 2^s * odd` and powers of two
+  for `I64`: mask `x & (2^s - 1)` must be zero, plus the odd-divisor
+  multiply-compare; the two Bool tests combine with `select(a, b, false)` and
+  `ne` inverts with `select(is_zero, false, true)`.
+- The rewrite now inserts a prologue of new instructions and replaces the
+  original `icmp` with `Copy(rr, Bool, is_zero)`; `optimize` then DCEs the
+  `urem`.
+- Tests: 15/15 (the even/power-of-two test now asserts the rewrite fires for
+  `4`, `8`, `12` and for `ne` on `4`).
+- End-to-end: `RAKIT_RIR=1 RAKIT_NO_DIVTEST=1` on `x % 12 == 0` and
+  `x % 8 == 0` logs `[rir] div_test fired` for both and prints `1 2 1 1 2`,
+  identical to the normal build.
+
+## Session (2026-11-23, Fase 2 step 4) — `div_test` migrated to RIR
+- `rakit-ir/src/div_test.rs`: RIR port of the CLIF divisibility fold for `I64`
+  and odd `C > 1`: `icmp eq/ne (urem x, C), 0` -> `imul x, C^-1` +
+  `icmp ule` (and `select` for `ne`). `run()` resolves `Copy` chains and finds
+  the defining `urem`; `RirPass` calls it after `optimize` and runs `optimize`
+  again to DCE the now-dead `urem`.
+- Even divisors, narrower types and `brif`-on-remainder stay in the CLIF pass:
+  RIR `brif` takes `Bool`, and RIR has no `uextend`/Bool-`band` yet.
+- Tests: `cargo test --manifest-path rakit-ir/Cargo.toml` -> 15/15 (4 new:
+  odd `eq`, odd `ne`, even/power-of-two skipped, inverse sweep).
+- End-to-end: `RAKIT_RIR=1 RAKIT_NO_DIVTEST=1` (CLIF pass disabled) on
+  `fn f(x: u64) -> u64 { if x % 3 == 0 {1} else {2} }` logs `[rir] div_test
+  fired` + `[rir] optimized` and prints `1 2 1`, same as the normal build.
+
+## Session (2026-11-23, Fase 2 step 3) — RIR-only folds that fire end-to-end
+- `rakit-ir/src/opt.rs` now also folds, for integer types:
+  `x - x -> 0`, `x ^ x -> 0`, `x & x -> x`, `x | x -> x`, `icmp x, x` to
+  true/false per condition, `select(c, x, x) -> x`, and
+  `brif(c, b, args, b, args) -> jump b`.
+- Unit tests: `cargo test --manifest-path rakit-ir/Cargo.toml` -> 11/11
+  (4 new: icmp same operand, select same arms, bin same operand, brif same
+  target).
+- End-to-end: `RAKIT_RIR=1` on `x & x` / `x | x` logs `[rir] optimized` and the
+  binary prints the same output as the normal build (`1 2 0 0 5 6`). cg_clif
+  already folds `x ^ x`, `x - x`, `x << 0` and `if c { x } else { x }`, so only
+  `&`/`|` reach RIR here.
+- Debug: `RAKIT_RIR_DEBUG=1` also dumps the CLIF of `no-change` functions,
+  which is how the surviving `band`/`bor` were located.
+
+## Session (2026-11-23, Fase 2 step 2) — CLIF<->RIR bridge + optional `RirPass`
+- `rakit-opt/src/rir.rs`: `import(&Function) -> Option<rakit_ir::Function>` and
+  `export(&rir, &Signature) -> Option<Function>` for a conservative scalar
+  subset (constants, int/float binops, icmp/fcmp, select, block params,
+  jump/brif/return). Calls, memory, stack slots, globals and multi-result
+  instructions are refused, so unsupported functions are left untouched.
+- **Aliases are the first blocker**: cg_clif emits `vN -> vM` heavily. Without
+  `dfg.resolve_aliases` every real function fails to import (a value used in
+  `return` has no defining instruction). `lookup`/`map_value` resolve both ways.
+- **CLIF bools are `i8`**; RIR has a distinct `Bool`. `as_bool` inserts
+  `icmp ne c, 0` for `brif`/`select` conditions, so functions with `i8`
+  parameters import. A function *returning* a bool still fails the RIR verifier
+  (Bool vs I8) and is skipped.
+- `RirPass` runs first in the pipeline but is a no-op unless `RAKIT_RIR=1`.
+  `RAKIT_RIR_FORCE=1` re-exports even when the optimizer changes nothing (this
+  is how the export path is validated on real CLIF), `RAKIT_RIR_DEBUG=1` logs
+  per-function skip/no-change/roundtrip decisions.
+- Tests: `cargo test --manifest-path rakit-opt/Cargo.toml` -> 7/7 (5 bridge
+  tests: add round-trip, branch folding, block params, floats, unsupported
+  rejection). End-to-end: `RAKIT_RIR=1 RAKIT_RIR_FORCE=1` on a `while` loop and
+  a bool-parameter `if` gives output identical to the normal build.
+- The RIR optimizer only does constant folding, algebraic identities, branch
+  folding and DCE -- all already done by Cranelift's egraph -- so `RirPass`
+  usually reports `no-change`. This step delivers the bridge and the plumbing,
+  not a speedup.
+
+## Session (2026-11-23, Fase 2 step 1) — `rakit-ir` mid-level IR foundation
+- New pure crate `rakit/rakit-ir` (no dependencies): SSA IR (`ir.rs`), builder,
+  verifier (single definition, dominance, types), optimizer (`opt.rs`:
+  constant folding + algebraic identities + branch folding + DCE), and a
+  reference interpreter (`interp.rs`).
+- Values keep stable indices, so folding rewrites an instruction in place and
+  DCE turns dead instructions into `Inst::Nop`; no renumbering yet.
+- `cargo test --manifest-path rakit-ir/Cargo.toml` → 7/7 pass (integer/float
+  folding, branch folding, DCE, use-before-def rejection, block params/branch
+  args, icmp+select).
+- Not wired into the compiler yet: next step is the CLIF↔RIR bridge, then move
+  passes onto RIR one at a time.
+
+## Session (2026-11-23, later) — extract the optimization pipeline into `rakit-opt`
+- New crate `rakit/rakit-opt/` (package `rakit-opt`) owns the CLIF-level
+  optimization layer: `PassManager`, `Analyses` (CFG/dominator/loop, cached and
+  invalidated per pass), `tunables`, `passtime`, and the seven first-party
+  passes (inliner, rec_loop, store_forward, div_test, if_convert, unroll,
+  sincos).
+- `rakit/src/base.rs` now builds a `PassManager` and runs it, instead of calling
+  the passes ad hoc. The inliner stays out of the pipeline because it uses
+  `Context::inline`.
+- Moved files had `rustc_data_structures::fx` replaced by `std::collections`
+  aliases, and `pub(crate)` widened to `pub`, so `rakit-opt` has no
+  rustc-private dependency and can be built/tested on its own.
+- `Cargo.lock` regenerated (only the `rakit-opt` entry added). Verified:
+  `./y.sh build --sysroot rakit` succeeds, `dist/bin/rustc-rakit` compiles and
+  runs a sort/filter program (`sum=499500 div3=33`), and `RAKIT_PASS_TIME=1`
+  shows store_forward/unroll/if_convert/div_test running via the manager.
+- Branch `rakit-middle-end`, PR targets `replace-main-with-cgclif-experiments`.
+
+## Session (2026-11-23) — rebrand the modified fork to Rakit
+Only the **modified** backend was rebranded to **Rakit**; the upstream baseline
+(`cg_clif_upstream/`) is intentionally left untouched as the original cg_clif /
+Cranelift reference. The old engine, project, and IR tokens no longer appear in
+the modified tree's source, docs, or scripts.
+
+- **Layout**: the modified tree is `rakit/`; the reference tree stays
+  `cg_clif_upstream/` (original cg_clif + Cranelift, unmodified).
+- **Vendoring (modified tree only)**: `rakit/vendor/rakit-*` holds the full
+  codegen dependency set (`rakit-codegen`, `rakit-frontend`, `rakit-module`,
+  `rakit-native`, `rakit-jit`, `rakit-object`, plus the transitive
+  `rakit-bforest`, `rakit-bitset`, `rakit-control`, `rakit-entity`,
+  `rakit-codegen-shared`, `rakit-codegen-meta`, `rakit-isle`, `rakit-srcgen`,
+  `rakit-assembler-x64`, `rakit-assembler-x64-meta`), wired as relative path
+  deps. `cg_clif_upstream/` keeps its original registry dependencies.
+- **Package/binary (modified tree)**: `rustc_codegen_rakit`, dylib
+  `librustc_codegen_rakit.so`, wrappers `rustc-rakit` / `rustdoc-rakit` /
+  `cargo-rakit`, dist `rakit/dist`.
+- **Env knobs (modified tree)**: the old prefix is now `RAKIT_*` (e.g.
+  `RAKIT_NO_LANES`, `RAKIT_UNROLL_DEBUG`, `RAKIT_INLINE_MAX`); the IR-time
+  counter is `RAKIT_IR_TIME`.
+- **Manifests (modified tree)**: the old `[patch.crates-io]` was removed; deps
+  point directly at `vendor/rakit-*` via `path`.
+- **Build verified** with `nightly-2026-11-17` + `rust-src,rustc-dev,llvm-tools`:
+  `cargo check`/`cargo build --lib` clean in `rakit`, and
+  `./y.sh build --sysroot rakit` produced `rakit/dist/bin/rustc-rakit` plus
+  its Rakit-compiled std sysroot; a hello-world compiled and ran (`sum=5050`).
+
+## Session (2026-11-23) — Phase 3 backend + RIR gap closure (LANDED locally)
+- **Phase 3 implemented** in `rakit/rakit-ir/src/backend/`: `mach.rs`
+  (machine IR), `mod.rs` (`InstructionSelector`, `RegisterAllocator`,
+  `BackendError`), `isel.rs` (`RirSelector`), `regalloc.rs` (`LinearScan` with
+  liveness, graph coloring, spills), `exec.rs` (machine interpreter).
+  Object-safe traits; `RAKIT_CUSTOM_BACKEND=1` runs ISel+regalloc as a
+  validated alternate path (CLIF remains the production emitter).
+- **Gap closure**: `I128` arithmetic/compare in `int_sem` + interpreter;
+  direct/indirect calls, libcalls/known-symbol targets, multi-result calls in
+  RIR/bridge; `run_with` / `run_with_indirect` interpreter callbacks; SROA of
+  dynamic addresses into one-element slots (valid index is necessarily zero).
+  Verifier, DCE, cfg remapping, and `External` now handle all call forms.
+- **RIR default changed**: runs by default for **executable user crates**, but
+  skips std crates (`core`, `std`, `alloc`, `compiler_builtins`, `unwind`,
+  `rustc_*`) until the bridge is validated against the whole stdlib.
+  `RAKIT_RIR=1` forces on; `RAKIT_NO_RIR=1` forces off. Enabling it for std
+  still ICEs in `core`, so the skip is deliberate.
+- **Bug found/fixed**: `RirPass` overwrote `new_func.params` with the old
+  table after export; the new `ExternalName::User` indices then pointed at the
+  wrong names. `h26` (function pointer) segfaulted until that assignment was
+  removed. Multi-result support also needed `result_values()` in the verifier.
+- **Validation**: `./y.sh build` exit 0 (13–14 s); `cargo test` in
+  `rakit-ir` = 85 tests / 0 failed, `rakit-opt` = 11 / 0; `h20`–`h26` output
+  identical for default-RIR, `RAKIT_NO_RIR=1`, and forced `RAKIT_RIR=1`
+  (including `I128` array, direct call, libcall, and indirect-call programs);
+  `RAKIT_CUSTOM_BACKEND=1 RAKIT_RIR_DEBUG=1` logs `custom backend: 8 vregs, 8
+  regs, 0 spills` for `choose` in `h24`.
+- **Docs**: README bridge/SROA/I128/calls and Phase 3 sections updated.
+- **Push**: pending user-supplied PAT; branch `rakit-middle-end`.
+
+## Session (2026-11-22, "win everything") — why the remaining p1/p2/p3/p4/p8/p9 gaps are architectural
+Ran the full per-benchmark bottleneck hunt (with RAKIT dumps via `--emit=llvm-ir`,
+which writes `<out>.rakit/`). Every losing benchmark reduces to a deep compiler gap;
+no knob closes them. **Nothing new landed beyond the already-pushed `a51c34b`
+(simd_splat)**; tree verified clean.
+
+- **p3_calls (1.62x)**: `rec_loop.rs` ALREADY converts `fib` to a single-call loop
+  (verified in disasm: `cmp $2; jb base; call fib; sub $2; add; jmp`). The gap is
+  the **`format!("item-{}-xyz", i)` string machinery** (std::fmt, allocations),
+  not recursion. Hard (std-level).
+- **p9_u64f32 (1.12x)** and **p4_simd (1.53x)**: the `sin()`/`cos()` loops are
+  **multi-block**. Exact p9 shape: header `block2` (`icmp i<n; brif`) → `block6`
+  (`call sinf`) → `block8` (`icmp` bounds check, `brif` hot→`block10` /
+  cold→`block12` panic) → `block10` (store, `i++`, jump `block2`). `unroll::analyze`
+  requires a *single-block* body whose jump goes straight to the header, so it
+  rejects this (`then-arm is not body`). LLVM unrolls 4× for ILP on the
+  independent `sinf` calls. Closing needs a **multi-block unroller** (clone a
+  body block-set + remap inter-block args + remainder loop) — a real pass.
+- **p8_minmax (1.15x)**: already unrolled **3×** (`ATOM_FACTOR=3`); LLVM 4×. Both
+  use `cmovb`. rakit uses **memory-operand `imul 0x..(%rip)`**; LLVM hoists the
+  constant to a register. `ATOM_FACTOR=4` **regressed p7 by 32%** (33.7→44.4 ms)
+  and didn't help p8 — reverted. 3 is the tuned optimum.
+- **p1_arith (1.25x)**: memory-operand `imul`/`mulsd` + branchy saturating
+  `f as u64` (tested before, not worth it).
+- **p2_mem (3.0–3.2x)**: regalloc spills (partition 83 rsp refs / 1072 B);
+  SipHasher is scalar compute (3 rsp). Needs rakit regalloc work.
+- **Bottom line**: rakit wins p5/p6 (~11×), p7 (0.82×), ties p8/p9 (~1.1×),
+  loses p1/p2/p3/p4. Beating LLVM on *all* requires months of backend work:
+  **multi-block unroller + reassociator**, **bounds-check elimination**,
+  **regalloc improvements**, **autovectorization/sincos fusion**, and std-fmt
+  speedups. Not session-sized knobs; a multi-block unroller alone is a 2–4h,
+  correctness-critical change touching all code.
+
+## Session (2026-11-22, later) — `simd_splat` scalarization fixed (LANDED, p2 −3.5%)
+- **Found via disassembly of `hashbrown::raw::RawTableInner::find_inner`** (17% of
+  p2): `_mm_set1_epi8(tag)` / `Simd::splat` was lowering to **N individual byte
+  stores + a reload**, not a vector broadcast.
+- **Path**: `_mm_set1_epi8` → `Simd::splat` → `std::intrinsics::simd::simd_splat`,
+  lowered in `src/intrinsics/simd.rs`. The `sym::simd_splat` arm wrote the value
+  to *each lane* (`for i in 0..lane_count { place_lane(i).write_cvalue }`) = N
+  scalar stores. Replaced with a single `ins().splat(vec_ty, scalar)`.
+- **Two guards are required** (both learned from real panics):
+  1. `ret.layout().size.bytes() == 16` — the x64 backend only lowers `splat` for
+     the natural 128-bit vector types. `i8x8` (64-bit) and `i8x32` (256-bit) hit
+     `Compilation(Unsupported("should be implemented in ISLE: splat.i8x8"))`.
+     So `<= 16` is wrong; it must be `== 16`.
+  2. skip f16/f128 lanes (no RAKIT vector mapping → per-lane fallback).
+- **`fx.rakit_type()` returns None for SIMD types** (`rakit_type_from_ty` has no
+  SIMD arm — only scalars/pointers). The first attempt used it for the vector
+  type, so the guard `if let Some(vec_ty) = fx.rakit_type(...)` silently failed and
+  fell back to per-lane stores — the change looked correct but did nothing.
+  Use `crate::intrinsics::rakit_vector_type(tcx, layout)` instead.
+- **Measured** (`p2_slow`, 60x sort+hash loop): 2548 → 2387 ms (**−6.4%**);
+  `p2_mem` 48.1 → 46.4 ms (**−3.5%**). `find_inner` 891 → 640 B with the 16
+  byte-stores gone (0 `mov %sil` byte-splat stores left in the binary); also
+  `simd_contains` closure −540 B, `Mask::to_*` −273 B, `memchr` −119 B,
+  `prepare_rehash` −112 B. Binaries ~1.5 KB smaller.
+- **Correctness**: `./y.sh test --sysroot rakit` → **65 suites, 0 failed (incl.
+  portable-simd), exit 0**; p1–p9 byte-identical to LLVM; extbench crate tests
+  (`exttests.sh`, openlocationcode/holidays-rs/stdnum-rs) all **ok for L/U/M**.
+- **Post-fix p2 profile** (`p2_slow`): partition 32.9% (regalloc spills),
+  `raw_entry` 12.6%, `SipHasher::write` 11.5% (697 B, **only 3 rsp refs / 0 calls**
+  — pure scalar SipHash compute, not spill-bound, no easy win), `find_inner`
+  9.8% (was 17.4%), `find` 7.8%, `swap_if_less` 5.5%. The remaining p2 gap is
+  the partition's regalloc spilling (rakit-codegen) + scalar SipHash; both
+  need deep changes.
+- **Methodology gotcha (cost real time)**: editing the codegen backend does **not**
+  invalidate cargo's std cache — the `.so` is loaded dynamically and is not part
+  of the fingerprint, so `./y.sh build` recompiles libcore *incrementally* and
+  keeps the **old** lowering baked into std. Force it with
+  `rm -rf build/stdlib_target` before `./y.sh build` when validating a lowering
+  change. Also: `nm | grep find_inner | tail -1` picked a stale/second instance
+  and hid the win; diff function sizes (`nm -S` old-vs-new) to confirm.
+
+## Session (2026-11-22, later) — Experiment A (VarN aggregate promotion): NEGATIVE
+- **Goal**: keep the hot `PartitionState<u64>` (32-byte / 4-word aggregate, the
+  46%-spill source in `partition_lomuto_branchless_cyclic`) in registers instead
+  of stack slot `ss2`. rakit's `is_ssa` only accepted 1–2 word RAKIT types, so a
+  4-word aggregate always became `new_stack_slot`.
+- **Implemented** `CPlaceInner::VarN(Local, [Variable;4], u8)` + `word_aggregate_words`
+  (flat struct/tuple, all fields i64-scalar or i64-pair, 1..=4 words) +
+  `new_var_n` + arms in every `CPlaceInner` match (`to_cvalue`/`to_ptr`/`to_place`/
+  `force_to_stack`/`place_field`/`write_cvalue`/lanes/unsized), and `is_ssa`
+  extended to accept word aggregates. Committed… **no, reverted** (see below).
+- **Two real bugs found and fixed while building it** (kept in notes in case it
+  is retried):
+  1. `place_field` word index must use `layout.fields.offset(i)/8`, **not** the
+     sum of preceding field *sizes* — struct definition order ≠ offset order, and
+     the size-sum gave the wrong var → **segfault** (p2_mem printed nothing).
+  2. Restrict `word_aggregate_words` to `ty::Tuple` / `ty::Adt(def) if
+     def.is_struct()` — enums/unions have a single "variant" field and broke
+     `place_field` (`VarN field width` panic while compiling `core`).
+- **Result: NEUTRAL, reverted.** After fixing both bugs: p1/p2/p3/p4 all
+  byte-identical to LLVM, but `partition_lomuto_branchless_cyclic` spills are
+  **unchanged at 57** (`(%rsp)` refs), fn size 525 B unchanged, and A/B
+  (`RAKIT_NO_VARN` kill-switch) on p2/p3 shows no runtime or size change
+  (p2 48.0 vs 48.1 ms; size 4,145,792 vs 4,145,656 — VarN marginally *bigger*).
+- **Why it doesn't help**: the partition takes `&mut` of the `PartitionState`
+  (or its fields), so `analyze` marks it `NotSsa` or codegen `force_to_stack`s
+  it — the aggregate is materialised regardless of the VarN representation. The
+  VarN'd path is only reached for locals that are already `MaybeSsa`, and those
+  either aren't the hot ones or get materialised at the first `&mut`/address use.
+- **Conclusion**: the 3x p2 gap is **not** the aggregate-local representation.
+  Closing it needs either (a) lenient `&mut`-of-field handling in `analyze` so
+  only the borrowed field spills, or (b) register allocation quality inside
+  `rakit-codegen`. Neither is a quick `VarN` tweak. Do not re-attempt plain
+  VarN without first solving the `&mut` materialisation.
+- **Infra**: the toolchain was wiped mid-session again (no rustc); reinstalled
+  `nightly-2026-11-17` + `rustc-dev,rust-src,llvm-tools,rustfmt`. `./y.sh build`
+  rebuilds `.so` + std + `dist/bin` wrappers (~13 s incremental). If `dist/bin`
+  looks empty, re-run `./y.sh build` (not `prepare`) to recreate the wrappers.
+
+## Session (2026-11-22) — hot-callee inliner budget (LANDED, p2 −5%)
+- **Experiment "rebuild std 1-CGU" disproved the cross-CGU hypothesis.** std is
+  already 1 CGU (`ar t libstd-*.rlib` → 1 `.o`); the sort fns
+  (`partition_*`/`swap_if_less`/`select_unpredictable`) are monomorphized in the
+  **user crate** (mangled names end `_5p2big`); `-Ccodegen-units=1` on the program
+  changes nothing (still 65 calls); removing the `is_final` collection filter
+  changes nothing (all are `final=true`, already in `bodies`).
+- **Real root cause: the per-caller growth budget.** Inliner debug
+  (`reject_size id=35 size=48 cap=128 budget=5 self=36`) showed `sort9_optimal`
+  inlines ~6 `swap_if_less` then `budget=5` rejects the remaining 65 calls.
+- **Fix (`src/inliner.rs`): hot-callee budget.** Once a callee has been inlined
+  `>= HOT_CALLS` times into one caller, further inlines may draw on a separate
+  `HOT_BUDGET` even after the ordinary budget is spent. `HOT_CALLS=1`,
+  `HOT_BUDGET=1024`. Fields: `hot_budget` on `CguInliner`, `use_hot` in `inline`.
+- **Result**: p2 52.6 → 50.0 ms (**−5.0%**), 3.42× → 3.25×. p1/p3–p9 within noise
+  (≤±1.6%), p9 no regression. Size +0.3%, compile same. `./y.sh test` → **25368
+  passed / 65 suites / 0 failed**.
+- `HOT_BUDGET=4096` gave p2 −4.1% **and** p3 −5.3% but p9 +4.3% → rejected; 1024
+  is the safe point. So "p2 can't be improved" was wrong — sort inlining helps
+  ~5%; the rest of p2 is partition codegen (28%, already 0-call, regalloc-bound).
+- **Gotchas**: (a) compile-time measurements on this box are noisy — a p5
+  "compile +18%" vanished with 8 reps (79 vs 80); always use many reps +
+  min/median. (b) `CguBodies` is collected from *all* `codegened_functions` up
+  front (not order-dependent), so the inliner already sees every callee; the
+  blocker was purely the budget, not CGU or ordering. (c) `git checkout --`
+  on the two files fully reverted the debug experiments; the only landed change
+  is the ~20-line hot-budget patch in `inliner.rs`.
+- **Real-crate validation (extbench / crateworks)** — hot-callee ON vs
+  `RAKIT_NO_HOT_INLINE=1`: openlocationcode run −1.5%, holidays-rs −1.0%,
+  stdnum +1.4% (noise), compile ~neutral (−0.4%/+3.6%/−0.9%), size ~neutral. So
+  it generalizes and is **not** overfit to p2_mem. Contrast a prior
+  `MIN_GROWTH=1024` attempt (separate session) that gave p2 −8.7% but +15%
+  compile on real crates and was dropped: raising the *floor* for every caller
+  costs compile, whereas the hot budget only targets repeatedly-inlined callees.
+  `RAKIT_NO_HOT_INLINE` disables it (bisecting knob). extbench needs
+  `extbench/crateworks` cloned (`git clone --depth 1
+  https://github.com/cipansor/crateworks.git`).
+
+## Session (2026-11-22) — `rec_loop`: recursion→loop (LANDED, p3 −38%)
+- New pass `rakit/src/rec_loop.rs`: matches a self-recursive linear
+  recurrence `F(x) = if x < base { x } else { F(x-c1) + F(x-c2) }` and rewrites
+  it into a loop `acc=0; while x>=base { acc += F(x-c1); x -= c2 } return acc+x`.
+  This is what LLVM's middle-end `TailCallElim` does on LLVM IR; rakit has no
+  middle-end, so the naive two-call form reached RAKIT. Knob `RAKIT_NO_REC_LOOP`.
+- Wired in `base.rs` **before** `store_forward` (early). Matcher is strict:
+  exact shape, both calls must be **self-calls**, identity base, `iadd` of the
+  two call results; otherwise skipped.
+- **Gotcha**: the two self-calls use **distinct FuncRefs** (`fn0`/`fn1`, same
+  function, different sigs). Do NOT test `fr1 == fr2`; test
+  `is_self(fr1) && is_self(fr2)` via `func.params.user_named_funcs()[reff].index
+  == func.name`'s index. This was the first bug (pass silently didn't fire).
+- **Gotcha**: must call `crate::rec_loop::run` from `base.rs` — writing the module
+  and adding `mod rec_loop;` is not enough (first build "passed" but never ran).
+- RAKIT build recipe: `make_block()` does NOT insert into layout; `at_bottom`
+  debug-asserts `is_block_inserted`, so `layout.append_block` first. `jump`/`brif`
+  args need `BlockArg` (`value.into()`). `InstructionData::Return` has no such
+  variant — detect via `opcode() == Opcode::Return` + `arguments()`. `Call`'s
+  args via `arguments(&dfg.value_lists)`, not the `args` field. Add `..` to all
+  `InstructionData` struct patterns (they carry an `opcode` field).
+- **Result**: fib now 1 call/iteration (LLVM shape). p3_calls 92.4 → 57.2 ms
+  (−38%), M/L 2.60× → 1.61×. Other benchmarks unchanged. fib(0..40) identical to
+  LLVM; 9 bench progs identical; `./y.sh test` → **25368 passed / 65 suites / 0
+  failed**.
+- Answers the standing "why can't p3 be done" — it CAN; the transform is a
+  middle-end pass, not a backend one. This recovers one slice of it.
+
+## Session (2026-11-22) — loop-invariant load hoisting attempt (NEGATIVE, reverted)
+- Tried `licm_loads` pass: mark loads from private stack slots at
+  `stack_addr(slot)+const`, not stored in their loop, as `readonly+can_move+
+  notrap`, so Rakit's LICM hoists them out of the loop (target: the `Vec`
+  header `ptr`/`len` reloaded every iteration).
+- **It fires (binaries of p2/p4/p9 change) and is correct, but gives 0 runtime
+  win** (p2 median 54.4 on vs 53.8 off; p4/p9 reload counts identical).
+- **Root cause 1**: Rakit LICM refuses to hoist any load when the loop has an
+  *opaque store* (e.g. the `sinf` call in p9's loop):
+  `safe = !any_opaque_store && !store_bases.contains(base)`. A private-slot load
+  is still blocked even though the call cannot write the slot. Fixing this needs
+  a `licm.rs` patch (allow private-slot loads past opaque stores).
+- **Root cause 2 (decisive)**: the header reloads are NOT the bottleneck anyway.
+  p9's loop is 85% `sinf`; p4 is vectorization-bound; p2 is sort/hash codegen.
+  Removing two L1-hit reloads is invisible.
+- Pass removed; REPORT §26 records it. `./y.sh build` clean.
+- Lesson: before building a load-hoisting pass, confirm the loop is
+  memory-reload-bound (disasm + profile), not libcall- or vectorization-bound.
+
+## Session (2026-11-22) — bounds-check elimination attempt (NEGATIVE, reverted)
+- Tried a `redundant_branch` RAKIT pass: eliminate `brif (icmp CC x y)` when a
+  dominator has the same comparison and its matching edge dominates. Target: the
+  redundant `i >= len -> panic_bounds_check` inside `for i in 0..v.len()`.
+- **It fires on tiny cases but NOT on any of the 9 benchmarks (binary unchanged).**
+  Root cause found by dumping RAKIT: the loop guard compares against the `Range`'s
+  `end` value (threaded as a **block param**), while the bounds check compares
+  against a **separate** `v.len()` load — different SSA values even though equal.
+  Block-param substitution on the direct edge was added but still doesn't match
+  because the two length loads are not CSE'd.
+- **Prerequisite for a real bounds-check eliminator**: CSE/value-numbering of the
+  two length loads (`Range::end` vs `v.len()`) + proof no store to the Vec header
+  slot between them. That's alias/load analysis, not a branch pass. Don't retry
+  the branch-only approach.
+- **Also not worth it even if it worked**: `bcbig` is 134 vs LLVM 40 ms — a 4x
+  **vectorization** gap, bounds checks are ~10-20%. So bounds checks are not the
+  lever for p4/p2.
+- Pass removed; REPORT §25 records this. `./y.sh build` clean, 9 bench progs match.
+- Useful debugging trick: dump the loop RAKIT by iterating `layout.blocks()` +
+  `dfg.display_inst` in a pass gated on an env var — there is no built-in RAKIT
+  dump flag.
+
+## Session (2026-11-22) — sincos fusion (LANDED, p4 100→86ms)
+- **New pass `src/sincos.rs`** (runs in `base.rs` after `unroll`, has `module`
+  context): fuses `sinf(x)`+`cosf(x)` (and `sin`/`cos`) with the same argument
+  into one `sincosf`/`sincos` libcall — LLVM does this, rakit didn't. **p4
+  100→86 ms (14%)**, LLVM 59. Knob `RAKIT_NO_SINCOS`.
+- **Cross-block works**: sin's block need only **dominate** cos's block (not same
+  block). p4's sin/cos ARE in different blocks (bounds-check branches between),
+  so same-block-only would have missed it. Emit `sincos` at the sin position, load
+  both outputs, `detach_inst_results` + `change_to_alias` to rewire.
+- **BUG that cost the round**: the first version declared ONE func_ref from the
+  *first* pair's type. A function with BOTH a f32 pair and a f64 pair (p4 loop 1
+  does) then calls `sincos` (f64) for the f32 pair → wrong. 9 bench progs still
+  passed (p4 is f32-only); only a dedicated f32+f64 differential test caught it.
+  **Declare `sincosf` and `sincos` separately, pick per pair.** Lesson: never
+  assume a function has a uniform float type across sin/cos sites.
+- API gotchas: `Call { func_ref, args, .. }`; `args.get(0, &dfg.value_lists)`;
+  `dfg.resolve_aliases` (plural); `MemFlagsData::trusted()` (not `MemFlags::new`);
+  `StackSlotData::new(kind, size, align_shift)`; `func.create_sized_stack_slot`;
+  `module.declarations().get_function_decl(FuncId::from_u32(index)).name` to get a
+  callee's name (`FuncId` recovered from the `ExternalName::User` index).
+- **Tests**: `sincostest`/`scloop1`/`scloop2`/`sc1` (same-block, cross-block,
+  different args, f32, f64, in loops) → all byte-identical to LLVM. Suite 65/65.
+
+## Session (2026-11-22) — remaining-gap investigation + fcvt local rules
+- **fcvt narrowing extended** (`src/unroll.rs`): besides the dominator proof, two
+  always-sound LOCAL rules now fire: `fcvt_from_uint(uextend(narrow))` (zero-extend
+  → `< 2^32`) and `fcvt_from_uint(band(x, M<2^63))` (`≤ M`). **Important**: a
+  narrow *type* alone is NOT enough — `fcvt_from_sint` on a raw `i32` is wrong for
+  `u32 ≥ 2^31` (sign bit). Only `uextend` guarantees non-negative. Verified incl
+  `u32::MAX`, `4e9`, `& 0xFFFF` masks; suite 65/65.
+- **Where the remaining gaps really are (profiled this session — do NOT re-tread):**
+  - **p2 (54 vs 17)**: 26% `partition_lomuto`, 31% hashing, 10% `swap_if_less`,
+    all in the prebuilt **Rakit std**. Diffuse codegen quality (regalloc +
+    cross-CGU inlining + no vectorizer). Not a pass-sized fix.
+  - **p3 (94 vs 37)**: 84% in `fib`. LLVM rewrites `fib(n)=fib(n-1)+fib(n-2)` so
+    the **second** recursive call becomes a loop iteration → ~**half** the calls
+    (verified by disasm: L's loop calls fib(n-1), fib(n-3), …; M does both
+    fib(n-1) and fib(n-2) → tree is ~2×). This is a MIR/algorithmic transform,
+    out of scope for a RAKIT pass.
+  - **p4 (100 vs 57)**: LLVM uses `sincosf` (M emits separate `sinf`+`cosf`), and
+    the two remaining loops are vectorized by LLVM (M scalar). BUT the sin/cos
+    calls are in **different basic blocks** (bounds-check `je`/`jae` between them),
+    so same-block sincos fusion won't fire; cross-block fusion is much harder.
+    Also the per-iteration bounds checks (i<a.len()) aren't eliminated because M
+    can't prove a.len()==n. → vectorization + bounds-check-elimination wall.
+  - **p1 (101 vs 82)**: branchy saturating `f64→u64` (`cvttsd2si` pair) — the
+    documented negative-result area (branchless was slower; constants not
+    hoistable). Not fixable without hoisting the constants to RAKIT values first.
+  - **p8 (21 vs 19), p9 (37 vs 32)**: residual = rakit **regalloc** spills
+    (lane loop 6 carried values; p9 reloads a.ptr/a.len from stack each iter).
+- **sincos fusion is NOT worth attempting as a RAKIT pass**: declaring the
+  `sincosf` symbol needs `module`/`tcx` (available in `base.rs`, not in a raw
+  `&mut Function` pass), AND the calls are cross-block in real code. Abandoned.
+
+## Session (2026-11-22) — u64→float narrowing via dominator (LANDED)
+- **What**: `narrow_uint_fcvt` in `src/unroll.rs` rewrites `fcvt_from_uint(x)` →
+  `fcvt_from_sint(x)` when `x` is provably `< 2^63`. On x86-64 that turns a
+  branchy full-range u64→float sequence into a single `cvtsi2ss`/`cvtsi2sd`
+  (LLVM does this via its range analysis; Rakit can't see the bound).
+  p9_u64f32 **36 → 35 ms** (LLVM 31). Small win but **general**: every
+  `for i in 0..n { … i as f32/f64 … }` with small const `n` benefits.
+- **The trick is to NOT need loop analysis**: walk the `DominatorTree` up from
+  the conversion's block; if a dominator `brif`s on `icmp ult x, C` (or `ule`,
+  or `C > x` / `C >= x`) with `C < 2^63` and the **taken edge dominates** the
+  block, then `x ≤ C < 2^63` there → safe. Works for **multi-block bodies**,
+  which the `analyze`/`Plan` path (§19) rejects — and p9's `for i in 0..n` loop
+  IS multi-block (range-iterator lowering splits it), so the Plan-based approach
+  never fired; the dominator approach does.
+- **API gotchas**: `func.layout.inst_block(inst)` returns `Option<Block>`;
+  `Icmp` is `InstructionData::IntCompare { opcode, args, cond }` (NOT `Binary`);
+  `Brif { opcode, arg, blocks }` needs `..` in the pattern; `dom.idom(block)`
+  returns `Option<Block>`; build via
+  `rakit_codegen::flowgraph::ControlFlowGraph::with_function` +
+  `DominatorTree::new()` + `dom.compute(func, &cfg)`.
+- **Soundness**: only narrows when `C < 2^63` AND the true-edge dominates, so
+  `x ≤ C` holds on every path to the conversion. Exit blocks (where the guard is
+  false) are not dominated by the true-edge, so they're skipped.
+- **Knob**: `RAKIT_NO_NARROW_FCVT=1`. Debug: `RAKIT_UNROLL_DEBUG=1` prints
+  `fcvt x=… bound=…`.
+- **Tests**: `fcvttest.rs` (const bounds narrowed, dynamic bound falls back,
+  `(1<<40)..` i≥2^31 correct) → byte-identical to LLVM; all 9 bench progs match;
+  `./y.sh test` 65/65. This pass touches conversions everywhere in std, so the
+  full suite is the real gate — it passed.
+- **Remaining p9 gap (35 vs 31)** = per-iteration stack reloads of the array
+  ptr / len (rakit regalloc keeps loop-invariants on the stack), not the
+  conversion.
+
+## Session (2026-11-22, latest) — LCG lane transform (LANDED, p8 29→21ms)
+- **What**: new `apply_lanes` in `src/unroll.rs` rewrites `a = a*C + (i|1)` +
+  min/max-reduction loops into `F=2` independent lanes → **1 imul/iter** (was
+  2). p8_minmax **29 → 21 ms** (LLVM 18). Full suite 65/65 green.
+- **The key insight (non-obvious)**: LLVM uses an **even** lane factor so each
+  lane keeps a **fixed parity**; then `(i|1) = i + (lane even ? 1 : 0)` is
+  **linear** in the lane step, so the forcing term advances by a **constant add**
+  (`slope = F·Σ_{k<F}C^k`) instead of a per-step imul. Odd factors (3) can't do
+  this. `F_L(k) = fbase + lane_const[L]`, `fbase = iv·S = k·slope`.
+- **F=2 beats F=4** (21 vs 23 ms): F=4 carries 8 live values → spills; F=2
+  doesn't. F=6=22, F=8=24. Don't assume more lanes = better.
+- **The hard part was the exit, not the math.** rakit's exit block reads the
+  header params **by dominance with 0 args** (`brif block7(0 args), block8(0
+  args)`). So you cannot branch straight to the exit block. **Fix: branch the
+  lane loop's exit back to the *old header*** with `(iv=B, a=a_cur, mn)`; it
+  re-checks `iv<B` (false) and falls through to the real exit, which then reads
+  correct params. Works for any exit shape. This also means the old header
+  stays alive as a trampoline and the old body is simply dead.
+- **`a_cur` must be carried**: the lane body advances all lanes past `a_B`
+  before the header re-checks, so `a_B` is not recoverable from the lanes at
+  exit; carry it (set `a_cur = a_last` each step).
+- **Detection (`detect_lane`) is strict and conservative**: header params
+  exactly `(iv, a, mn)`; `a' = C·a + (iv|1)` (one `Bor imm=1` atom over `iv`);
+  `mn' = select(icmp(cc,l,r), arm1, arm2)` over `{a', mn}`; `iv` starts at 0;
+  `bound` **constant** and `% F == 0`. Anything else → returns false → the old
+  clone path runs. So extra loop state (n≠3) or a dynamic bound never risks
+  correctness, only forgoes the speedup.
+- **Constants (mod 2^64)**: `cpow[k]=C^k`; `pro_const[j]=Σ_{l<j}C^{j-1-l}(l|1)`;
+  `lane_const[L]=Σ_{j<F}C^{F-1-j}((L+j)|1)`; `slope=F·Σ_{k<F}C^k`. Verified by
+  hand for F=2,C=3 (const_1=6, const_2=12, F=8k+6).
+- **Testing that matters**: compile-time-constant bounds via a macro
+  (`for i in 0..4u64 {...}`) so the lane path actually fires; sweep bounds
+  `{0,1,2,3,4,5,7,8,12,16,20,100,1000,12345,30M}` (divisible → lane, else
+  fallback), min AND max, two multipliers, plus a case that **prints `a` after
+  the loop** (=a_B), non-MAX initial `mn`, non-1 initial `a`. A bound that is a
+  runtime variable does NOT trigger the path (bound must be `const_of`).
+- **Knob**: `RAKIT_NO_LANES=1` disables it. Debug: `RAKIT_LANE_DEBUG=1`.
+- **Commits**: detection → full transform → F=2 (4 commits). NOT yet pushed at
+  time of writing (needs the user's `repo` PAT; `GITHUB_TOKEN` is read-only).
+- **Remaining p8 gap (21 vs 18) = rakit regalloc spills**, not the pass.
+
+## Session (2026-11-22, later) — constant-bound guard + atom factor 3 (LANDED)
+- **Toolchain reset mid-session** (the documented failure): `$HOME/.cargo`,
+  rustc, cargo, rustup all gone while `dist/` survived. Recovery that worked:
+  `curl https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none`,
+  then `rustup toolchain install` (reads `rust-toolchain.toml` =
+  nightly-2026-11-17). The dist server DOES have 2026-11-17 (this sandbox's
+  clock matches the rust dist server). `./y.sh build` then rebuilt in ~12 s
+  (target/ survived).
+- **p8_minmax / p7_branchy remaining gap = the per-iteration guard**, not the
+  atom rebuild. `build_guard` now emits a **single `icmp ult(iv, limit)`**
+  against a constant when the trip count is constant (and `bound+last` can't
+  wrap); `limit = bound-last` (strict) or `bound-last+1` (`<=`), or 0 if
+  `bound < last`. Falls back to the old `band(no_wrap,last_ok)` for
+  non-constant bounds. Shared by `apply_partial` and `apply_reassoc`.
+- **Two dead ends, both measured and reverted (do not re-try):**
+  - Caching atom *values* in `build_affine` (share `(i+jδ)|1` across `pre[k]`):
+    **netral**. The O(factor²) cost is the *coefficient* multiplies
+    `C^k · a_j`, not the atom values.
+  - De-duplicating the body's own single-step `acc_next` against `pre[0]`
+    (remap body uses to `pre[0]`, make both branches use `pre[0]`): **netral**
+    (35.1 vs 35.0). The redundant multiply is not on the critical path.
+- **`ATOM_FACTOR` 2 → 3.** With the cheap guard the knee moved: p8 factor
+  sweep 2=31.4, **3=29.1**, 4=33.5, 6=39.3, 8=51.3 ms; p7 2=38.0, **3=35.4**,
+  4=45.1. Factor 4+ still loses to O(factor²) coefficient multiplies.
+- **Result** (full 3-way, `bench/allaxes.sh` CREPS=3 RREPS=7): p7 40.3→**36**
+  (LLVM 45), p8 35.0→**29** (LLVM 18). M beats LLVM on compile wall (most),
+  size (~12% smaller everywhere), and runtime p5/p6 (~10×), p7. p9 near-tie
+  (34 vs 30). p1/p2/p3/p4/p8 still lose on architectural grounds.
+- **Tests**: `./y.sh test --sysroot rakit` → **65 suites, 0 failed** (EXIT 0).
+  All bench outputs byte-identical to LLVM.
+- **Commits**: `253dc80` (cheap guard), `8e49f2b` (factor 3), + docs. NOT
+  pushed (token situation unchanged — needs a user-supplied `repo` PAT).
+- **p8 lane restructure is the real remaining fix**: LLVM uses 4 independent
+  lanes each advancing by `C^4` (O(f) imuls, full ILP); our `pre[k]` builds
+  every step from the header (O(f²) imuls). Matching it needs per-lane carried
+  state in the clones — a structural rewrite, out of scope for a safe change.
+
+## Session (2026-11-22) — atom-aware affine reassociation + div_test alias ICE (LANDED locally)
+- **Win**: loops of the shape `acc = acc*C + (i|1)` (LCG, p7/p8) used to be
+  rejected by the unroller for two reasons: (a) the other state is a
+  reduction (`min`) with no closed form, so `power` bailed, and (b) `i|1` is a
+  bitwise op, not a linear form. Both are now handled.
+- **Model** (`src/unroll.rs`): split into `Pure` (linear form, atom operand),
+  `Atom { op, imm, operand: Pure }` (a *recomputable* non-linear term such as
+  `i|1`), and `Affine { coeffs, c, atoms }`. `apply_step(step, state)` evaluates
+  the one-step update at `state`, rebuilding each atom from its operand's value
+  there (`subst_pure`) so `i|1` advances to `(i+delta)|1`. `build_affine`
+  materialises every atom independently from the header params, so atoms stay
+  off the carried `imul` chain.
+- **Equivalence for pure loops**: `power`/`compose` were refactored to use
+  `apply_step`; this is algebraically identical to the old composition
+  (`F^{k+1} = F_j ∘ F^k`), so already-handled loops are unchanged.
+- **Factors**: `ATOM_FACTOR = 2` (rebuilding atoms is O(factor^2), so a small
+  factor wins), `PARTIAL_FACTOR = 6` for pure affine reductions
+  (`RAKIT_PARTIAL` overrides). Sweep: atom loops best at 2, pure reductions at
+  6.
+- **Result** (`allaxes.sh`, full matrix in REPORT §19.5): `p7_branchy`
+  U=100→**M=42** ms (LLVM 46) — now faster than LLVM; `p8_minmax` 38→**35** ms.
+  Overall M now beats LLVM runtime on p5/p6 (6 vs 58 ms, ~9.7x) and p7, ties on
+  p9 (35 vs 31), is ~11-12% smaller than LLVM, and compiles p2 1.66x faster.
+  Verified output-identical to LLVM (differential test `t_atom`); full
+  `./y.sh test --sysroot rakit` → **65 suites, 0 failed, exit 0** (incl. regex,
+  rand, graviola, portable-simd, stdarch).
+- **Pre-existing ICE fixed** (`src/div_test.rs`): compiling `env_logger 0.9.3`
+  (a `regex` dev-dep) panicked in the egraph with
+  `index out of bounds ... index is 4294967295` (`Value::reserved_value()`).
+  Only `RAKIT_NO_DIVTEST=1` avoided it, so `div_test` was the cause — NOT the
+  atom work (ICE persisted with `RAKIT_UNROLL=1`). Root cause: `div_test::collect`
+  counted uses only via `InstructionData::arguments()`, which (1) excludes
+  branch/block-call args and (2) does not resolve value aliases (`v420 -> v399`,
+  which rakit emits heavily). A `urem` result used through an alias or as a
+  phi arg looked single-use, so `remove_inst` left a dangling reference. Fix:
+  resolve aliases when counting, count `branch_destination(...)` block args too,
+  and resolve aliases in `classify_use`. Purely conservative (only rejects more
+  candidates), so §18 results stand. `env_logger` now compiles clean.
+- **Debugging recipe that worked**: the `#[cfg(false)] PrintOnPanic` block in
+  `base.rs` (around line 221) prints the post-pass RAKIT of the panicking
+  function when flipped to `#[cfg(true)]`; the dump shows aliases as `vX -> vY`.
+- **Methodology note**: this ICE was invisible in earlier sessions because
+  `regex`/`env_logger` were never actually compiled — the external crate
+  download (`./y.sh prepare`) had not been done. Always run the full suite
+  including `regex` before claiming "0 failures".
+- **The unroller only fires on a compile-time-constant trip count.** A runtime
+  bound (`for i in 0..n` with `n` from args) disables both `unroll` and the atom
+  path entirely (atom/noatom binaries become byte-identical). All bench programs
+  that show wins (p5/p6/p7/p8) use constant bounds. `bench/tests/t_atom.rs`
+  therefore uses `const N`; its reduction states (min/xor/add) stop it folding
+  to a closed form so it actually runs and exercises the atom path.
+
+## Session (2026-11-20, latest) — `unroll` pass was quadratic (LANDED, `f6d2ae5`)
+- **The per-pass instrumentation had never worked.** `passtime::report()` had no
+  caller, and its accumulator was `thread_local!` while codegen runs on rustc's
+  worker threads, so every number it could have printed was zero. Fixed both:
+  `report("aot")` is now called from `codegen_crate`, and the accumulator is a
+  shared `static [AtomicU64; 5]`. Enable with `RAKIT_PASS_TIME=1`.
+- **First real numbers** (`p2_mem`, cgu.1): `store_forward=8.4ms unroll=18.9ms
+  inline=3.6ms collect=1.9ms if_convert=1.9ms`. `unroll` was the most expensive
+  pass, ahead of `store_forward` which does far more work.
+- **Root cause**: `collapse_forwarders` → `find_forwarder` rebuilt three
+  whole-function facts (incoming edge counts, edge sources, per-value reader
+  counts for `params_escape`) on **every successful collapse**. `p2_mem` does
+  1419 collapses, so the same function was rescanned 1419 times — quadratic in
+  the block count.
+- **Fix**: those facts moved into `struct Forwarders`, built once in
+  `Forwarders::new` and updated incrementally in `Forwarders::removed` (drop the
+  latch's edge, retarget the predecessor's edge to the latch's target). Trivial
+  block candidates are also filtered once, not per iteration.
+- **Measured**: `unroll` **18.9 → 2.4 ms** (7.9x), `collapse` sub-phase 18.8 →
+  2.7 ms, iterations 1419 → 1093.
+- **Tests**: `./y.sh test` → **25368 passed / 0 failed** (65 suites). p-suite
+  8/8 and s-suite 10/10 output-identical to LLVM.
+- **Note on remaining compile overhead**: mod is still ~13% slower than upstream
+  to compile `p2_mem` (145 vs 128 ms). That is the honest price of four added
+  passes, not a bug — `store_forward` is now the most expensive at 8–12 ms and
+  is linear in instruction count (178 funcs → 10.1 ms total). On programs that
+  do not trigger the passes the cost is zero.
+- **Push/PR**: the injected `GITHUB_TOKEN` is a read-only GitHub App token
+  (`ghu_`, "Resource not accessible by integration") and the OpenHands
+  credential helper returns empty, so `git push` and the PR API both 403. Both
+  the push and the PR edit succeed with a user-supplied `repo`-scoped PAT
+  (`ghp_…`) passed inline in the URL. Pass it inline rather than storing it in
+  the remote, then reset the remote:
+  `git push "https://irhasar:$PAT@github.com/irhasar/rmc.git" <branch>` followed
+  by `git remote set-url origin https://github.com/irhasar/rmc.git`.
+- **PR**: #10 (`replace-main-with-rakit-experiments` → `main`), head `fd9396a`,
+  `mergeable: true`, 888 files changed. Description updated with the §17
+  compile-time findings.
+
+## Session (2026-11-19) — small-switch compare chain (LANDED, `6cefd14`)
+- **Methodology trap (important)**: `cargo build` in a driver crate does NOT use
+  the Rakit backend. You must set `RUSTC=rustc-rakit` (with
+  `rakit/dist/bin` on PATH), or you silently benchmark LLVM. Tell-tale
+  sign: binary ~579 KB (LLVM) instead of ~1.63 MB (Rakit), and identical
+  md5 across tunable values. All §9 numbers in REPORT.md use the correct build.
+- **Disproved**: autovectorization is NOT the blur gap. LLVM with
+  `-Cno-vectorize-loops -Cno-vectorize-slp` gives 763 insts / **0 SIMD** and
+  still takes 1248 ms vs 1246 ms vectorized (551 insts / 71 SIMD). Also
+  disproved: `RAKIT_UNROLL` (1/4/16/128 → identical binary; the pass only
+  handles single-block constant-delta loops) and raising the inliner caps
+  (10380 vs 10359 ms, size grew).
+- **Root cause found**: `rakit_frontend::Switch::emit` picks `br_table` for
+  any contiguous case range, so `match i { 0=>r, 1=>g, 2=>b }` becomes a jump
+  table. Binary had **2714** jump-table sites vs LLVM 0.
+- **Fix** (`rakit/src/base.rs`, `SwitchInt`): ≤8 cases and discriminant
+  ≤64 bits → `icmp_imm_s` + `brif` chain. The 64-bit guard is REQUIRED:
+  `icmp_imm_s` takes an i64 immediate, so i128/f128 discriminants truncate
+  (that bug failed 13 coretests).
+- **Measured**: blur 10329 → 10004 ms (**-3.1%**), binary 1629168 → 1500000 B
+  (**-7.9%**), jump tables 2714 → 84. p1–p8 matrix did not regress (run 525 vs
+  528 ms, compile 715 vs 719 ms).
+- **Tests**: `./y.sh test --sysroot rakit` → **exit 0, 0 failures across 65
+  suites** (6021 tests). Output byte-identical to LLVM.
+- **Push**: `GITHUB_TOKEN`/`OH_GIT_CREDENTIAL_ACCESS_TOKEN_GITHUB` are read-only
+  (403). Use `GH_PAT` with the explicit helper reset:
+  `git -c credential.helper= -c credential.https://github.com.helper= -c "credential.https://github.com.helper=!f(){ echo username=irhasar; echo password=$GH_PAT; };f" push origin <branch>`
+- **Remaining gap** (~8.3x on blur) is `rakit-codegen` quality: loop
+  rotation / regalloc spilling (hot fn: 240 `(%rsp)` refs vs LLVM 66; LLVM
+  concentrates 60.6% of samples at one offset, Rakit spreads over 213).
+  Out of scope for this fork.
+
+## Session (2026-11-17) — trivial-leaf inliner exemption (LANDED, `4d046cc`)
+- **Root cause**: `MAX_CALLEE_USES = 3` applied to *all* callees, including
+  one-operation bodies. `<f32 as Mul>::mul`, `<f32 as Add>::add`, and
+  `__iterator_get_unchecked` (1 and 12-13 RAKIT insts) stayed out-of-line after
+  3 uses, so hot loops kept real calls, each forcing spill/reload around it.
+- **Fix**: leaves with `<= TRIVIAL_LEAF_INSTS` (16) insts are exempt from BOTH
+  the use cap and the growth-budget charge. Safe: one op, and a leaf has no
+  callees so no cascading; recursion still impossible. Knobs:
+  `RAKIT_INLINE_TRIVIAL_MAX`, `RAKIT_INLINE_NO_TRIVIAL` (A/B off).
+- **Threshold 8 is too low**: `__iterator_get_unchecked` is 12-13 RAKIT insts.
+  Bisect on `filter_symmetric_column` calls: 8/9/11 -> 8 calls; 13/16/32 -> 0.
+  Runtime 15.27 s (t=8) -> 12.80 s (t=16); 32 is a plateau. Default = 16.
+- **Measured** (image blur 2048px, same compiler binary, knob only):
+  22.323 s -> 12.790 s (**1.75x**), binary 1.647.648 -> 1.627.864 B, output
+  identical. `filter_symmetric_row`: 581 insts/37 calls -> 359/**9** calls,
+  now *smaller* than LLVM (446 insts/9 calls). LLVM still wins via `mulps`
+  (9 vs 0).
+- **Tests**: `./y.sh test --sysroot rakit` -> 25,368 passed, 0 failed.
+  `bat` + `tokei` rebuild and run; tokei output identical per-file (md5 differs
+  only by `reports` array order from hashmap iteration).
+- **No suite regression**: baseline vs final all within noise. p7_branchy
+  +9% is machine drift — the trivial-OFF config alone now measures 62 ms
+  where the old log said 55 ms.
+- **Corrects report 8.20**: that section claimed the remaining runtime gap was
+  "not the inliner, must be inside rakit-codegen". Wrong here — the
+  inliner IS a rakit pass and closed 42% of the blur gap. What remains in
+  rakit-codegen is (a) vectorization, (b) regalloc spilling (column filter
+  still 240 `(%rsp)` refs vs LLVM 66 with zero calls left).
+- **Docs**: REPORT.md 8.27 (this change) + 8.28 (final 3-way matrix).
+- **Gotcha**: `perf` is not installed in this container; use objdump/nm
+  symbol-size analysis instead of profiling.
+
+## Session (2026-11-18, latest) — if-conversion diamond → select/cmove (LANDED locally)
+- New pass in the fork: `rakit/src/if_convert.rs`. Collapses a short,
+  side-effect-free two-way diamond (`brif` head -> then/else -> common join)
+  into a `select` in the head, which Rakit lowers to `cmove`. Runs
+  **before** `unroll` (slot `IF_CONVERT` in `passtime.rs`; knob
+  `RAKIT_NO_IFCONV`, default ON). Fork commit `7374000` (+ `8f88af2` docs).
+- Two wins: a data-dependent in-loop branch mispredicts every iteration; and
+  the fork's `unroll` only widens a single-block body, so a diamond blocks
+  unrolling. Collapsing first gives the unroller its single block.
+- **Cost model is essential** (the key finding): `cmove` computes both arms, so
+  `is_cheap_to_speculate` rejects arms holding `FcvtToUintSat`/`FcvtToSintSat`
+  (long branchy sequence on x86) or `Udiv/Sdiv/Urem/Srem/Fdiv`. Without it, p1's
+  `f as u64` arm regressed p1 105 -> 112 ms; with it, p1 is neutral.
+- **Measured** (wall, 30M iters): `p7_branchy` (hash%7 arm) 102 -> **56** ms
+  (LLVM 44); `b1` (3-way cheap arms) 74 -> **61** ms (LLVM 60); p1/p4
+  (`f as u64` arm) neutral; small 4% loss only on a near-always-false condition.
+- **Tests**: `./y.sh test --sysroot rakit` -> 65 `test result: ok`, 0 failed.
+- **Deliverable**: `rmc_clone` subtree commits `341a286` (change) + `5bce6fa`
+  (docs) on `replace-main-with-rakit-experiments`; REPORT.md 8.22; new bench
+  programs `p7_branchy`, `p8_minmax`.
+- **PUSHED**: remote `replace-main-with-rakit-experiments` = `f084efe`; PR #10
+  head `f084efe`, `mergeable: clean`, base `main`. The injected `GITHUB_TOKEN`
+  (read-only GitHub App) and credential-helper token both fail; the push used a
+  user-supplied `repo`-scoped PAT (not stored).
+
+## Session (2026-11-18, latest) — affine unroll factor 8 → 128 (LANDED locally)
+- `rakit` head **`6951858`** "Raise the affine loop unroll factor to 128
+  with a checked step bound"; `rmc_clone` subtree commit **`193ec3e`** (PR #10
+  branch `replace-main-with-rakit-experiments`), **not pushed** (see below).
+- **Win**: reassociating an affine loop to closed form `S_k = M^k·S + c` removes
+  the loop-carried `imul` chain, and the win keeps scaling with the factor.
+  p5/p6 (300M iters): 61 ms @ f=8, 32 @ 16, 22 @ 32, 12 @ 64, **7 ms @ 128**,
+  4.6 @ 256, 3.3 @ 512, 2.4 @ 2048 (LLVM = 58 ms). Output identical to LLVM at
+  every factor; size +32 B, compile +0.4 ms. `UNROLL_FACTOR` default = 128.
+- **Latent overflow fixed**: the wide-path guard checks `iv + (factor-1)*delta`,
+  valid only while `delta*(factor-1)` does not wrap. Added `safe_factor(delta,
+  factor)` shrinking the factor until `delta*(factor-1) <= 2^62`; both sites now
+  `checked_mul` (was `wrapping_mul`). Large-step loops auto-use a smaller factor.
+- **Environment note**: mid-session the runtime wiped `~/.rustup` + `~/.cargo`
+  (no rustc anywhere). Reinstalled via rustup: `nightly-2026-11-17` +
+  `rust-src,llvm-tools`. `dist/bin/rustc-rakit` was intact and works after PATH
+  restore (`export PATH="$HOME/.cargo/bin:$PATH"` — the wrapper needs `rustc`).
+- **Final 3-way matrix** (RC=5/RR=9, `bench/fullbench.sh`; ms, MB, bytes):
+  | prog | rwall L/U/M | rcpu L/U/M | size L/U/M |
+  |------|-------------|------------|------------|
+  | p1_arith | 81/108/**105** | 82/108/**104** | 4.64/5.88/**4.40** MB |
+  | p2_mem | 17/157/**69** | 17/157/**69** | 4.64/5.94/**4.42** MB |
+  | p3_calls | 37/117/**98** | 37/117/**97** | 4.61/5.82/**4.33** MB |
+  | p4_simd | 56/157/**139** | 56/157/**139** | 4.64/5.89/**4.41** MB |
+  | p5_inline | 58/895/**7.3** | 57/892/**6.9** | 4.61/5.81/**4.32** MB |
+  | p6_scalar | 58/905/**7.4** | 57/905/**7.0** | 4.61/5.81/**4.32** MB |
+  Compile: M ≈ U (noise) and both ~1.7× faster than LLVM on p2. Size: M ~5%
+  smaller than LLVM, ~25% smaller than U.
+- **Root cause of the *remaining* runtime gaps (NOT autovectorization).**
+  Disabling LLVM's vectorizer (`-Cno-vectorize-loops -Cno-vectorize-slp`) barely
+  changes LLVM's times (p4 55.4 → 57.2 ms), so the gap is deep scalar codegen:
+  - p4 trig: LLVM unrolls the `sinf` loop 6× for ILP on the calls (and fuses
+    `sin`+`cos` of the same arg into one `sincosf`); M calls `sinf`/`cosf` once
+    per iteration. 2.5× even for sin-only (`trig1`: L 30.9 / M 77.0 ms).
+  - p2 mem: LLVM fully inlines the hashbrown SSE2 probe into `main`; M leaves it
+    out of line (`find_insert_index_in_group` etc.). LLVM's `main` has 9 calls,
+    M's has 12.
+  - p3 fib: LLVM converts the double recursion to a loop; M keeps recursion.
+- **Levers tested and found neutral** (do not re-try without new data):
+  `-Ctarget-cpu=native`; `RAKIT_INLINE_MAX` 16/256; aggressive inliner
+  (`INLINE_USES=100 INLINE_MAX=200`) → p1 108→105, others flat; Rakit
+  `opt_level=speed` vs `speed_and_size` (no difference); clone-based body
+  duplication on multi-block bodies (does not fire — `analyze_affine` requires a
+  single-block body, so trig/sin loops are untouched).
+- `./y.sh test --sysroot rakit` → 3011 passed / 0 failed (before the reset).
+- **Push BLOCKED**: `irhasar/rmc` rejects every credential available in this
+  environment (403 `Resource not accessible by integration`). Both the injected
+  `GITHUB_TOKEN` (GitHub App installation, read-only) and the OpenHands
+  credential-helper secret are rejected. To land, push
+  `replace-main-with-rakit-experiments` with a user-supplied `repo`-scoped PAT;
+  PR #10 then updates in place. Local commits `6951858` (mod) / `193ec3e` (subtree)
+  are ready.
+
+## Session (2026-11-18) — inliner growth cap (LANDED locally)
+- `rakit` head **`41dc347`** "Bound inliner growth by caller size; speed up
+  dead-store removal".
+- **Root cause of the p2 compile gap vs U**: the inliner grew RAKIT by up to 62%
+  (14449 → 23383 insts on p2_mem). Every later Rakit pass then walks the
+  larger function, so the whole codegen slows down. This was the *entire* gap.
+- **Fix**: cap the instructions a caller may absorb to a fraction of its own
+  size. New tunable `RAKIT_INLINE_GROWTH` (default 50%), clamped to
+  `[MIN_GROWTH=64, INLINE_BUDGET=512]`. `CguInliner::new` now takes `&Function`
+  (reads `caller.dfg.num_insts()`); `base.rs` passes `&context.func`. Pareto
+  knee at 50%: p2 compile 139.9 → 135.3 ms, runtime 61.3 → 67.0 ms.
+- `store_forward::drop_dead_stores` now buckets loads per stack slot, so a store
+  is compared only against reads of its own slot (was O(stores × loads)).
+- **Dead ends measured and reverted** (do not re-try without new data):
+  - loop-only (hot-path) inlining via `LoopAnalysis`: worse on *both* axes
+    (p2 compile 139.8 vs 138.9 ms, runtime 69.3 vs 66.4 ms). Removed entirely.
+  - one-level inlining (`visit_callee: false`): no compile win, hurts runtime
+    (p2 69.3 → 74.5 ms). Kept `visit_callee: true`.
+  - `-Ccodegen-units` / `-Zthreads`: threading hurts at this scale (p2 only has
+    2 CGUs on a 4-core box, so there is little to overlap).
+- **PUSHED** (2026-11-18, later session): `replace-main-with-rakit-experiments`
+  is at `b521842` on the remote; PR #10 head is `b521842`, `mergeable: clean`,
+  base `main`. The earlier credential blocker was worked around with a
+  user-supplied `repo`-scoped PAT (used only for the push/PR edit; not stored).
+- `./y.sh test --sysroot rakit` → **3011 passed / 0 failed** (+596 core benches).
+- `REPORT.md` §8.16–8.17 and `bench/fullbench.sh` record the final matrix
+  (RC=11/RR=11).
+
+## Session (2026-11-18) — pass cost + SIMD lane ICE fix
+- `rakit` head `97617a1`; `rmc_clone` subtree head `7249d45`.
+- New `src/tunables.rs`: every env knob read once via `OnceLock` (passes run per
+  function; `std::env::var` locks a global map each call).
+- `store_forward` rewritten: one `analyze()` setup walk instead of three, and a
+  single reverse-postorder sweep instead of a worklist dataflow (9.2ms → 5.1ms).
+- New opt-in pass accounting: `src/passtime.rs` (`RAKIT_PASS_TIME=1`) and
+  `src/rakitprof.rs` (`RAKIT_IR_TIME=1`).
+- **Fixed the pre-existing SIMD-lane ICE**: `value_lane`/`value_typed_lane`/
+  `value_lane_dyn` assumed a `ByRef` value and hit `unreachable!()` for the
+  register-resident `ByVal` vector introduced by `a9d182a`; they now spill via
+  `force_stack`. `./y.sh test` → **3011 passed / 0 failed** (+596 core benches);
+  the `jit/aot.std_example` ICE is gone.
+- `REPORT.md` §8.13–8.15 and `bench/fullbench.sh` record the full three-way
+  matrix (RC=7/RR=9).
+- **Push still blocked**: `irhasar/rmc` rejects every available credential (403
+  `Resource not accessible by integration`). Commit `7249d45` is local only; to
+  land it, push `replace-main-with-rakit-experiments` with a `repo`-scoped PAT
+  (updates PR #10 in place).
+
+## Repo purpose
+Experiments comparing Rust codegen backends: LLVM (`rustc`) vs
+cg_clif upstream (`rustc_codegen_cranelift`) vs a modified Rakit fork.
+
+## Layout
+- `REPORT.md` — findings, numbers, root causes, recommendations.
+- `build.sh` — rebuilds the modified Rakit backend + its Rakit std sysroot.
+- `cg_clif_upstream/` — pristine cg_clif (commit 42ac63e), unmodified.
+- `rakit/` — fork with the modifications (see commits
+  `b6c94e4`…`9ea4bbe`).
+- `bench/` — harness:
+  - `allaxes.sh` — **canonical all-axes 3-way harness** (LLVM / cg_clif
+    upstream / Rakit modified). Every run MUST report all of these, per backend
+    and per program; a benchmark is not complete without all of them:
+    - compile: **wall time**, **CPU time** (user+sys), **peak RSS**, **artifact
+      size** (bytes)
+    - run: **wall time**, **CPU time** (user+sys), **peak RSS**
+    Do not report a subset. `RREPS`/`CREPS` control repetitions.
+  - `compare3.sh` — 3-way benchmark across 5 sysroot configs; prints
+    `C`=compile, `S`=size, `R`=run metrics (including peak RSS).
+  - `sizes2.sh` — sizes across opt-levels and stripped.
+  - `measure.py` — wall/CPU/peak-RSS via `os.wait4` rusage.
+  - `progs/p1..p6*.rs` — workloads (p5 inline, p6 scalar are the decisive microbenchmarks).
+
+## Benchmark reporting rules (MANDATORY)
+When comparing backends, always report the **full matrix**, never a partial one.
+For each backend (LLVM / cg_clif upstream / Rakit modified) and each program,
+record and present:
+
+**Compile**
+1. compile wall time (ms)
+2. compile CPU time = user+sys (ms)
+3. compile peak RSS (MB)
+4. artifact size (bytes), plus section sizes (`.text`, `.data.rel.ro`,
+   `.rodata`, `.eh_frame`) when relevant
+
+**Run**
+5. run wall time (ms)
+6. run CPU time = user+sys (ms)
+7. run peak RSS (MB)
+
+Correctness: every backend's stdout must match LLVM's (or match the expected
+value) before its numbers count. A run with `exit != 0` or a compile failure is
+reported as such, never silently dropped.
+
+Use `bench/allaxes.sh` as the single source of truth so no axis is ever omitted.
+Add new programs under `bench/progs/` so they are picked up automatically.
+
+## Build environment
+- Toolchain: `nightly-2026-11-17` (must match, rakit pins it).
+- Need `rust-src` and `llvm-tools`. `$HOME/.cargo/bin` on PATH.
+- Build: `build.sh` → `rakit/dist/bin/rustc-rakit`.
+- Rebuilding Rakit std takes ~1–2 min incremental.
+- **The toolchain is not always present.** Some sandbox restarts come back with
+  no `rustc`, `cargo`, `rustup`, or `$HOME/.cargo` at all (`find / -name rustc`
+  returns nothing), while the prebuilt `dist/` trees survive. Measurements that
+  need a fresh `rustc` then cannot be reproduced; the prebuilt binaries under
+  `rakit_{mod,upstream}/dist/bin/rustc-rakit` still run. Check this before
+  planning a rebuild, and read numbers off `bench/out/` artifacts instead
+  (`stat -c%s` per program sums to the same totals the report cites).
+- Git remotes may prompt for credentials and hang for the full timeout. Push with
+  an explicit token URL and `-c credential.helper=''` rather than letting the
+  prompt block; then `git update-ref refs/remotes/origin/<branch> <sha>` to keep
+  the local remote-tracking ref honest, since `git fetch` will not refresh it.
+- API writes to PRs fail with `Resource not accessible by integration` under the
+  injected `GITHUB_TOKEN`; a user-supplied PAT is required for `PATCH /pulls/N`.
+
+## Key facts learned
+- Rakit is **Apache-2.0 WITH LLVM-exception**; forking/reworking is fine.
+- rakit compiles ~20–45% faster than LLVM but produces ~26% larger binaries
+  and runs 2–9× slower.
+- **Size root cause:** `rakit-object` named every function section
+  `.text.subsection` and every data object `.data.rel.ro.subsection`; the linker
+  merges same-named sections so `--gc-sections` could not drop dead code.
+  Fix: name sections after the linkage symbol (`add_subsection(kind, decl_name)`)
+  and set `builder.per_data_object_section(true)`. Result: −15.6% raw, −26.5% stripped.
+- **Runtime root cause:** rakit does not use Rakit's `Inline` API (the
+  trait docstring names rakit explicitly), and MIR locals stay in stack slots
+  (`add (%rax),%rdx` / `mov %rdx,(%rsp)` per loop iteration) with no unrolling/ILP.
+  `-Zinline-mir=yes` grows functions but does not speed up runtime on its own.
+- With LLVM-built std, rakit's binary size matches LLVM, proving the size gap
+  comes from Rakit-built std and the runtime gap from the backend itself.
+
+## Modifications landed in `rakit` (beyond upstream)
+- `b6c94e4` per-symbol sections (size −15.6% raw, −26.5% stripped).
+- `7ddf2d4` **SROA**: a scalar local that is only *shared*-borrowed is kept in a
+  register; a stack slot is materialized lazily at the first real address use
+  (`CPlace::to_ptr` → `force_to_stack`). Fixes the decisive `println!("{}", acc)`
+  regression (p5/p6 894 ms → 356 ms) without regressing p2_mem.
+- `2ddb545` **RAKIT inliner** (`src/inliner.rs`): per-CGU, inlines small (`≤64`
+  RAKIT insts) *final* callees with a 512-inst budget. Guardrails: no self-inline,
+  each callee at most once per caller, and **skip callees that reference any
+  `global_values`** — Rakit's `inline_one` does not remap them and the
+  resulting object file fails to link (`R_X86_64_TLSGD out of range`).
+  `RAKIT_INLINE_MAX=0` disables it (bisecting knob).
+- `9ea4bbe` **RAKIT affine-reassociation loop pass** (`src/unroll.rs`): recognises a
+  canonical counted loop, derives the affine state update `S' = M·S + c` from the
+  body, composes it `factor` times in closed form, and rewrites the back edge so
+  one header check advances the whole state by `factor` iterations at once, with
+  a guard that falls back to a single step for the tail. Exact modulo 2^64
+  (iadd/imul wrap). Turns p6 from 902 ms → 61 ms (LLVM 58 ms). A body-duplicating
+  unroller is also present but **off by default** (`RAKIT_UNROLL_CLONE`): it is
+  correct but slower, because duplicating a body does not shorten the carried
+  chain. Knob: `RAKIT_UNROLL` (default 8).
+- **NEW** `src/store_forward.rs` **RAKIT stack store→load forwarding + dead-store
+  elimination**: forwards a `store` into a private (non-escaping) stack slot to
+  every later `load` of the same address, aliases the load result to the stored
+  value and removes the load; then deletes stores whose bytes no surviving load
+  reads. This is the real lever for p5/p6 (365 ms → 63 ms). It must run **before**
+  `unroll`, because the affine loop pass rejects any body that still touches
+  memory — the store/load round-trip rakit emits for an `Option`/iterator
+  otherwise blocks the unroll. Knob: `RAKIT_NO_STORE_FWD`.
+  - Why it is needed: Rakit's egraph only value-numbers loads that are
+    `readonly`, `notrap` and `can_move`. A store to an explicit stack slot is not
+    `readonly`, so a `store`/`load` round-trip of the same slot survives into the
+    machine code, and inside a loop it lands on the carried dependency chain.
+  - Soundness: only slots whose address is *never* used as anything but the
+    address operand of a load/store are touched (`private_slots`), so no call or
+    indirect store can observe the slot. Volatile and atomic accesses are skipped
+    (a volatile store has no `Load`/`Store` `InstructionData`, and `store` to a
+    private slot cannot be volatile because the address never escapes).
+  - Overlapping (partial) stores are not forwarded: only an exact
+    `(slot, offset, type)` match is.
+  - **Miscompile fixed** (`343ff3f`): `private_slots` scanned only
+    `InstructionData::arguments()`, which excludes block-call (branch)
+    arguments. rakit threads a stack address through a block parameter (a phi),
+    e.g. `jump block9(v29)` with `v29 = stack_addr ss4` and a later `load v42`;
+    that reader was invisible, so `drop_dead_stores` deleted the store the load
+    depended on. The BTreeMap insert path in libstd then read uninitialised
+    memory and segfaulted (`std::process::Command::spawn`, `BTreeMap::insert`).
+    Fix: treat any stack address that reaches a branch argument as escaping.
+    Repro: `std::process::Command::new("true").env("c","d").spawn()`, and a
+    64-entry `BTreeMap<OsString, OsString>` insert loop. Both now exit 0 and
+    match LLVM output.
+  - **Cross-block forwarding** (`43a30ac`): the pass was block-local, so a store
+    in one block and the load reading it back in a dominated successor were never
+    connected — yet rakit materialises aggregates *across* control flow (a
+    tuple assigned in both arms of an `if`/`else` and read after the merge). In
+    p2_mem alone there are 348 such cross-block round-trips. Added a
+    must-analysis dataflow (`cross_block_entry`): a store fact reaches a block
+    only if *every* predecessor agrees on the exact same SSA value, which makes
+    the value well defined at the merge and dominating. The entry block is
+    seeded empty because it is also entered from outside the function, an edge
+    the CFG does not model. Result: find_inner stores 31→24, loads 13→12; binary
+    size −2% more. Verified by rebuilding the whole std sysroot with the pass on
+    and re-checking every program output against LLVM.
+- `38923c0` **SIMD 128-bit constants → `vconst`** (`src/constant.rs`). A 16-byte
+  read-only, pointer-free, fully-initialised `ConstValue::Indirect`
+  (`Simd::ZERO`, splat masks, `_mm_set1_*` results) used to become an anonymous
+  global plus a `load`. Now it lowers to a single `vconst`. Two effects: removes
+  a memory round-trip on the hot path, and — the important one — removes the
+  `GlobalValueData::Symbol` that blocks the inliner (it does not remap
+  `ExternalName`). `_mm_*` call sites in `p2_mem` drop 31→3; the residual 3 are
+  cross-CGU (`hashbrown::find_inner`).
+- `0e6c2f0` **128-bit SIMD copy via one vector load/store**
+  (`src/value_and_place.rs`). Writing a by-ref 128-bit SIMD value into a memory
+  place fell through to `emit_small_memory_copy`, splitting 16 bytes into two
+  `i64` loads and two `i64` stores. rakit bounces every SIMD op through such a
+  slot, so the bitcast `__m128i → Simd<i8, 16>` alone was 1 store + 2 loads + 2
+  stores. Now a single 16-byte vector load+store. Wider vectors (`__m256i`
+  without AVX) have no single store and keep the `memcpy`.
+- `8ff4779` **cross-type same-size vector store→load forwarding**
+  (`src/store_forward.rs`). The pass only matched a load to a store of the
+  *exact same* RAKIT type. A SIMD bitcast (`__m128i ↔ Simd<i8, 16>`) compiles to
+  a store as one lane type and a load back as another, so those round-trips
+  survived to machine code. When byte sizes match and both types are vectors,
+  the stored value is now forwarded through a single `bitcast`; the target
+  endianness is threaded in from the ISA because Rakit's verifier requires
+  explicit endianness when lane counts differ. `as_i8x16` becomes one
+  `bitcast.i8x16`. p2_mem 110→99 ms; size 4.41 MB (LLVM 4.64 MB).
+- `c2e292b` **inline callees that reference globals** (`vendor/rakit-codegen-0.137.0`,
+  `src/inliner.rs`). Rakit's inliner copied a callee's `GlobalValueData`
+  verbatim, including `GlobalValueData::Symbol`, whose `ExternalName` indexes the
+  *callee's* `user_named_funcs`/`ext_funcs` tables. Those indices were never
+  translated, so inlining a callee that referenced a const/static/thread-local
+  corrupted the caller (out-of-range `R_X86_64_TLSGD`). rakit worked around it
+  by refusing to inline any callee with a non-empty `global_values`, which
+  blocked the hot small helpers (`core::hash::sip`, the branchless sort
+  partition closure). Fix: vendor rakit-codegen and translate the symbol's
+  user name while copying global values (`translate_symbol_name`), reusing the
+  same caller-side mapping `create_user_external_name_refs` installs — done
+  inline there because global-value copying runs first. Also drop the
+  one-inline-per-callee limit (`MAX_CALLEE_USES`, `RAKIT_INLINE_USES`): the
+  partition closure is called 3× and was left out of line; the call-graph budget
+  still bounds recursion. Effect: `slice::sort_unstable` quicksort calls 11→3,
+  srt 28.5→23.1 ms; p2_mem 74.5→59 ms. TLS/atomics/statics verified correct.
+
+## What did NOT work / open leads
+- **p2_mem runtime gap (fixed)**: the 8× gap (125 ms vs LLVM 16 ms) came from
+  rakit emitting the `core::core_arch::x86::sse2` intrinsics as **out-of-line
+  calls** — `p2_mem_M` had 8 `_mm_*` symbols and 23 `call`s to them, while LLVM
+  had 0. Root cause was *not* the inliner: `src/intrinsics/simd.rs` scalarized
+  every integer SIMD comparison per-lane (load i8 → `icmp` → `bmask` → store,
+  16×) and `simd_bitmask` into a per-lane shift/or loop, so `_mm_cmpeq_epi8`
+  produced ~155 RAKIT instructions and never fit the inliner budget. Fixed by
+  emitting one vector `icmp` (`pcmpeq*`/`pcmpgt*`) and `vhigh_bits`
+  (`pmovmskb`) on x86_64; see `simd.rs` and REPORT.md §8.8. `_mm_cmpeq_epi8`
+  body: 155→34 insts, `_mm_movemask_epi8`: 255→23; p2_mem 159→110 ms.
+  - What did **not** help, recorded for the record: `-Ctarget-feature=+sse2`,
+    `-Ctarget-cpu=native`, `-Zinline-mir=yes`, `RAKIT_INLINE_MAX=4096`
+    (the last only trims in-crate callers), and forcing `-Ccodegen-units=1`.
+  - Residual p2/p4 gap now comes from cross-CGU inlining of `memchr`/`hashbrown`
+    helpers and the absence of autovectorization in Rakit; both are outside
+    the reach of rakit-side changes. A real cross-CGU inliner would be the
+    next step.
+  - Rakit's `Inline` API clones `GlobalValueData` verbatim and does **not**
+    remap the `ExternalName` indices inside `GlobalValueData::Symbol`, so
+    inlining a callee that references a const/static/thread-local corrupts the
+    caller (TLS relocations went out of range when the guard was lifted).
+    **FIXED** in the vendored `rakit-codegen` (see the entry below): the
+    symbol's user name is now translated into the caller's namespace, so the
+    `body.global_values.is_empty()` guard in `inliner.rs` is gone.
+- Extending SROA to **`&mut`/`RawPtr` whole-local borrows** (with `local_map`
+  redirect) is a **miscompile** (p1/p3/p4 wrong). Shared-only is correct.
+- The inliner is redundant **within a crate** (MIR inlining already folds those
+  helpers), but load-bearing **across crates**: the hot helpers in `core::hash`
+  and `slice::sort` live in the pre-built std, so only a RAKIT-level inliner can
+  reach them. Once the global-values guard was removed it turns `slice::sort`'s
+  partition closure from an out-of-line call into inlined code (quicksort calls
+  11→3). It remains net-neutral on the p1–p6 microbenchmarks that MIR already
+  folds.
+- **Body-duplicating unrolling does not help.** Measured slower on p6 (357→423 ms):
+  the win LLVM gets on p5/p6 is *affine reassociation* of the accumulator chain,
+  not unrolling per se. Duplicating the body leaves the loop-carried dependency
+  chain intact. Implemented anyway behind `RAKIT_UNROLL_CLONE` for completeness.
+- Remaining runtime gap on p1–p4 (LLVM 17–58 ms vs mod 99–140 ms) is **not**
+  loops or store/load round-trips — the cross-block pass left runtime unchanged.
+  For p2 it is the out-of-line `core` SSE intrinsics (see the root-cause entry
+  above). p1/p3/p4 gaps are smaller and stem from the same missing cross-CGU
+  inlining plus incomplete memory-to-register promotion.
+
+## Gotchas
+- `measure.py`/`compare3.sh`: pass the rustc command as separate argv elements;
+  the `--sysroot` handling in `run_backend` requires the sysroot as its own arg.
+- Regenerating `rakit/Cargo.lock` needs dropping `--locked` because of the
+  local `[patch.crates-io]` for `rakit-object`.
+- `--gc-sections` works in this environment (verified with a hand-written asm test).
+- **RAKIT rewriting:** `InstructionData` is `Copy` and its `BlockCall`s share the
+  value pool with the source instruction. Before remapping a cloned instruction
+  you must `deep_clone` its branch destinations, or the clone's branch args
+  silently corrupt the original (this ICEs later in the egraph pass with
+  `assertion failed: payload < (1 << 30)`).
+- **Value aliases:** rakit emits `v6 -> v2` aliases heavily. Resolve with
+  `dfg.resolve_aliases` before mapping header params to clone params, or the
+  clone reads the wrong state.
+- `func.layout` has no `num_blocks`; use `func.layout.blocks().count()`.
+
+
+
+## Push status (T6) — DONE
+- PR **#10** (`replace-main-with-rakit-experiments` → `main`) is open,
+  **mergeable=True (clean)**. Local `rmc_clone` == remote.
+- Latest fork commit on `rakit`: `8ff4779`
+  `Forward same-size vector stores to loads of a different lane type`
+  (on top of `0e6c2f0` SIMD copy via one vector load/store and `38923c0`
+  SIMD constants → `vconst`). Squashed into one commit `4759d90` in
+  `rmc_clone` and pushed; PR #10 head is `4759d90`, 10 commits.
+- Earlier commits: `e101572` cross-block store forwarding + doc/bench-path sync;
+  `628c73b` store-forward miscompile fix (branch args were not scanned in
+  `private_slots`). Pushed with a user-supplied classic PAT with `repo` scope:
+  `git push https://<user>:<PAT>@github.com/irhasar/rmc.git replace-main-with-rakit-experiments`.
+- Note: the environment's injected `GITHUB_TOKEN` (GitHub App installation) is
+  read-only for this repo — `git push` and all write APIs return 403
+  (`Resource not accessible by integration`). `OH_GIT_CREDENTIAL_ACCESS_TOKEN_GITHUB`
+  is also rejected (`Invalid username or token`), and there is no SSH key.
+  Re-confirmed 2026-11-19: `POST /repos/irhasar/rmc/git/blobs` returns 403 while
+  `GET /repos/irhasar/rmc` reports `push: true` — the repo permission and the
+  token's granted scope disagree, so the 403 is a token-scope limit, not a
+  repo-permission one. A user-supplied classic PAT with `repo` scope does work;
+  pass it inline and reset the remote afterwards so it is not persisted:
+  `git -c credential.helper= push https://<user>:<PAT>@github.com/irhasar/rmc.git
+  HEAD:replace-main-with-rakit-experiments`, then verify `grep -c ghp_ .git/config`
+  is 0.
+- 2026-11-19 large-crate work is **landed**: remote head `960ae7e`, PR #10 at 46
+  commits / 926 files, `mergeable: True`, `mergeable_state: clean`. Commits:
+  `cd14e20` (treemeasure.py + cratebench.sh + REPORT 8.26), `df39c58` (push
+  status note), `960ae7e` (three derived figures corrected).
+
+## Session benchmark report (2026-11-18, latest)
+
+Full three-way harness: `cd bench && REPS_COMPILE=3 REPS_RUN=5 ./compare3.sh`
+(log `/tmp/compare3_final.log`) and `./sizes2.sh` (log `/tmp/sizes2_final.log`).
+C = compile (wall ms, cpu ms, peak RSS MB, exit), S = size (raw bytes,
+.text, .data.rel.ro, .rodata, .eh_frame, `size -A` total), R = run
+(wall ms, cpu ms, peak RSS MB, exit). "up_llvmstd"/"mod_llvmstd" link the
+stock LLVM std to isolate the backend from the Rakit-built std.
+
+### Compile
+| prog | backend | wall ms | cpu ms | RSS MB |
+|------|---------|--------:|-------:|-------:|
+| p1_arith | llvm | 89 | 108 | 106 |
+| p1_arith | up | 80 | 102 | 108 |
+| p1_arith | mod | 81 | 105 | 109 |
+| p2_mem | llvm | 253 | 383 | 133 |
+| p2_mem | up | 129 | 175 | 131 |
+| p2_mem | mod | 138 | 192 | 132 |
+| p3_calls | llvm | 103 | 126 | 116 |
+| p3_calls | up | 90 | 111 | 117 |
+| p3_calls | mod | 89 | 115 | 118 |
+| p4_simd | llvm | 111 | 136 | 116 |
+| p4_simd | up | 95 | 117 | 117 |
+| p4_simd | mod | 98 | 123 | 118 |
+| p5_inline | llvm | 85 | 106 | 105 |
+| p5_inline | up | 78 | 102 | 107 |
+| p5_inline | mod | 80 | 104 | 108 |
+| p6_scalar | llvm | 85 | 103 | 101 |
+| p6_scalar | up | 78 | 99 | 103 |
+| p6_scalar | mod | 79 | 101 | 104 |
+
+rakit (up and mod) compiles ~1.5–2x faster than LLVM on p2 and slightly
+faster elsewhere, at equal peak RSS. The mod's extra RAKIT passes cost ~1 ms
+wall / ~3 ms cpu and are size/run-neutral at compile time.
+
+### Artifact size (raw bytes; section breakdown in the log)
+| prog | llvm | up | mod |
+|------|-----:|---:|----:|
+| p1_arith | 4,635,232 | 5,878,688 | 4,376,376 |
+| p2_mem | 4,639,888 | 5,936,880 | 4,404,664 |
+| p3_calls | 4,612,368 | 5,820,872 | 4,317,616 |
+| p4_simd | 4,636,096 | 5,893,112 | 4,384,824 |
+| p5_inline | 4,609,368 | 5,814,440 | 4,309,064 |
+| p6_scalar | 4,609,368 | 5,814,424 | 4,309,064 |
+
+mod vs up: **−25% raw**, and −40% in `.text` (up 1.19 MB → mod 0.81 MB) with
+`.rodata`/`.data.rel.ro` also ~4x smaller. mod vs LLVM raw: −5%, and `.text`
+is 3x larger than LLVM's (0.81 MB vs 0.26 MB) — LLVM's `.text` is small
+because much of its runtime lives in the shared LLVM-built std/panic
+libraries, whereas the mod links its own Rakit-built std. With the LLVM
+std (isolates the backend), mod is byte-for-byte the same size as up plus
+only the SIMD lowering: p1 4,631,032 vs 4,631,880, p5/p6 4,603,608 vs
+4,604,376 — i.e. the size win is in the Rakit-built std (the mod's
+`--gc-sections` + store-forwarding let dead code go).
+
+Stripped (p2_mem/p3_calls, opt-level 3 / z / cu1): up 1.92/1.85 MB →
+mod 1.14/1.08 MB; llvm 0.36/0.34 MB. mod strips 40% smaller than up.
+
+### Runtime
+| prog | llvm ms | up ms | mod ms | mod/llvm |
+|------|--------:|------:|-------:|---------:|
+| p1_arith | 81 | 109 | 106 | 1.31x |
+| p2_mem | 16 | 159 | 75 | 4.7x |
+| p3_calls | 37 | 118 | 99 | 2.7x |
+| p4_simd | 56 | 156 | 139 | 2.5x |
+| p5_inline | 58 | 893 | 61 | 1.05x |
+| p6_scalar | 58 | 900 | 61 | 1.05x |
+
+mod vs up: **p2 159→75 ms (2.1x, the small-memcpy fix)**, p5 893→61 ms
+(14.6x), p6 900→61 ms (14.8x). p5/p6 now match LLVM. Remaining gap is p2
+(SipHash cross-crate inlining), p3 (closure calls), p4 (SSE intrinsics),
+p1 (bounds/arith) — all cross-crate/cross-CGU inlining limits, not loops or
+store/load round-trips.
+
+### New work this session (on top of PR #10 head 4759d90)
+- `badbf0e` Inline small constant-size memcpy/memmove instead of libc calls:
+  `ptr::copy_nonoverlapping`/`ptr::copy` with a constant byte count ≤64
+  (`count * elem_size` folded) become load/store pairs. `slice::sort_unstable`
+  partition (8-byte element moves) went from a `%Memcpy`/`%Memmove` call per
+  element to register moves: sort 44→24 ms on 300k u64 (LLVM 4.3 ms). Verified
+  with a 61×5 fuzz over sizes 0..60, alignments, and both overlap directions
+  (`bad=0`, identical to LLVM).
+- `bc9b0f0` Honour `RAKIT_INLINE_MAX` when collecting inlineable bodies:
+  `aot.rs` filtered bodies on the compile-time `MAX_CALLEE_INSTS` while the
+  decision used `max_callee_insts()`, so the knob did nothing. Now both agree.
+  Root-caused the p2 hash gap: `core::hash::sip::SipHasher::write`/`c_rounds`
+  are cross-crate and round-trip the 32-byte `State` through the opaque
+  `&mut self` pointer; even inlined they stay memory-bound (opaque-pointer
+  aliasing), so raising the inline budget cannot close it. This is a genuine
+  cross-crate inlining limit, not a tunable.
+
+## Push status update (2026-11-18) — PUSHED
+- PR **#10** open, `mergeable=True`, `mergeable_state=clean`, base `main`,
+  remote head **`aee9ba3`**, 13 commits, 625 changed files.
+- Pushed with a user-supplied `repo`-scoped classic PAT (the injected
+  `GITHUB_TOKEN` is read-only for this repo, 403). New commits on the branch:
+  `467f05c` "Inline small constant memcpy/memmove and honour RAKIT_INLINE_MAX"
+  and `aee9ba3` "docs: record push status for the latest session".
+- The branch replaces the whole `main` tree (subtree `rakit/` at repo
+  root alongside `cg_clif_upstream/`, `bench/`, `REPORT.md`, `AGENTS.md`).
+
+## Session benchmark report (2026-11-18, inliner-globals fix)
+
+`cd bench && CREPS=3 RREPS=5 ./allaxes.sh` (log `/tmp/allaxes_final.log`).
+L = stock LLVM nightly, U = cg_clif upstream, M = modified. Compile = wall ms,
+run = wall ms, size = bytes.
+
+| prog | Cwall L/U/M | Rwall L/U/M | size L/U/M |
+|------|-------------|-------------|------------|
+| p1_arith  |  90 /  81 /  83 |  82 / 108 / 105 | 4635232 / 5878688 / 4328824 |
+| p2_mem    | 244 / 130 / 144 |  16 / 154 /  59 | 4639888 / 5936880 / 4352336 |
+| p3_calls  | 103 /  88 /  90 |  37 / 116 /  97 | 4612368 / 5820872 / 4270352 |
+| p4_simd   | 111 /  95 / 109 |  55 / 158 / 143 | 4636096 / 5893112 / 4336352 |
+| p5_inline |  86 /  81 /  80 |  58 / 893 /  61 | 4609368 / 5814440 / 4261624 |
+| p6_scalar |  86 /  80 /  80 |  58 / 900 /  61 | 4609368 / 5814424 / 4261624 |
+
+M vs U: p2 154→59 ms, p5 893→61 ms, p6 900→61 ms; p1/p3/p4 unchanged
+(they do not call global-referencing helpers). M compiles ~1.7–2x faster than
+LLVM on p2 and is ~7% smaller than LLVM raw; peak RSS equal on all three.
+
+### What limits the hash workloads (goal: parity with LLVM)
+Micro-benchmarks (M vs L, run wall): `slice::sort_unstable` 23.1 / 8.2 ms,
+`HashMap` insert 35.4 / 10.0 ms, `DefaultHasher` (SipHash) 136.6 / 20.2 ms.
+The inliner-globals fix shrank `quicksort` from 11 out-of-line calls to 3, but
+the residual 3–7x is **Rakit codegen quality, not inlining**:
+- Forcing `RAKIT_INLINE_MAX=200` to inline the SipHash rounds *slows* the
+  hash benchmark (136.6→154 ms): after inlining, the `SipState` round-trip goes
+  through the opaque `&mut self` pointer and Rakit spills/reloads it every
+  round, while LLVM keeps it in registers. rakit's `store_forward` only
+  forwards through *non-escaping* pointer bases, and the `Hasher::write`
+  parameter escapes into `c_rounds`/`d_rounds`, so the round-trip survives.
+- LLVM's advantage on these loops is its register allocator plus
+  autovectorization (the SipHash tail, `u8to64_le`), which Rakit does not
+  do. These are backend-internal; a rakit-side pass cannot reach them.
+
+### Push status (2026-11-18, second update) — PUSHED
+- Pushed to PR **#10** (`replace-main-with-rakit-experiments` → `main`), head
+  now **`8f84035`**, 16 commits, `mergeable=True`, `mergeable_state=clean`.
+  Commits this session: `64b3760` "Inline callees that reference globals; allow
+  repeated inlining" (vendors `rakit/vendor/rakit-codegen-0.137.0` +
+  the `translate_symbol_name` fix) and `8f84035` (docs).
+- The environment's injected `GITHUB_TOKEN` is read-only for this repo (all
+  writes 403 `Resource not accessible by integration`); a user-supplied
+  `repo`-scoped classic PAT was used to push. (History note below kept for the
+  blocked attempt.)
+- Historical note — BLOCKED ON CREDENTIALS
+- `rakit` head is `c2e292b` "Inline callees that reference globals; allow
+  repeated inlining"; it vendors `vendor/rakit-codegen-0.137.0` (added to
+  `[patch.crates-io]`) with the `translate_symbol_name` fix.
+- `rmc_clone` (subtree layout) is committed as **`64b3760`** on branch
+  `replace-main-with-rakit-experiments`, which is PR **#10**'s head branch
+  (`102ec7b` on remote). The commit is **local only** — it is not pushed.
+- **Push is blocked**: every token in this environment is read-only for
+  `irhasar/rmc`. `GITHUB_TOKEN` authenticates as user `irhasar` and the repo API
+  reports `permissions.push=true`, but all writes return 403
+  (`Resource not accessible by integration`): `git push` (helper token),
+  `git push` with `$GITHUB_TOKEN` embedded, `gh auth token`, and
+  `POST /git/refs` all fail. `OH_GIT_CREDENTIAL_ACCESS_TOKEN_GITHUB` is
+  `401 Bad credentials`. The earlier session pushed with a user-supplied
+  `repo`-scoped classic PAT that is no longer available.
+- To finish: supply a `repo`-scoped PAT (or push manually):
+  `git -C rmc_clone push https://<user>:<PAT>@github.com/irhasar/rmc.git replace-main-with-rakit-experiments`
+  This updates PR #10 in place; no new PR is needed.
+- **Push is no longer blocked**: it landed with a user-supplied `repo`-scoped
+  classic PAT. The earlier failures were *not* only a read-only token: passing
+  `-c credential.helper=` does **not** clear the global
+  `credential.https://github.com.helper` in `~/.gitconfig`, so the read-only
+  helper still answered first and every attempt returned 403. Working recipe
+  (token from env, never in the remote URL, so `.git/config` stays clean):
+
+      cd rmc_clone && GIT_TERMINAL_PROMPT=0 git \
+        -c credential.helper= \
+        -c credential.helper='!f() { echo username=<user>; echo "password=$GH_PAT"; }; f' \
+        push origin replace-main-with-rakit-experiments
+
+- **Pushed**: `c64e31b` is on the remote; PR #10 is `mergeable_state: clean`.
+  Confirmed via the contents API that `rakit/src/intrinsics/mod.rs` on
+  the remote contains the native `round` lowering.
+
+## Session 2026-11-19 (later) — the trunc libcall finding
+
+**Biggest single win so far: −15.8% runtime on the image blur benchmark, and
+fully portable (no `-Ctarget-cpu=native` needed).**
+
+### The finding
+
+`ftrunc` only lowers to `roundss`/`roundsd` when the target has **SSE4.1**
+(`vendor/rakit-codegen-0.137.0/src/isa/x64/lower.isle`, the `x64_round_*`
+rules). On the x86-64 baseline it falls through to a libcall into
+`compiler_builtins`' soft-float `truncf`. `round` in rakit was built on
+`ins().trunc(x)`, so it inherited the same libcall.
+
+### Methodology lessons (both cost real time)
+
+1. **A first patch that changes nothing is a signal, not a dead end.** Patching
+   only `sym::trunc` gave 10091 ms vs 10053 ms — no change. The hot caller was
+   `round`, which called `ins().trunc(x)` internally. When a plausible fix
+   measures as noise, grep for *every* emission site of the instruction, not
+   just the intrinsic you assumed.
+2. **Never validate a lowering against itself.** The first correctness test
+   compared `v.trunc()` with `f64::trunc(v)` — both compiled by the lowering
+   under test. It "passed" while the code was wrong. Only a **cross-backend
+   differential** test is valid: hash the results in a RAKIT-built binary and in
+   an LLVM-built binary, then compare the hashes.
+3. **A 2^32-iteration test must stream.** Buffering one line per f32 pattern
+   into a `String` OOM-killed the sandbox and wiped `~/.cargo` + `~/.rustup`.
+   Fold results into a running hash instead. Recovery: reinstall rustup, then
+   `rustup toolchain install nightly-2026-11-17 --profile minimal -c
+   rust-src,rustc-dev,llvm-tools,rustfmt` (per `rust-toolchain.toml`).
+
+### The fix
+
+`trunc_via_int` in `rakit/src/intrinsics/mod.rs`: `fcvt_to_sint_sat` →
+`fcvt_from_sint` → `fcopysign` (to keep the sign of zero), guarded by
+`|x| < 2^mantissa_bits` with `select`. SSE2 only, never traps (the saturating
+conversion cannot).
+
+Correctness argument: any float at or above 2^mantissa_bits is already
+integral, so the round-trip is exact exactly where it is applied; below that
+bound the value is small enough to convert without overflow. NaN/infinity fail
+the magnitude test and pass through, which is what truncation returns.
+
+**The sign-of-zero bug is easy to miss**: the integer round-trip returns `+0.0`
+for `trunc(-0.4)`, which must be `-0.0`. The bundled test suite catches it
+(`num::floats::{trunc,round,fract}`), so always run the full suite — 6 tests
+failed on this alone.
+
+### Results
+
+| backend | wall (ms) | size (bytes) |
+|---|---|---|
+| LLVM | 1237.7 | — |
+| RAKIT baseline | 10257.5 | 1500000 |
+| RAKIT + small-switch | 10002.5 | 1500000 |
+| RAKIT + small-switch + trunc | **8422.0** | **1499568** |
+| RAKIT + `-Ctarget-cpu=native` | 8241.8 | 1498832 |
+
+`compiler_builtins` went from ~13% of profile samples to **zero**.
+
+Verified: differential hash identical to LLVM (`4de7d090cdfce77d`) over all
+2^32 f32 patterns plus an f64 sweep; `./y.sh test --sysroot rakit` → 65 suites,
+0 failures; benchmark output byte-identical at n = 512/1024/2048.
+
+### Remaining gap
+
+8422 ms vs 1238 ms LLVM. Now dominated by codegen quality: `try_from_fn`,
+`wrap_mut_1`, `Pixels`, `Zip` never inlined (~18% of samples) and register
+spilling in the hot loop. §9.9's claim that this was "out of scope" is wrong —
+`rakit-codegen` is vendored and patchable.
+
+### Push status — PUSHED
+
+Commit `5e92648` is on the remote; PR #10 head is `5e92648` (54 commits),
+`mergeable: True`, `mergeable_state: clean`, base `main`.
+
+The environment token situation is worth remembering: `GH_PAT` is **not**
+persisted to disk and dies with a sandbox restart, and `GITHUB_TOKEN` is a
+GitHub App token with **read-only contents** (`PUT /contents` → 403,
+`git push` → 403). With no SSH key, a fresh push needs a PAT supplied by the
+user. Use the credential-helper form (never the remote URL) so `.git/config`
+stays clean:
+
+    git -c credential.helper= \
+      -c "credential.https://github.com.helper=!f(){ echo username=<user>; echo password=<pat>; };f" \
+      push origin <branch>
+
+Verified after push: `trunc_via_int` and the `fcopysign` sign fix are present in
+`rakit/src/intrinsics/mod.rs` on the remote branch.
+
+### Follow-up: the remaining gap is auto-vectorization, not inlining
+
+Re-profiled the final binary and then compared disassembly of the hot function
+`filter_symmetric_column` across both backends (same baseline x86-64 target):
+
+| metric | LLVM | RAKIT (mod) |
+|---|---|---|
+| total instructions | 904 | 733 |
+| packed SIMD (`ps`/`pd`) | **75** | **1** |
+| breakdown | `movups`×34, `mulps`×17, `addps`×10, `shufps`×6, `xorps`×4, `movaps`×4 | `xorps`×1 |
+
+LLVM vectorizes the convolution 4 `f32` lanes at a time; Rakit emits fully
+scalar code. **Rakit has no loop vectorizer** — only local RAKIT-level
+patterns (`simd_*`, i.e. hand-written `std::simd`), not automatic loop
+analysis. Closing this needs a real loop vectorizer in `rakit-codegen`
+(dependence analysis, widening, tail handling), which is months of work and
+out of scope. `-Ctarget-cpu=native` only buys ~2% (8241.8 vs 8422.0 ms), which
+confirms SSE2 was always available — nothing uses it without a vectorizer.
+
+**Inlining is empirically saturated** — don't re-open that lead. Raising the
+existing tunables makes things worse:
+
+| config | runtime (ms) |
+|---|---|
+| default | 8440 |
+| `RAKIT_INLINE_MAX=200` | 8533 |
+| `RAKIT_INLINE_LEAF_MAX=200` | 8451 |
+| `RAKIT_INLINE_USES=10` | 8564 |
+
+So the gap is now fully explained: §9 (small switch) + §10 (trunc libcall) are
+landed wins; the rest is architectural. Documented as §11 in REPORT.md.
+
+### Session: floor/ceil were the same libcall class as trunc
+
+`floor`, `ceil`, `nearest` and `trunc` **all** reach the same `x64_round` rules
+in `vendor/rakit-codegen-*/src/isa/x64/lower.isle`, which select a libcall
+when `has_sse41` is false. Fixing only `trunc`/`round` in the previous session
+left `floor` and `ceil` as soft-float calls. Measured on a compute-bound loop
+they were **6.3x / 6.6x** slower than LLVM; both now match.
+
+Two measurement mistakes cost real time here — avoid both:
+
+1. **`RUSTC=rustc-rakit rustc ...` does nothing.** `RUSTC` is read by *cargo*,
+   not by `rustc`. Both "backends" were LLVM and the binaries were
+   byte-identical (`md5sum` proves it). Always invoke `rustc-rakit` directly, and
+   sanity-check that the two binaries differ before trusting any timing.
+2. **A 16 MB array is memory-bound**, not compute-bound, which hides rounding
+   cost entirely. Keep the working set in L1 (16 KB) with many repetitions.
+
+Gating matters: the integer round-trip is ~3 instructions vs 1 `roundss`, so
+applying it unconditionally regressed `-Ctarget-cpu=native` by 4%. `FunctionCx`
+now caches `has_sse41` (read once per function — `isa_flags()` allocates a
+`Vec`, so never call it per call site).
+
+**`nearest` must stay as-is.** Its baseline libcall masks the mantissa rather
+than doing soft-float arithmetic, so it is already fast; an integer round-trip
+measured **15% slower**. "Libcall" does not imply "slow" — measure per case.
+Use interleaved A/B with many samples; single runs on this box vary ~15%.
+
+Verification pattern that works: print only a hash so memory stays constant,
+compile with both backends, and require identical hashes over all 2^32 f32
+patterns. Also confirm in the disassembly (`cvttss2si` vs `roundss`) that the
+intended code was actually emitted — the symbol table alone cannot tell you.
+
+## LICM in rakit-codegen
+
+`vendor/rakit-codegen-0.137.0/src/licm.rs` is the only loop pass in the
+vendored crate. It runs from `Context::compile` **after** the egraph pass, and
+rebuilds `cfg`/`domtree`/`loops` from scratch each round because creating a
+preheader mutates the CFG. Do not "optimise" that into incremental updates: the
+earlier attempt reused a stale dominator tree and surfaced as a regalloc2 ICE
+(`ion/moves.rs:658 unwrap None`), not as a wrong answer.
+
+The three ways this pass was silently wrong, in the order they were found:
+
+1. Splitting an edge discarded the header's phi arguments — forward the edge's
+   block args into the new block.
+2. `BlockArg` is not always a plain `Value`; `TryCallRet`/`TryCallExn` carry
+   exception payloads. Restrict splitting to plain values and give up on EH
+   edges rather than guessing.
+3. `is_pure_for_egraph` accepts **trapping** ops (`sdiv`, `fcvt_to_sint`).
+   Purity is not the same as safety to speculate, so LICM also requires
+   `!op.can_trap()`.
+
+Header block parameters are phi nodes and must never be treated as invariant;
+`bench/tests/t_licm.rs` pins that and the other shapes.
+
+Two knobs exist for bisecting: `RAKIT_NO_LICM` and `RAKIT_NO_COLLAPSE`
+(the unroller's forwarding-latch collapse, which only unblocks one extra loop
+and is runtime-neutral).
+
+Reading env vars inside a per-function pass is measurable: `std::env::var`
+locks a global map on every call. Cache every knob in a `OnceLock`, as
+`src/tunables.rs` does. The vendored crate cannot see that module, so `licm.rs`
+keeps its own cached copies.
+
+Measurement notes: `/usr/bin/time` does not exist in this image — use
+`bench/measure.py`. Running `./y.sh test` rebuilds `dist/`, so any binary
+compiled from `dist/bin/rustc-rakit` disappears mid-run; never benchmark while a
+test suite is in flight.
+
+### Never trust a stale `dist/`
+
+`rustc-rakit` falls back to the LLVM sysroot when its own sysroot has no
+`libstd`, and it does so **silently**. The only symptom is that the "Rakit"
+binary is ~4.6 MB and behaves exactly like LLVM. This invalidated a whole
+benchmark matrix once (upstream looked 12% smaller than it is).
+
+Before trusting any U-vs-L row, check all three:
+
+```bash
+ls cg_clif_upstream/dist/lib/rustlib/*/lib/libstd-*.rlib   # must exist
+ls rakit/dist/lib/rustlib/*/lib/libstd-*.rlib        # must exist
+stat -c%s /tmp/fb/p1_arith_U /tmp/fb/p1_arith_L             # must differ
 ```
 
-## Source map
-
-- `compiler/src/lib.rs` — library entry point: `compile_to_asm(src, options)`.
-  The compiler is a library plus a thin CLI, so it can be embedded.
-- `compiler/src/lexer.rs` — byte scanner, tokens carry byte positions. A byte
-  literal `b'A'` lexes to a `Tok::Int` (a byte *value* is an `i64`; only a byte
-  *referent* `*const u8`/`*mut i8` carries `Type::U8`/`I8`, see below);
-  `b".."` is not a
-  literal it recognises, so it is rejected downstream. `lex_byte_lit` reads the
-  first content byte with `get`, so an input ending in `b'` is an
-  unterminated-literal error rather than an out-of-bounds panic. An integer
-  literal's width suffix (`200u8`, `1i64`, `0xffu32`) is kept on the token
-  (`Tok::IntSuffixed`); the parser types the value at that width and keeps it in
-  the width for later arithmetic (`200u8 + 100` overflows, as rustc reports),
-  and rejects a magnitude that does not fit (`300u8` is an error). A suffix
-  naming the native width (`5i64`) is a plain `i64`. A negated suffixed literal
-  (`-128i8`) folds the sign into the magnitude before the range check, so `128`
-  is checked rather than the cast's wrapped `-128`.
-- `compiler/src/parser.rs` — recursive descent; `is_block_like` allows
-  `if`/blocks as statements without a trailing `;`. `parse_cond` sets
-  `no_struct_lit` so a `{` after a condition starts the body, not a struct.
-  The flag is scoped to the head itself: `parse_bracketed_expr` clears it while
-  parsing inside `(...)`/`[...]`, so `for p in [P { x: 1 }] { .. }` (and a struct
-  literal in a call argument or index) still parses, matching rustc.
-  Precedence, loosest to tightest: `||`, `&&`, comparison, `|`, `^`, `&`,
-  `<< >>`, `+ -`, `* / %`. Note shifts bind *looser* than `+`/`-`, matching
-  Rust: `parse_shift` consumes `parse_add`, and `parse_bitand` consumes
-  `parse_shift`. Swapping these silently mis-parses `1 + 2 << 3`.
-  Comparison is *non-associative*: `parse_cmp` parses one comparison and then
-  rejects a second comparison operator at the same level, because rustc treats
-  `a < b < c` as a hard error rather than `(a < b) < c`. A parenthesised inner
-  comparison (`(a < b) == c`) still parses, since the `)` ends the first.
-  `match` is parsed here and *desugared to a chain of `if`s* (`desugar_match`),
-  so sema and codegen have no `match` case. A non-`Var`/`Int` scrutinee is bound
-  to a hidden `let` first, so a call in the scrutinee runs once. An arm after
-  `_` is unreachable and dropped (the `_` body becomes the `else`).
-  An arm *body* is parsed by `parse_arm_body`, not `parse_expr`: assignment is
-  only a statement here, so a bare `0 => acc = 1` would otherwise stop at the
-  `=` and fail, and `return`/`break`/`continue` would be rejected outright.
-  `parse_arm_body` builds an `Assign` for `expr = value` and `expr op= value`
-  (via `desugar_compound`), or a `Return`/`Break`/`Continue` statement, and
-  wraps it in a `Block`; the block is what `match_arm` places as the branch
-  expression. A terminator's optional value stops at the arm's `,`/`}`
-  (`arm_terminator_value`), so `0 => return 5,` keeps the comma for the arm
-  list. Only `match` arms use it: `if let`/`while let` bodies are blocks.
-  An arm pattern may be an integer, a *range* `lo..hi`/`lo..=hi`, a *string
-  literal*, an `Enum::Variant`, an *or-pattern* `a | b | c`, or `_`. A range
-  desugars to `Bin(And, Le, Lt/Le)`, an or-pattern to `Bin(Or, ..)` over the
-  alternatives' tests with the *same* body (`or_cond` builds only the test, so
-  the body is not duplicated), so neither needs a sema or codegen case. A
-  *string* pattern desugars to `Bin(Eq, scrutinee, Str(s))`, which sema already
-  lowers to the byte-wise `__rmc_str_lt` helper: the scrutinee is a pointer, so
-  a machine compare would never match two distinct-but-equal literals. A
-  *scalar* pattern (a literal, a range or a bool) desugars to a plain compare
-  too, but match ergonomics must deref a `&T` scrutinee (`match &x { 5 => .. }`
-  reads the `i64` under the `&i64`), and the parser does not know the
-  scrutinee's type. So `scalar_scrutinee` wraps it in `Expr::PatScrutinee`, a
-  marker sema rewrites: `check_expr` replaces it with a `Deref` for a `Ref`
-  scrutinee, or with the bare expression otherwise (a scalar scrutinee stays
-  untouched). Only a pattern auto-derefs; a bare `r < 6` still needs `*r`, as in
-  rustc. The rewrite moves the inner expression out with `std::mem::replace`
-  rather than re-checking it, so a side-effecting scrutinee is type-checked and
-  its slots allocated exactly once. The marker never survives to codegen; the
-  later passes (`inline`, `tco`, `licm`, `dce`, `codegen`) treat it as
-  unreachable, like `ArrayList` and `MethodCall`. `TupleLit` is the same kind of
-  marker: sema's `check_expr` rewrites it to a `StructLit` of the anonymous
-  struct that lays the tuple out (so it is visible only to the sema pre-pass,
-  `collect_mut_borrows`, which recurses into its elements).
-  An or-pattern with a
-  `_` alternative, and one whose alternatives cover every variant, are handled
-  by `pat_irrefutable` and `or_leaves` (in sema) respectively. A *binding*
-  alternative is rejected, as rustc's E0408 rejects it.
-  A *struct pattern* `S { f, g: h, i: _, .. }` is irrefutable, so it also has no
-  sema or codegen case: `struct_pat_binds` turns each bound field into a `let`
-  whose initialiser is `Expr::Field { base: scrutinee, .. }`, which sema already
-  types and locates (so a field may auto-deref a `&S` scrutinee). `mut` is a
-  per-binding flag carried in `Pat::Struct` (`f: mut h`, `mut f`), so a bound
-  field becomes a `let mut`. The prescan records
-  each struct's field names before the real parse (`struct_fields`), so a field
-  name is checked even for `i: _` (which emits no read) and a later-declared
-  struct still matches; a field the struct lacks, or one bound twice, is a parse
-  error. A field's value may be a *nested* struct sub-pattern (`a: I { x }`), to
-  any depth: `parse_nested_struct_pat` recognises `Ident {` after the `:` and
-  recurses into `parse_struct_pat_fields` (the field-list loop, factored out of
-  `parse_pattern_primary`), which checks the inner struct against `struct_fields`
-  too. `struct_pat_binds` recurses with the field read as the sub-scrutinee, so a
-  nested name expands to an ordinary chain of field reads (`s.a.x`) and sema and
-  codegen gain no case; `mut` is rejected on a sub-pattern, since it only applies
-  to a binding. A field whose type is an array may also be destructured by an
-  array sub-pattern, `S { a: [x, y], b }`: `struct_pat_binds` recurses into
-  `array_pat_binds` with the field read as the sub-scrutinee, so the field read
-  and the index read compose (`s.a[0]`) and the two nesting directions (a struct
-  inside an array element, an array inside a struct field) both work.
-  `first_bound_name` walks the pattern (through struct and or
-  alternatives) to keep rejecting a binding in an or-pattern (rustc's E0408) one
-  level down. A struct pattern is a catch-all arm, so it joins
-  `pat_irrefutable`, and `or_cond` treats it as `true` (a *binding* struct
-  pattern in an or-pattern is rejected like any other binding alternative).
-  *`let` destructuring* `let S { f, g: h, .. } = e;` reuses the same parser
-  (`parse_pattern_primary`) and the same `struct_pat_binds` helper. Because the
-  bindings must outlive the statement, the expansion cannot be a nested block:
-  `parse_stmt` was split into `parse_stmt_into(&mut Vec<Stmt>)`, and a
-  destructuring `let` pushes the hidden scrutinee (a `\0lp<n>` temporary, unless
-  the scrutinee is already a plain place, in which case its field reads read it
-  directly, as in `desugar_match_arms`) followed by the per-field bindings into
-  the enclosing block. `let mut S { .. }` is rejected (rustc's "`mut` must be
-  attached to each individual binding"); a type annotation goes on the temporary.
-  The temporary is forced when a binding shadows the name the initializer reads
-  (`let (x, y) = x;`), so every element read still sees the original value; the
-  prelude's `force` flag and the `pat_bound_names`/`init_shadowed_by` helpers
-  decide that. No sema or codegen case.
-  *Array patterns* `[a, b, .., c]` are the third irrefutable aggregate pattern,
-  alongside struct patterns: `Pat::Array { elems, rest, front }` is parsed by
-  `parse_array_pat` (`[` is routed from `parse_pattern_primary`) and desugared by
-  `array_pat_binds` into one `let` per bound element whose initialiser is
-  `Expr::Index { base: scrutinee, index: .. }`, which sema already types, bounds
-  checks and locates. No sema or codegen case. `elems` stays in source order and
-  is `Option<(bool, Pat)>` per element (`None` only for the `..` slot the builder
-  skips): `front` counts the elements before `..`, and an element at pattern
-  index `j` reads `subj[j]` when `j < front` (or with no rest) and
-  `subj[subj.len() - (behind - (j - front))]` otherwise, so a trailing binding
-  reads relative to the length (which folds to the constant, see `sema`'s
-  `arr.len()`). An element may be `_` (no read), a `mut` binding (the per-element
-  `mut` flag), or a nested array/struct sub-pattern (recursion, with the index
-  read as the sub-scrutinee). `parse_array_pat` rejects a second `..`, `mut` on a
-  non-binding, and any *refutable* element (`[1, y]`) — the last would need a
-  per-element test rmc does not generate, so it is rejected rather than
-  mis-bound. The pattern is irrefutable when every element is, so it joins
-  `pat_irrefutable`, `first_bound_name` (recursing so a binding element in an
-  or-pattern is still rejected) and the `let`/`for`/`match`/`if let` paths through
-  `let_destructure_array_stmts` (the `let_destructure_prelude` helper shares the
-  hidden-scrutinee logic with the struct path).   `or_cond` does not treat it as
-  true: an array pattern is not a supported or-alternative.
-  *Tuple patterns* `(a, b)` are the fourth irrefutable aggregate pattern:
-  `Pat::Tuple(Vec<(bool, Pat)>)` is parsed by `parse_tuple_pat` (`(` is routed
-  from `parse_pattern_primary`; `()` is the unit pattern and `(a)` is a
-  parenthesised sub-pattern, so a one-tuple needs a trailing comma `(a,)`, as in
-  Rust) and desugared by `tuple_pat_binds` into one `let` per bound element whose
-  initialiser is a *field read* `Expr::Field { name: "k" }`. A tuple is an
-  aggregate lowered to an anonymous struct (element `k` is field `"k"`), so a
-  tuple pattern reuses the whole struct path: `tuple_pat_binds` mirrors
-  `struct_pat_binds` (a nested struct/tuple/array element recurses with the field
-  read as the sub-scrutinee). `tuple_pat_binds` emits an `Expr::PatArity`
-  marker first (and `array_pat_binds` does too, unless a `..` rest makes the
-  count flexible), which sema checks so a pattern naming the wrong number of
-  elements is rejected as rustc does (E0308/E0527) rather than silently reading
-  the first `k` and ignoring the rest; `()` (the unit type) counts as the empty
-  tuple. A tuple pattern never matches an array even at equal length (E0308), so
-  the array arm of the check is guarded by `!is_tuple`. No sema or codegen case
-  beyond that marker. It is irrefutable when
-  every element is, so it joins `pat_irrefutable`, `first_bound_name`, `or_cond`
-  and the
-  `let`/`for`/`match`/parameter paths through `let_destructure_tuple_stmts` (the
-  `let_destructure_prelude` helper shares the hidden-scrutinee logic).
-  In a *refutable* position (a `match` arm or an `if let` / `while let`
-  scrutinee) a tuple element may be a scalar test. The parser tracks this with
-  `pat_refutable_ok`, set by `parse_refutable_pattern` at the four refutable
-  call sites; `parse_tuple_pat` rejects a non-irrefutable element when it is
-  clear. `tuple_pat_test` builds the arm's test as the `&&` of each element's
-  test (`pat_test`), each read through the element's field; `None` when every
-  element is irrefutable, so the arm stays a catch-all. A refutable element may
-  not bind or be a variant (`tuple_element_ok` rejects `E::V(x)`), since the
-  test carries no payload. `pat_test` also handles an or-pattern element
-  (`(0 | 1, x)`) by folding `or_cond` with `||`, and `or_cond` handles a tuple
-  alternative the same way; `parse_tuple_pat` therefore parses each element with
-  `parse_pattern` (not `parse_pattern_primary`) so an or-pattern is collected.
-  A tuple *type* `(A, B)` is lowered by `lower_tuple_type` (in `parse_type`) to
-  the same anonymous struct, named by the canonical element-type keys
-  (`ast::tuple_struct_name`), and a tuple *literal* `(a, b)` stays `Expr::TupleLit`
-  until sema resolves its element types and rewrites it to a `StructLit` of that
-  struct (`tuple_struct_for` introduces the layout if the parser did not). An
-  element is written `.0`, `.1`, ...: `parse_postfix` accepts a decimal literal
-  after `.` as the field name.
-  *Tuple structs* `struct P(T, T);` are a second way to write a struct: the
-  fields are stored with the positional names `"0"`, `"1"`, ..., so layout, the
-  field read `p.0`, and the destructuring paths treat it exactly like a braced
-  struct, and sema and codegen gain no case. Only the constructor and the
-  pattern differ, so the prescan records the name and field count in
-  `struct_ctors` (a unit struct `struct U;` goes in `unit_structs` instead, since
-  its name is also its value). The prescan's `skip_tuple_struct_fields` must step
-  over a whole field *type*, not one token: `struct P(&i64, i64)`, `struct
-  P(*const i64, i64)` and `struct P(Vec<i64>)` all span several tokens, and the
-  helper `skip_to_field_end` advances to the field-separating `,`/`)` at bracket
-  depth zero (balancing `(`/`[`/`<` and splitting a `>>`), so the count is right.
-  A call `P(a, b)` in `parse_primary` becomes a
-  `StructLit` (arity checked against `struct_ctors`), and the pattern
-  `P(a, b)` in `parse_pattern_primary` becomes the existing `Pat::Struct` with
-  positional field names, so `struct_pat_binds` desugars it to the same chain of
-  field reads. The shared `parse_tuple_struct_pat_args` helper reads the field
-  list (used at the top level, in a `let`, in a parameter via `parse_param`, and
-  as a nested field sub-pattern `f: P(a, b)`); it checks the arity and rejects a
-  refutable element, as the braced path does. A unit struct's bare name `U` is a
-  fieldless `StructLit` in a value position and a fieldless `Pat::Struct` in a
-  pattern position. `reject_const_shadow` rejects a `let` binding that shadows
-  any struct name (rustc's E0530), which covers `let P = ..` and `let U = ..`.
-  *At-bindings* `name @ subpat` bind the whole value to `name` and also match it
-  against `subpat`. `Pat::At(String, bool, Box<Pat>)` is parsed by
-  `parse_pattern_primary` (an identifier followed by `@`), so it is reachable in
-  every pattern position; `mut` before the name (`mut n @ sub`) sets the flag.
-  The name is an ordinary binding (the whole scrutinee) and `subpat`'s own names
-  are bound from the same value, which is exactly what `pat_binds(pat, m, subj,
-  out)` does: the uniform binding helper every position calls, which emits a
-  `Stmt::Let` for the name then recurses on `subpat`. `pat_irrefutable` treats an
-  at-binding as irrefutable only when its sub-pattern is, and `first_bound_name`
-  returns the name. In a refutable position (`pat_test`, `arm_pattern_parts`,
-  `or_cond`) the sub-pattern contributes its own test and the name binds when it
-  passes. The irrefutable positions (`let`, `for`, parameters, a struct field's
-  sub-pattern) each reject a refutable sub-pattern rather than mis-bind it, so
-  `let n @ 1..=5 = e;` is a refutable local binding (E0005), as in rustc. A
-  binding alternative inside an or-pattern stays rejected: `n @ 1 | 2` is E0408.
-  The element-level `mut` of an array or tuple element (`[mut n @ _, m]`,
-  `(mut n @ _, m)`) is OR-ed into the binding's flag, since `mut` before the
-  element attaches to the element binding. An at-binding whose sub-pattern is a
-  `..` rest (`first @ ..`) is rejected cleanly: rmc has no slice type.
-  An arm may carry a *guard*, `PAT if COND => body`. `parse_match` reads the
-  optional `if COND` after the pattern (`parse_cond`, so a struct literal needs
-  parentheses) and threads it through `desugar_arm` as an `Option<Expr>`. The
-  guard folds into the arm's condition rather than becoming a node, so sema and
-  codegen gain no case; see the exhaustiveness notes below for the three rules a
-  guard changes. When any arm has a guard, `desugar_match_arms` snapshots a
-  variable scrutinee into a temporary before the arm chain, so a guard that
-  assigns the matched value (`match x { n if { x = 2; true } => n }`) or one of
-  its fields (`match p { P { x } if { p.x = 9; true } => x }`) cannot change what
-  the arm body's binding reads: the guard and the body share the snapshot.
-  Without a guard nothing runs between an arm's test and its body, so a plain
-  variable stays inline and the lowering matches the equivalent field reads.
-  rustc's borrow checker rejects both mutating programs (E0506), so no
-  differential twin exists; the values are pinned by end-to-end tests.
-  `while let PAT = EXPR { body }` is parsed here and desugared by
-  `desugar_while_let` to `loop { if let PAT = EXPR { body } else { break; } }`,
-  reusing the `if let` path, so sema and codegen gain no case. The scrutinee sits
-  inside the loop, so it is re-evaluated each iteration and `continue` re-tests
-  it. The `;` after `return`/`break`/`continue` may be omitted at the end of a
-  block (`eat_semi_at_block_end`), as in Rust. An assignment and a compound
-  assignment are `()`-valued expressions, so `parse_block_body` and the
-  statement arm of `parse_stmt_into` end them with `eat_semi_at_block_end`
-  too: `{ x = 1 }` and `{ x += 1 }` are accepted as a block's last statement,
-  and a bare `;` (an empty statement) is skipped before every statement.
-  `if let PAT = EXPR { .. } else { .. }` is parsed here too and desugared by
-  `desugar_if_let` into a two-arm `match` (`PAT => then, _ => else_or_unit`),
-  reusing `desugar_match_arms` and the `parse_pattern` shared with `match` arms,
-  so sema and codegen gain no new case. The `_` fallback arm is what makes an
-  `if let` need not be exhaustive; a non-unit `then` with no `else` then trips
-  the ordinary branch-type check, as in rustc. But note the two desugarings
-  differ in how an *irrefutable* arm (`_` or a binding) treats what follows it.
-  `match` drops the dead arms, as before. `if let` must not: rustc type-checks
-  the dead `else` and rejects `if let y = o { 1 } else { }` (E0308), so
-  `desugar_match_arms` takes a `check_dead_arms` flag and `irrefutable_arm`
-  wraps the dead arm in `if true { body } else { rest }` to carry that check
-  through the ordinary branch-type rule. Dropping the dead `else` for `if let`
-  accepts a program rustc rejects; wrapping the dead arms for `match` instead
-  rejects a program rustc accepts (`match o { _ => 5, 3 => 9 }` in value
-  position), which is why the flag exists.
-  `sema` also unifies a diverging branch: `if c { 1 } else { return 2 }` is
-  well typed because `!` unifies with any type. `block_diverges` decides it,
-  and `stmt_diverges` treats `loop { .. }` as diverging unless `block_has_break`
-  finds a `break` that targets it (a nested loop captures its own `break`s).
-  Definite initialization follows: only the non-diverging branch's writes
-  survive the `if`.
-  `check_block` returns `Never` for a block that cannot complete, and every
-  consumer of a block type accepts `Never` where a value is expected (`let`,
-  `return`, the function-body check, and both arms of an `if`). That is what
-  makes `fn f(e: E) -> i64 { match e { E::A => { return 1; } E::B => { return 2;
-  } } }` and `let x: i64 = if c { return 1; } else { return 2; };` compile, as
-  in rustc. The one case a block type cannot express is a `match` chain whose
-  every arm diverges: its last step is an `if` with no `else`, which completes
-  as `()`, so `Sema::match_chain_diverges` walks the chain and the no-`else`
-  branch propagates `Never` for a `total` chain.
-  An *unannotated* binding whose initializer diverges keeps `Never`, and rmc
-  has no usage-based inference to refine it, so using it as a place is an error:
-  `let x = { return 3; }; x + 1` and `let S { a } = { return 3; };` are rejected
-  where rustc accepts them. This is a documented limitation, not a regression —
-  an annotation (`let x: i64 = ..`) makes the type concrete and both compile.
-  `let_destructuring_{accepts,rejects}_an_*_diverging_initialiser` pin it.
-- Type aliases (`type NAME = T;`) are resolved entirely in the parser and never
-  reach sema or codegen, so they cost nothing at run time and cannot affect
-  layout. `prescan` records each alias name and the token index where its target
-  begins (skipping to the `;`), then, after `resolve_consts`, parses each target
-  (a second pass expands a target that named a not-yet-parsed alias, so
-  `type A = B; type B = i64;` works in either order). `parse_type_inner`
-  rewrites a `Tok::Ident` through `aliases` via `expand_alias_ty`, so every use
-  site (a `let`, a parameter, a return, a struct field, a cast) is already
-  concrete. A struct name is not an alias and stays `Type::Named`. A cycle is
-  reported (`expand_alias_ty` bounds the walk), matching rustc's `E0391`.
-  A *tuple* or array alias whose element names a later alias needs one more
-  step: the first pass bakes the tuple struct's element as the still-unresolved
-  `Named`, so after the map is complete every target is re-parsed with the
-  tuple-struct table cleared (`type Pair = (Later, i64); type Later = i64;`
-  otherwise keeps the placeholder's layout). `a_tuple_alias_may_name_an_alias_
-  declared_later` and the `PairF` case in `tests/cases/typealias.*` pin it.
-- `compiler/src/ast.rs` — AST and `Type` (`I64`, `Bool`, `Str`, `Unit`, `Array`,
-  `Struct`, and the parser-only placeholder `Named`). `Str` is the type of a
-  string literal: one slot holding a pointer to NUL-terminated static data. It
-  is a scalar (travels in a register) but is deliberately *not* `i64`, so a
-  string cannot be added to an integer or passed where an `i64` is expected.
-  There is no way to spell the type in source, so only a literal produces it.
-- `compiler/src/sema.rs` — type checking, struct layout, stack-slot allocation,
-  builtin sigs, and the soundness checks (mutability, definite initialization,
-  constant array bounds, string typing — see "Soundness checks" below). Resolves
-  `Type::Named`, fills `Field`/`FieldInit` offsets, and allocates the hidden
-  slots for aggregate arguments and returns. Field init shorthand
-  (`P { x, y }`) is resolved by the *parser*, which rewrites a bare field name
-  to `x: x`; sema then checks the `Var` it built like any other, so an unbound
-  name reports `unknown variable` rather than a missing-field error.
-- `compiler/src/consts.rs` — shared constant folding: `const_i64`/`const_binop`
-  (used by sema to fold a constant index or operand) and `resolve`/`eval_i64`
-  (used by the parser to evaluate `const` items). A `const` item has no storage
-  and no codegen; its value is substituted at every use. An immutable `static`
-  is parsed by `parse_static` and lowered to the same `ConstDef`, so it shares
-  this path; `static mut` is rejected, since rmc has no mutable global.
-  Folding threads an *operand width* (`eval_int_at`/`eval_i64_at`): a
-  `const N: u8` folds at `u8`, and a method folds at its *receiver's* width, not
-  the destination's (`A.saturating_add(10)` on a `u8` `A` clamps at 255 even when
-  bound to an `i64`). `resolve_with` carries the declared width of each resolved
-  narrow item so an initializer that names one folds the method at that width.
-  `pow` folds by squaring (`while exp > 0 { if exp & 1 { acc *= base } exp >>= 1;
-  base *= base }`), so `1u8.pow(1_000_000_000)` is O(log exponent), not a
-  billion multiplications; the base is squared only while exponent bits remain,
-  so an unused high square cannot reject a result that fits.
-  A `const`/immutable-`static` declared inside a block is collected and resolved
-  by `scan_block_consts` when the block begins (rustc hoists block items), so it
-  is in scope for the whole block and shadows an outer one until the block ends.
-  The whole block's items are collected before any is folded, then resolved
-  together (`consts::resolve_with`) seeded with the enclosing scope: a forward
-  reference resolves, and a self-reference is a cycle rather than a read of the
-  outer value (the items are parsed with the live constant tables cleared, so a
-  name in an initializer stays symbolic). Because such a constant never reaches
-  sema, the parser must enforce the checks sema applies to a top-level one:
-  `resolve_const_ty` requires a foldable kind (a block-scoped `const S: str` is
-  rejected like a top-level one), every item must fold even when unused (a call,
-  a cycle or a type mismatch is an error), a `const`/`fn` name collision is
-  `E0428`, and `reject_const_shadow` rejects a `let`/`@`/struct-field binding that
-  reuses the name (rustc's `E0530`).
-- `compiler/src/inline.rs` — AST inlining of small, call-free, scalar functions
-  (a loop is allowed, an early exit is not), run after sema and before codegen.
-  See the inlining gotcha below.
-- `compiler/src/licm.rs` — loop-invariant code motion, run after inlining and
-  before codegen. See the LICM gotcha below.
-- `compiler/src/dce.rs` — dead-function elimination, run after LICM and before
-  codegen. Keeps only the functions reachable from `main` (see "Runtime pruning"
-  below for why this composes with runtime selection).
-- `compiler/src/codegen.rs` — AST to AT&T x86-64 assembly.
-- `compiler/src/runtime.rs` — freestanding assembly runtime (`_start`, I/O,
-  `alloc`/`free`, `arg_i64`, the traps). Stored as a table of selectable
-  `PIECES`; `for_program(user_asm)` links only the pieces the program reaches
-  (see "Runtime pruning" below).
-- `compiler/src/elf.rs` — the in-process assembler and ELF64 linker. Parses the
-  assembly text `codegen`/`runtime` produce and emits a static executable with
-  two `PT_LOAD` segments (R+X for text/rodata, R+W for data). See "In-process
-  assembler" below before adding an instruction or a codegen form.
-- `compiler/src/main.rs` — CLI: reads source, calls the library, writes the ELF.
-  Flags: `--emit-asm`, `--keep-asm`, `--binutils`, `--no-strip`, `--min-size`,
-  `--overflow-checks`, `--no-bounds-checks`, `--no-inline`, `--no-licm`,
-  `--no-tco`. (`--bounds-checks` is accepted and ignored: bounds checks are on
-  by default.)
-- `compiler/tests/compile.rs` — unit tests for the front end and codegen; these
-  run without `as`/`ld`.
-
-## Things that are easy to get wrong
-
-- **`loop` is an expression, and codegen must report its own type, not `I64`.**
-  `loop { .. }` parses to `Expr::Loop(body, slot, ty)`; a `loop` in statement
-  position is a `Stmt::Expr` around it with `slot == -2`, so its value is
-  discarded and it is typed `()`. Sema fills `ty` with the type of the loop's
-  `break`s (or `Unit` for a `!` loop, matching every other diverging
-  expression), and codegen returns that `ty`. Hardcoding `Type::I64` there
-  compiles but silently mis-types a loop that yields a `bool` (so `!loop { break
-  true }` becomes a bitwise `not` instead of a logical one) and a loop that
-  yields an aggregate (so an enum-constructor argument or `value_copies_aggregate`
-  takes the wrong path). A value-yielding loop carries its result in a hidden
-  slot sized by the result's word count (`slot >= 0`); `break value` stores into
-  it and the loop loads it after `break_label`. The slot's `-1`/`-2` sentinels
-  are load-bearing: `-1` means "no value to carry", `-2` means "statement
-  position, value discarded".
-- **Do not weight `promote`'s mention count by loop depth.** It looks obviously
-  right — a variable inside a loop runs many more times than one in straight-line
-  code — but it loses: weights 2, 3, 4 and 8 all moved mandel from ~95 ms to
-  ~101 ms and heap from 3.20 to ~3.4 ms. The five registers are a fixed budget,
-  so promoting an innermost-loop local demotes an outer one, and mandel's inner
-  loop is division-bound and does not notice its own memory traffic while the
-  outer counters `x`/`y`/`size`/`acc` pay a store and reload on every iteration.
-  `promote` ranks by the raw mention count on purpose; measure before touching it
-  (the full account is in `docs/design.md`). A depth *tiebreak* (same count,
-  prefer the deeper loop) fails the same way: mandel's five locals tie at four
-  mentions, the tiebreak promotes the innermost `i` and demotes `x`, and mandel
-  goes 31.7 -> 32.4 ms.
-- **A local whose address is taken must be forced into memory before promotion.**
-  The promotion pass picks the hottest scalar locals and keeps them only in
-  registers, so their frame slot goes stale. `&x` needs `x` to be in memory, so
-  `count_expr` calls `mark_addressed` on an `AddrOf` operand to set `mem[]` for
-  that slot *before* promotion runs. Miss this and `lea slot(%rbp)` reads a
-  garbage word. `mark_addressed` walks `Field`/`Index` bases and marks the whole
-  aggregate, and it must run in the dry pass too (it does: `count_expr` is shared
-  by both passes).
-- **A reference is a scalar, but an aggregate referent is named by its address.**
-  `Type::Ref` is a scalar (one slot, one register) even when the referent is a
-  struct or array. So `gen_expr` on a `Ref` local is a plain `mov`, while `Deref`
-  of an aggregate is a no-op after evaluating the pointer — the pointer *is* the
-  value. `gen_addr` on a `Deref` yields the pointer, and on a `Field` whose base
-  is `Ref`-typed it adds the offset to the pointer (`ref_base`), never to the
-  slot holding the pointer.
-- **`&e` on a non-lvalue materialises a temporary.** `sema` gives `AddrOf` a
-  hidden slot (`slot >= 0`) for a literal, call result, or aggregate-valued
-  operand, and codegen stores the value there and yields that address. An
-  aggregate operand is copied with `copy_words_rdi_rsi`, a scalar with one `mov`.
-  `slot == -1` means the operand is an lvalue and `gen_addr` is used directly.
-- **`&mut T` coerces to `&T`; the reverse does not.** `ref_coerces` is the only
-  coercion and is checked in `let`, assignment and call arguments. Both are one
-  pointer, so the coercion emits no code. `&mut` and `&` are otherwise distinct
-  types, which is why `Sig` carries `ref_self_mut`.
-- **A field read through a reference folds to one `disp(%reg)` load.**
-  `field_operand` recognises a reference local kept in a register (`p.x` where
-  `p: &T` and `p` is promoted) and a dereference of one (`(*q).x`), emitting
-  `mov off(%reg), %rax` instead of `mov %reg,%rax; add $off,%rax; mov (%rax),%rax`.
-  Before this, an `&self` accessor over an 8-field struct emitted ~3 instructions
-  per field and the `refs` benchmark ran at 69 ms; the fold brought rmc's own
-  runtime down ~1.4x to ~50 ms. Inlining the accessors then removed the calls
-  entirely, taking `refs` to ~20 ms. The current `refs` benchmark reaches its
-  fields through a `&Wide`, and LICM hoists a read through a reference only when
-  a provenance pre-pass proves the reference points at a live local (`&x`,
-  `&x.field`): rmc's `&T` carries no guarantee that it is dereferenceable, so a
-  speculative load out of a loop that might never run could fault where the
-  source would not. `refs` binds its reference to a local, so the read is hoisted
-  and `refs` now wins (~1.7x). The benchmark keeps the loop real for *both*
-  compilers without an in-loop `black_box`: the struct is built from an opaque
-  `black_box`ed seed (so LLVM cannot constant-fold the accessor sum) and the
-  accumulator is reduced by a data-dependent branch (so LLVM can neither close
-  the loop into `K * n` nor vectorise it). An earlier design put `black_box`
-  inside the loop and reported 2.2x; that number was withdrawn because rmc
-  lowers `black_box` to the identity while rustc makes it opaque, so the barrier
-  charged rustc a store/reload rmc never emitted. A loop that reads through a
-  reference of unproven origin (a parameter, a cast, a mutable ref) still reloads
-  every iteration and loses; that is the honest limit, and the gap is the
-  reference, not the arithmetic. The fold is deliberately *one* level
-  deep:
-  a `*p` used as a reference has its pointer in memory, so `ptr_reg` only matches
-  a reference *local*, never a `Deref`. `addr_reg` (local or one `Deref` of a
-  local) is the form `gen_addr` folds for a `lea`. Extending either to a deeper
-  chain would read the inner pointer from a register it is not in — the bug that
-  `(**ppr).x` in `tests/cases/references.rs` guards against.
-- **A scalar `*p` read is a memory operand.** `simple_operand` returns `(%reg)`
-  for a non-aggregate `Deref` whose pointer is a reference local, so `*p < 5`
-  is one `cmpq $5, (%reg)` and `*p` in a comparison needs no load. An aggregate
-  `Deref` is *not* a simple operand: its value is an address, not data.
-- **A store through a computed address folds a register/immediate value.**
-  `(*np).next = head` with both operands in registers emits one `mov %r, (%rax)`
-  rather than spilling `head` to a frame slot, storing the address, and reloading
-  (`mov %rbx, -80(%rbp); mov %rax, -72(%rbp); mov -72(%rbp), %rcx; ...`). The
-  fold guards on the value operand starting with `%` or `$` so a *memory* value
-  never becomes an illegal memory-to-memory `mov`; a frame-slot operand falls
-  back to the `%rax` round trip. The same fold applies to a field in a promoted
-  register (`mov %r, %r`) and to `field_operand`'s `disp(%reg)` form. Measured
-  +5% on `heap`. The two store-shape tests (`a_write_through_a_dereference...`,
-  `field_write_targets_the_right_slot`) assert the folded form.
-- **A simple initialiser or assignment stores straight into its home.**
-  `store_simple` collapses `mov X, %rax; mov %rax, dst` into `mov X, dst` when
-  `X` is already a bare operand: a small immediate (`movq $k, dst`) or a
-  register (`mov %r, dst`). It is used from all four store sites — a `let` into
-  an unpromoted local, an assignment to one, a struct field in a promoted
-  register (via `gen_expr_into_reg`, so `mov $k, %rbx`), and a field in memory —
-  and never accepts a memory operand, which would make an illegal
-  `mov mem, mem`. A promoted *local* still uses `gen_expr_into_reg`, so its
-  constant becomes `mov $k, %r` directly. Neither an immediate nor a register
-  copy can trap, so the fold never changes when a trap would fire; it only ever
-  removes a `%rax` bounce. `refs` loses eight instructions from its struct
-  literal, and the frame store of a promoted field copied into an address-taken
-  local loses one. A *store-to-load forwarding* rewrite of the same shape
-  (`mov %r, X; mov X, %rY` -> `mov %r, %rY`) was measured perf-neutral on the
-  whole suite and not kept. A fuller textual version that tracked the live
-  register per frame slot (`forward_stores`) removed one instruction across the
-  whole corpus and cost 3-30% of compile time (`div.rs` 1.30x) for no runtime
-  change, so it was reverted too: the generator already keeps the value in a
-  register or reloads where a load is genuinely needed, and a whole-body rewrite
-  pass is the wrong price for the project's headline metric. `gen_expr_to_slot(e, slot)` is the one entry point
-  for "evaluate into a local": the promoted register when there is one, else a
-  folded frame store. `let`, assignment and both `for` bounds go through it, so
-  a constant `for` start is `mov $0, %rbx` rather than a bounce through `%rax`.
-- **An `if` whose whole body is `break`/`continue` branches straight to the
-  loop label.** In statement position (`discard`), `bare_exit` recognises a
-  single-statement body that is a lone `break` or `continue` and has the `if`
-  emit `gen_branch_true(cond, exit)` instead of branch-over-a-jump
-  (`jle .L12; jmp .L11; .L12:`). The taken path is one jump, the fall-through
-  path none. This is the escape test in `mandel`'s inner loop and the guards in
-  `sieve`/`forloops`. Guarded on `discard` so a value-position `if` still
-  materialises its unit.
-- **`trim_dead` drops unreachable instructions, self-moves, inverse-move pairs,
-  and a jump to the next label.** After each function body is generated it
-  removes instructions following an unconditional `jmp`/`ret` up to the next
-  label, `mov %r, %r`, a `mov` that exactly undoes the previous `mov` (`mov %rax,
-  X` then `mov X, %rax`, the store/reload pair a spill-and-restore emits), and a
-  `jmp L` whose target label `L:` is the very next line (the fallthrough already
-  reaches it — a function whose last expression is a value jumps to the
-  epilogue label that directly follows). A `return` inside an expression emits
-  `jmp epilogue` then the rest of the expression; the pass is a one-sweep
-  fixpoint because removing a line creates neither a label nor a new terminator.
-  The inverse-move check compares the full source and destination strings, so it
-  only fires on `mov` (there are no `movq $imm` register forms to confuse it)
-  and never across a label or any other instruction. It runs on the real body
-  only (the dry spill pass's output is truncated anyway), so it costs nothing at
-  compile time.
-- **A statement-position `if` without `else` emits no unit value.** `gen_stmt_expr`
-  sets a `discard` flag while generating an expression whose value is thrown
-  away, and `Expr::If` reads it: with no `else` the `xor %eax, %eax` that
-  materialises unit (and the `jmp` over the empty else) is dead, so it is
-  omitted. In `fib` that removes a dead instruction from the hot path. Only a
-  bare `if` is special-cased; a block or `match` in statement position is left
-  alone because an `if` in *its* tail is a value. The flag is saved and restored,
-  so a discarded outer expression does not silence an inner value `if`.
-  Runtime-neutral (the loops are latency-bound) but trims ~40 bytes per artifact.
-- **Inlining is a post-sema AST pass, and slots are frame indices.** Each
-  inlined call gets a fresh region of the caller's frame (`base = f.nslots`,
-  grown as it goes), the callee's slots are shifted by that base, and a read of
-  a parameter's slot is replaced by the argument. Two expansions must not share
-  a region or an inlined local would clobber another's. An argument with a side
-  effect must be bound to one slot, never substituted into a body that reads the
-  parameter twice — `f(sc(5))` with `f(x) = x + x` must call `sc` once. A
-  parameter the body assigns must also be bound to a fresh slot even when the
-  argument is a plain variable, because a parameter is a local copy: replacing
-  it by the caller's variable would make `x = x + 1` write through to the caller.
-  A trivial argument (a name or literal) is substituted in place only when no
-  *later* argument can write memory (`has_effect`); otherwise it is copied to a
-  fresh slot, so `sum(x, set(&mut x))` reads the `x` from before `set` ran.
-  The same holds for a parameter whose *address* the body takes (`let r = &x;`,
-  `&mut x`): it must be bound to a fresh slot too, or a substituted variable
-  argument would let `*r = ..` write through to the caller (`f(y)` with
-  `f(mut x) { let r = &mut x; *r = 5; }` left `y` at 5 instead of 3), and a
-  substituted non-lvalue argument (a literal, a call) would produce `&3`, an
-  address with no place to name, which `gen_addr` rejects. `escaped_slots`
-  collects both kinds — a slot assigned directly and a slot whose address is
-  taken — and its `Expr::AddrOf` arm records the operand slot when it is a bare
-  `Var`, so the copy is forced.
-  A candidate body must be call-free with no early exit; because it is call-free,
-  inlining it cannot expose new calls, but the pass still runs to a *fixpoint*
-  because a function only becomes call-free after its own callees are inlined
-  (the `refs` wrapper `sum_via_ref` needs round two). A loop is allowed — a small
-  helper like `gcd` has one and is still worth inlining, since that removes the
-  call from the caller's hot loop (measured 1.12x on a `tri(i % 50)` shape). A
-  `break`/`continue` is *not* allowed: once spliced into the caller it would bind
-  to the caller's enclosing loop. A non-final `return` is not allowed either, for
-  the same reason. `Sub` already rewrites `while`/`loop`/`for` bodies and their
-  counter slots, and `escaped_slots` already descends into them, so a
-  loop-bearing body needs no extra splice work. A statement-free block is unwrapped to
-  its tail after expansion: the spliced body of an accessor would otherwise stay
-  wrapped in an `Expr::Block`, and later passes (`simple_operand`, the
-  accumulator fold) cannot see through a block, so the hot loop would bounce its
-  sum through `%rax` and the spill slots. `--no-inline` disables it; the tests
-  that assert on the calling convention (`call f`, argument setup) use it.
-  `MAX_NODES` (48) must stay above a two-level helper — `sum_via_ref` is 35
-  nodes once its accessors land — and `count_expr` must count a block's tail,
-  or a candidate's size is understated and it is wrongly admitted.
-- **LICM never hoists a read through a reference.** A scalar field read is
-  hoisted only when its base is a local aggregate (`frame_field_base`); a field
-  read through `&T` dereferences a pointer that may be null (`0 as &S`) or
-  dangling, so hoisting it would fault on a loop whose body never runs. Any
-  field in the chain whose own type is a reference holds such a pointer, so
-  `h.p.n` (where `p: &S`) is not a frame access either. Nor is a field whose
-  *base* is a reference: `&r.inner` (where `r: &S`) forms `*r + offset`, so it
-  dereferences `r` and is not frame storage. `is_frame_place` rejects a
-  reference-typed base before recursing, which is what keeps `&r.inner` out of
-  `proven_refs`; `&r` itself (the local pointer slot) stays a frame place. Local
-  aggregate fields are frame accesses and stay hoistable.
-- **LICM hoists a loop body's invariant arithmetic, and `for` slots are
-  loop-carried.** The pass rewrites only a loop *body*; a `while` condition and
-  a `for`'s bounds run once per iteration by design. A `for`'s variable and
-  bound are assigned by the loop itself, not in the body, so they are handed to
-  the effect scan as explicit `carried` slots — miss this and `if i == 3` in a
-  `for` body gets hoisted and the loop runs wrong. It hoists only a pure,
-  non-trapping scalar: no call, division/modulo, index, dereference, block or
-  `if`, and a field read only when the loop writes no memory at all. Any call in
-  the loop disables the whole loop, since a call can write anything. The effect
-  scan must also see writes that do not name a slot directly: a `while`
-  condition and a `for`'s start/end run as part of the loop, taking a local's
-  address (`&mut x`) marks that slot as written (an inlined callee's deref store
-  reaches it), an assignment target is scanned as an expression
-  (`a[next(&mut x)] = 0`), and assigning a whole aggregate marks the loop as
-  writing memory. The pass is off under `--overflow-checks` (a hoisted checked
-  `+`/`-`/`*` would trap at the wrong time); `--no-licm` disables it outright.
-- **Stack slots grow downward.** A local in slot `s` lives at
-  `-(s+1+nregs)*8(%rbp)`, where `nregs` is the number of registers holding
-  promoted locals. Address them positively and you overwrite the saved
-  `%rbp`/return address and segfault. See `Codegen::off`.
-- **Spills live in frame slots, not on the stack.** `push_rax`/`pop_to` write a
-  slot instead of `push`/`pop`, so `%rsp` never moves and no alignment pad is
-  needed around a call. The first few spills are held in callee-saved registers
-  (`spill_regs`); only spills past those reach the frame, and they are packed at
-  `spill_base + (sp_off - spill_regs.len())` so a register-held spill leaves no
-  hole. `spill_slots` is sized by a dry run of the body; if the real pass spilled
-  deeper than the reservation, spills would overwrite locals. Keeping the two
-  passes identical is what makes the reservation exact.
-- **The frame is sized to the slots actually used, not to `nslots`.** The parser
-  sizes `nslots` for every local a function *could* declare; `off`/`array_off`
-  record the deepest local slot the emitted body actually names (excluding spill
-  slots, which are counted separately) and the prologue allocates only that much
-  plus `spill_slots`. A promoted-local-only leaf like `fib` then needs no frame
-  at all: dropping its 16-byte `sub`/`lea` pair took `fib` from 13.5 ms to
-  10.6 ms. The measurement is a `Cell` because `off`/`array_off` take `&self`;
-  the dry pass measures and the final pass is seeded with the result, so the
-  prologue (emitted before the body) allocates the exact size.
-- **A function that addresses no frame slot also omits `%rbp`.** When
-  `frame_slots == 0 && spill_slots == 0` nothing is ever addressed through the
-  frame pointer, so `push %rbp`/`mov %rsp, %rbp`/`leave` are dropped and the
-  epilogue `add`s the frame back instead of pointing `%rsp` at the saved
-  registers. This is the same reasoning the hand-written `alloc` already uses
-  (see below), generalised to compiled functions. On the current benchmark set
-  it is a wash at run time — the out-of-order core hides a three-instruction
-  prologue — but it is strictly fewer instructions and a couple of bytes smaller
-  on a register-only leaf like `fib`. `uses_frame` is read *before* the body is
-  emitted, because emitting re-measures `frame_slots` and `off` is `&self`.
-- **The no-frame-pointer path needs its own alignment pad.** The call ABI wants
-  `%rsp ≡ 8 (mod 16)` at a call. With a frame pointer `push %rbp` supplies the
-  8; without it, the saved registers plus the frame must total 8 mod 16, so an
-  even number of saved registers (16 bytes) is followed by an 8-byte `sub`.
-  A misalignment is silent — rmc's runtime makes no aligned SSE access, so it
-  never faults — which is why it is checked statically over every program in
-  `bench/` and `tests/cases/` (every call-site function must show
-  `%rsp ≡ 8 (mod 16)`) rather than trusted to the behavioural suite.
-- **Two-pass codegen must reset every counter.** `gen_fn` runs the body twice and
-  truncates the output between passes; the label counter, string table, spill
-  high-water mark and frame-size measurement are part of that reset. Miss one and
-  the two passes diverge.
-- **Cold blocks keep the hot path straight.** The 64-bit divide slow path
-  (the `i64::MIN`/`-1` check and `idiv`) is correct but almost never taken, so
-  `emit_div` routes it through `cold_start`/`cold_end` into a buffer appended
-  after the function body. Inlined, its ~30 bytes sat between the hot loop's
-  `div` and its back edge. The hot path then falls through to the join point and
-  `trim_dead` drops the `jmp` it used to need; the cold block keeps its own jump
-  back. The measured win is small (~0.5% on `mix`) but consistent, and the
-  layout no longer depends on where the slow path happens to land.
-- **The dry pass skips `trim_dead`.** The dry run only measures the spill
-  high-water mark and the deepest slot, and the dead/round-trip instructions
-  `trim_dead` removes change neither, so `Codegen::dry` turns the pass off for
-  it. That is a pure compile-time saving on a function whose body is one long
-  straight line: `div.rs` (a 531-line `main`) drops 6% of its compile time, and
-  the emitted assembly is byte-for-byte identical to running the pass twice.
-- **A callee-saved *temporary* is not worth it; a callee-saved *spill* is.** An
-  early attempt kept every short-lived value in `%r12`-`%r15` and measured
-  *slower* — the unconditional save/restore in the prologue/epilogue cost more
-  than the spills it removed. The shipped `spill_regs` is narrower: it holds
-  only the temporaries that must survive a call (the dry run reports how many),
-  so a function with no spill reserves no register and pays no push/pop. On the
-  recursive `fib` (which has exactly one such value per call) that is +23%
-  (`--no-tco`: 13.1 ms to 10.1 ms); it is invisible in the default benchmark
-  table because `tco` has already rewritten `fib`'s recursion into a loop with
-  no memory operation to remove. Do not widen it back to all temporaries, and
-  re-measure with `--no-tco` before touching it, or the win hides.
-- **Don't gate promotion on a use count.** A single-use local like `gcd`'s `b`
-  is copied into `%rbx` once, read once in the loop, and costs a push/pop per
-  call, so promoting only slots used more than once looked like a win on `mix`.
-  It measured neutral (0.998–1.009× across the suite, `mix` unchanged): the
-  extra frame store/load replaces the register push/pop one-for-one. Keep the
-  `> 0` filter.
-- **Saved registers sit between `%rbp` and the frame.** The epilogue must point
-  `%rsp` at the lowest saved register (or add the frame size back) before
-  popping, otherwise `pop` reads the frame and the return address is lost.
-  `regs.rs` and `calls.rs` fail if this regresses.
-- **Only whole-value structs keep all their fields in memory.** A scalar field
-  of a struct is promoted like any other local, *unless* the struct is ever
-  copied, returned or passed by value, in which case the whole-value copy reads
-  and writes memory and every field must stay there. `promote` tracks that
-  during its walk (`copied` and the `let` targets) and zeroes those slots. A
-  promoted field that stays in memory on the copy path but is read from its
-  register on the field path is a silent wrong-answer bug, which is what
-  `fieldpromo.rs` guards.
-- **A struct's base slot is its last field, and it stays promotable unless the
-  struct is used as a whole.** Field `k` lives at `slot + fields - 1 - k`, so
-  field `fields - 1` *is* `slot`. A whole-value use (copy, return, pass by
-  value, `let` of a whole copy) already marks every slot via `copied`, so the
-  base slot needs no special case; a field-by-field use reaches every field by
-  address off `array_off` or by register, so the last field competes for a
-  register like any other. `field_operand` must test the *field's own* slot
-  (`slot + n - 1 - offset/8`), not the struct's base slot, before trusting a
-  `%rbp` operand — otherwise a promoted last field reads a stale frame word.
-  A payload enum is the exception: it is read as a whole through its base word,
-  so that word always stays in memory. Promoting `stats`'s last field, together
-  with keeping an i64-method receiver in its slot and folding field
-  accumulators, is worth ~0.9x -> ~1.15x of its rustc twin.
-- **A base-less SIB operand must use mod=00 with a disp32.** `lea 0(,%rax,8)` is
-  SIB base field 101, which means "no base" only at mod=00; at mod=01/10 it
-  selects `%rbp` instead. Emitting a disp8 there reads the wrong address (a
-  silent miscompile that surfaced as `4 * c` printing a stack pointer). The
-  mirror case is `%rbp`/`%r13` as a base (rm 101), which is invalid at mod=00
-  and needs a disp8 0. `elf.rs` unit tests pin both.
-- **Field-to-slot uses the slot count, not the field count.** A struct with an
-  array field has more slots than fields (`WithArr` is 2 fields, 4 slots), so
-  `fields.len()` gives the wrong map. Use `size / 8`.
-- **Arrays cannot be promoted.** An element is reached by `base + i*8` through
-  memory, so no element slot may be promoted, and neither may an index base.
-  `promote` excludes *every* slot an array spans, not just its first.
-- **Aggregate element 0 is at the lowest address.** An array or struct in slots
-  `s..s+n` has element/field 0 at `-(s+n+nregs)*8(%rbp)`, with item `i` at
-  `base + i*8`. Mixing this up makes aggregate writes run upward past `%rbp`.
-  `aggregate_base` returns this base for both arrays and structs; use it
-  everywhere, including the struct-literal store in `gen_stmt` (an earlier bug
-  used `off(slot)`, the wrong end of the range).
-- **A wide element has stride `size()/8`, not 1.** An array of nested arrays or
-  of structs addresses element `i` at `base + i * stride`, so `array_off` must be
-  called with the *slot* count `n * stride`, never the element count `n`. Every
-  load, store, copy and splat scales by that stride. The stride comes from
-  `elem_stride(base)`, which reads `array_elem_ty(base)`; that must look through
-  an `Index` base (`m[i][j]` uses the inner array's element type), or the inner
-  index silently uses stride 1 and reads a neighbouring element. `sema`'s
-  list-literal and repeat-literal desugars must also allocate `n * stride` slots:
-  allocating `n` makes wide elements overlap.
-- **A splat copies one value into every element.** In `splat_aggregate`'s
-  counting loop only the destination pointer advances; the source stays put. An
-  earlier version stepped both, so element `i` was read from `v + i*elem_size`
-  and only element 0 held `v` — invisible for a scalar splat, wrong for a wide
-  element over the 8-word small-path threshold.
-- **`for` is not a `while`.** `continue` must run the increment, so `for` keeps
-  its own node with a dedicated continue label (`cont`). Desugaring it to `while`
-  would make `continue` skip the increment and loop forever. It *is* rotated like
-  `while`, but with a different shape: the guard tests the *un-incremented*
-  counter at the bottom and loops back to `top`, and the increment sits on the
-  fall-through path between the body and the guard. The entry `jmp` therefore
-  reaches the guard with `var == start`, the first body runs before any
-  increment, and `continue` targets `cont` so it still runs the increment exactly
-  once. Duplicating the guard at the top instead (the naive rotation) is what
-  would skip the first iteration or double the increment.
-- **A loop label selects the target loop, not the innermost one.** `sema` and
-  `codegen` each keep a stack of the enclosing loops (`loop_stack` / `loops`)
-  with the loop's label, and resolve a `break 'a` / `continue 'a` by searching
-  that stack from the top for the label (an unlabelled `break`/`continue` takes
-  the innermost entry). The label is carried through the desugarings that build
-  a loop: `'a: for x in arr` copies the label onto the index `for` it expands
-  to, and `'a: while let PAT = EXPR { .. }` passes the label to the `loop` it
-  desugars to, so `break 'a` / `continue 'a` in the body target it. The
-  `if`-with-a-lone-`break`/`continue`
-  fast path in `bare_exit` only fires for an *unlabelled* `break`/`continue`,
-  since a labelled one may leave an outer loop.
-- **`'` starts a `char` literal or a loop label, and the lexer decides by lookahead.**
-  It is a `char` literal when the byte after `'` is a backslash escape, an
-  immediate `'` (`''`), or a full UTF-8 sequence followed by `'`; otherwise it
-  is a label. This mirrors rustc, where a label is never followed by a lone
-  quote. A `char` *range* pattern (`'a'..='z'`) is built in `maybe_char_range`:
-  after a `char` literal, a following `..`/`..=` consumes a second `char`
-  literal as the upper bound. The upper bound must be a `char` literal (a bare
-  `5` is rejected) and an empty range (`'a'..'a'`, `'z'..'a'`) is rejected, as
-  rustc rejects them (E0579/E0308). `Pat::CharRange` lowers to the same
-  `lo <= s && s <= hi` comparisons as `Pat::Range`, so sema and codegen need no
-  new case.
-- **A `for` bound is compared directly when it is a constant, and through a
-  hidden slot otherwise.** `0..=1000` needs no `end_slot`: the guard is
-  `cmp $1000, %rax`, so no frame word is written and no reload happens each
-  iteration. A non-constant bound (e.g. `0..n`) is evaluated once into `end_slot`
-  and compared register-to-register. `count_expr` must count the hidden counter
-  and bound slots so they compete for a callee-saved register like any other
-  loop-carried local; otherwise the bound is reloaded from the frame every pass.
-- **`for x in ARRAY` desugars to an index loop**, not a new node:
-  `{ let a = EXPR; for i in 0..a.len() { let x = a[i]; body } }`. `parse_for`
-  binds `EXPR` to a hidden `\0fa<n>` temporary so an array expression with a
-  side effect (a call, a literal) runs once, and `a.len()` folds to the array's
-  compile-time length, so the loop bound is a constant and `end_slot` is unused
-  (see the note above). `x` is a fresh `let` per iteration, so it is immutable
-  and a stale read across iterations is impossible. `continue`/`break` work
-  because the desugared loop is the ordinary `For` node. A **struct pattern**
-  `for S { f, .. } in arr` reuses `let_destructure_stmts` (the `let`
-  destructuring expansion) in place of the single `let`, so the element is read
-  into a hidden temporary and the fields are bound from it; the element type is
-  `S`, so this is the same read-through as `let`. The pattern must be
-  irrefutable: a binding, `_`, or a struct pattern — including a nested
-  sub-pattern, which `struct_pat_binds` recurses into like the `let`/`match`
-  paths (a refutable pattern like an enum variant is rejected rather than
-  mis-bound). **`for x in &arr` / `for x in &mut arr`** iterates by reference:
-  the element binds to a real `&arr[i]` / `&mut arr[i]`, so `*x` reads and
-  `*x = v` writes the element in place, and the array place is indexed directly
-  (never copied — a `&mut` write reaches the original binding). `parse_for`
-  recognises the `Expr::AddrOf` head and hands the inner place to
-  `desugar_for_array_ref`, which builds `for i in 0..arr.len() { let PAT =
-  &arr[i]; body }`; `is_iterable_place` gates it to a binding or an
-  `Index`/`Field`/`Deref` chain rooted at one, so `&arr[i]` works but a
-  reference to a temporary (`&mk()`, whose head is a `Call`) is rejected rather
-  than mistyped. A `Vec` binding is excluded (`vec_names`) because it is a bare
-  address with no element type to address. The pattern must be a binding or `_`.
-  **`arr.iter()` / `arr.iter_mut()`** are recognised just before the range
-  checks and map to the same `desugar_for_array_ref` with `mutable` false/true.
-  `into_iter` is deliberately *not* accepted: on an array its element type is
-  edition-dependent (by-reference before Rust 2021, by-value after), and rmc has
-  no edition, so a fixed choice would diverge from one of them. `tests/cases/forref.rs`
-  and the by-reference unit tests cover it. `parse_for`
-  also checks the pattern name against the constant table *before*
-  `parse_pattern`, because a bare
-  constant name there resolves to its value (not a binding), which would turn
-  `for N in 0..3` into an iteration over a literal and lose the E0530 error.
-  `tests/cases/forarr.rs` and the `stmt` fuzzer cover it.
-- **Range adapters desugar to one upward counter, and the maps compose.** `for
-  i in (lo..hi).rev()` / `.step_by(k)` / `.skip(k)` / `.take(k)`, chained in any
-  order, are recognised by a token lookahead (`at_parenthesized_range_adapter`,
-  which requires the parentheses Rust requires) and desugared by
-  `desugar_for_range_adapter` into the ordinary `Stmt::For` upward counter, so
-  `continue` still reaches the increment — a downward `while` would skip it and
-  loop forever. The lookahead shares `parenthesized_range_end` (the token index
-  past a `( lo..hi )` group, `None` when it is not a range) with the plain form:
-  a parenthesized range with *no* adapter (`for i in (0..4)`) is unwrapped by
-  `at_parenthesized_range_plain` to the ordinary range loop, since `(lo..hi)` is
-  not an rmc expression. The plain check runs only after the adapter check fails,
-  so `(a..b).rev()` still takes the adapter path; both require the `..` at depth
-  one, so `((a..b))` and `(a..b).sum()` match neither. The desugar is two passes: a forward pass gives each adapter a
-  `let` bound (evaluated once, not per step) and threads the sequence length
-  through, and a reverse pass composes each adapter's *index* map into the
-  element expression. The maps stay relative to the raw range and `lo` is added
-  once at the end, which is what makes `rev` after another adapter reverse that
-  adapter's slice rather than the whole range. `rev`'s length is bound to a
-  temporary when it is itself a computed count (a `step_by`), so it is not
-  recomputed per iteration. `skip`/`take` use `__rmc_min(a, b)` (a new runtime
-  helper) for `c = min(k, len)`; `skip` shifts the map by `c`, the count it
-  actually removes, not the overshoot. Adapter temporaries use `\u{0}r`-prefixed
-  names (`rl`/`rh` for the bounds, `ri` for the counter, `rk`/`ra`/`rc`/`rs` for
-  the stride, argument, count and length-substitution); the counter is `ri`, not
-  `rc`, so it cannot collide with the `c` of the first `skip`/`take`.
-  `step_by`'s count is `ceil(len / k)` built as `len / k + (len % k != 0)`, not
-  `(len + k - 1) / k` (which overflows for a stride near `i64::MAX`) and not
-  `len / k + min(len % k, 1)` (which pulled in `__rmc_min`, and the test asserts
-  `step_by` needs no `min`). A negative *literal* count (`skip(-1)`,
-  `step_by(-1)`) is rejected as a unary `-` on a `usize` (rustc's `E0600`),
-  checked in the forward pass before the adapter's argument runs; a non-literal
-  negative count is left to run time, since rustc accepts it. A `rev` applied
-  *directly* to the raw range with no other adapter is a special case:
-  `desugar_for_range_rev_plain` lowers `(lo..hi).rev()` to an *inclusive*
-  upward counter `0..=span` (with `span = hi - lo`) whose element expression is
-  `hi - 1 - i` (or `hi - i` for `..=`), so the count `hi - lo + 1` is never
-  formed and a range whose length does not fit `i64`
-  (`(0..=i64::MAX).rev()`) still runs. The caller tries this path first and
-  falls back to `desugar_for_range_adapter` when it returns `None` (a
-  `skip`/`take`/`step_by` is present), so the general path keeps its
-  `__rmc_min`-based counts. A *remaining divergence*: only a `rev` chained
-  after a `skip`/`step_by` still materialises the span as a count, and the full
-  `i64::MIN..=i64::MAX` inclusive span overflows (rustc accepts it).
-  `tests/cases/rangeadapt.rs`, `tests/cases/revrange.rs` and
-  `counting_range_adapters_compile`/`a_plain_reversed_range_does_not_form_the_span_count`
-  cover the chains.
-- **`..=` exits on `jle` back-edge, not `jl`.** The guard is the loop-back
-  condition, so the inclusive form loops while `var <= end` (`jle`) and the
-  exclusive one while `var < end` (`jl`); a `jg`/`jge` *exit* test is the
-  un-rotated mirror of the same thing. `forloop.rs` and
-  `an_inclusive_range_uses_a_strict_exit_test` pin both bounds, and `..=` is a
-  three-character token, so it must be lexed in the three-char table (before
-  `..`), or it lexes as `..` then `=`.
-- **Loop bodies are aligned to 16 bytes.** Each loop's body label is preceded
-  by `.p2align 4`. Without it the body's start address drifts whenever unrelated
-  code elsewhere in the function changes size, and a one- or two-byte shift can
-  flip a hot loop between fetch-friendly and straddling alignments - a
-  two-byte *shrink* once cost `forloops` 0.69x. Aligning pins the body so the
-  same loop compiles to the same speed regardless of what moves around it. This
-  needs `trim_dead` to keep directives: it must test the *trimmed* line for a
-  leading `.`, because `.p2align` is emitted indented and otherwise looks like
-  dead text after the entry `jmp`. `a_loop_body_starts_on_a_sixteen_byte_boundary`
-  pins it.
-- **A hot loop's speed is an alignment lottery, so do not chase it.** Two
-  builds whose loop body is byte-identical differ by up to 1.4x when a preceding
-  change shifts the body by one byte (a `stats` variant measured min 2.61 ms at
-  one header offset and 3.08 ms two bytes later). This is not a codegen-quality
-  signal: the body the emitter produced was the same. The `.rms` path pins the
-  loop *body* to 16 bytes so unrelated edits cannot move it (above); the MIR
-  path (`mir_codegen.rs`) does **not**, which is why `stats`'s run-time drifts
-  with unrelated function-size changes. Do not try to steer it with per-header
-  `.p2align`/`nop` padding: a blanket 32-byte header alignment helped `sieve`
-  but lost on `callrec`/`fib`, and a size-thresholded version (align only bodies
-  of >=9 MIR statements) still lost on `mix`/`mandel`. `stats`'s ~0.97 run-time
-  against LLVM is this effect, not a scheduling gap.
-- **A caller-saved promotion is spilled around a call only when it is live
-  after it.** `spill_caller_saved` consults a backwards liveness fixpoint
-  (`compute_liveness`, built on `scan_rv_uses`/`scan_term_uses`) and skips a
-  promotion whose value the call's successor never reads again; the drop-glue
-  path passes `None` and keeps saving every one, because its calls span a tree
-  with no single block to query. This removes a store/reload pair around calls
-  in non-looping regions.
-- **A divisor that fits i32 uses `mov` not `movabs`.** `gen_div_const`
-  materialises the divisor and the magic multiplier; `mov_imm64` picks the
-  7-byte `mov $k, reg` when the value is a sign-extended 32-bit immediate and
-  the 10-byte `movabs` only when it is not. Small divisors are common, so this
-  trims the divide sequence and the artifact. The in-process ELF encoder
-  (`emit_mov_imm` in `elf.rs`) already made this choice, so the default path is
-  unchanged and only the `--binutils` artifact and the emitted `.s` shrink
-  (~0.7% across the corpus). `a_small_divisor_uses_a_short_immediate` and
-  `a_wide_magic_multiplier_keeps_movabs` pin both directions.
-- **`mov $imm, %reg` width follows the destination register.** The encoder
-  (`enc_mov_generic`/`emit_mov_imm`) picks the encoding from the register name
-  and the mnemonic: an unsuffixed `mov` to a 32-bit register (`%eax`) is the
-  5-byte `B8+rd` form with no REX.W, an unsuffixed `mov` to a 64-bit register
-  (`%rax`) is `C7 /0` (a sign-extended 32-bit immediate) unless the value does
-  not fit i32, `movq` is always 64-bit, and `movabs` is always the 10-byte
-  `B8+rd` form even for a small value. Getting this wrong is a silent
-  disagreement with `as`, which the `--encoding` fuzz oracle and the
-  `tests/cases/strcmp` case (a `mov $1, %eax`) catch; `elf.rs`'s unit tests pin
-  each form.
-- **`while` is rotated.** The test is emitted at the bottom as the back edge
-  (`gen_branch_true`, a `jl`/`jne`) with an entry `jmp` reusing the same test, so
-  an iteration is one branch fewer than the top-tested form. `continue` targets
-  the bottom test and `break` the label it falls into. If you change the loop
-  shape, keep both: a rotation that forgets the entry test loops forever on a
-  false condition, and one that targets the body for `continue` skips the test.
-- **Promotion counting is sparse, not a dense table over `nslots`.** `counts`
-  and `mem` are a `HashMap`/`HashSet` keyed by slot, and only slots something
-  actually names get an entry. A dense `vec![_; nslots]` plus a sort over
-  `0..nslots` is O(array length) — and the array's *element* slots are never
-  named, so the table is almost all zeros. A 200k-element array made that path
-  take ~1.9 ms (codegen was 90% of the compile); the sparse form is ~20 µs.
-  `large_array_compiles_in_linear_time` guards it.
-- **An array never needs its element slots marked in memory.** Only the base
-  slot can be named (elements are reached as `base + i*8`), so `Expr::Var` on an
-  array, a `let` of one, and `mark_addressed` all mark just the base. Marking
-  every element is O(length) per mention and promotes nothing that was not
-  already unpromotable.
-- **Struct layout must agree between read and write.** `sema` resolves a field
-  to an offset from the aggregate base; codegen must add that offset to the same
-  base used for reads (`field_operand`) and writes.
-- **Aggregates cross calls by hidden pointer.** An aggregate argument is copied
-  into a `sema` slot and its address is passed; an aggregate result is written
-  through a buffer the caller passes in `%r10`. Two orderings are load-bearing:
-  the callee must save incoming pointers on the stack *before* any copy, because
-  the copy clobbers `%rsi`/`%rdi` (which still hold later arguments). The caller
-  evaluates arguments strictly left-to-right and pushes each one (aggregate: its
-  slot address after the copy; scalar: its value), then pops them into the ABI
-  registers right-to-left, so an earlier argument's source is already copied
-  before a later argument runs. Evaluating all aggregates before the scalars
-  would run side effects out of order: `f(g(), mk())` must print `2` then `1`,
-  not the reverse. `aggfn.rs`/`aggbig.rs` and `argorder.rs` cover this.
-- **`%r10` carries the return buffer.** It is caller-saved and not an argument
-  register, so it survives argument setup. Do not use `%r10` as scratch anywhere
-  argument setup can run after the return pointer is set.
-- **The direct-argument shortcut must decline every clobbering argument.**
-  `gen_call` writes scalar arguments straight into the ABI registers when each
-  argument is a simple operand, or when there are at most two and none calls or
-  copies an aggregate. `contains_call` must therefore recurse into *every*
-  expression that can evaluate a child — including `EnumCtor`, `VariantTest`
-  and `EnumPayload` — and `clobbers_arg_regs`/`stmt_clobbers` must flag every
-  statement path that runs `copy_words_rdi_rsi` (whole-aggregate `let`, and
-  aggregate `Var`/`Field`/`Index` stores). A missed case leaves an earlier
-  argument in `%rdi`/`%rsi` that a later argument overwrites.
-- **At most six parameters.** The System V integer argument registers are the
-  only ones this compiler uses, so `sema` rejects a function (or a method after
-  its receiver is inserted) with more than six parameters rather than letting
-  `zip(ARG_REGS)` silently drop the seventh.
-- **`mut` is enforced.** `Stmt::Let` carries a `mutable` flag and `FnDef` a
-  `param_mut` vector; `sema` records both in its scope and rejects an assignment
-  to a non-`mut` binding. A plain `let` is written exactly once — its initialiser
-  or its first assignment — so a later write is `cannot assign twice to
-  immutable variable`, and an immutable parameter reports `cannot assign to
-  immutable argument`, both matching rustc. The check is a may-analysis: an
-  `if`/`else` merges a flag with OR. Whether a write repeats is decided per
-  path: `Sema` threads the enclosing statement's continuation (`loop_cont`)
-  into every nested block, so a write is a second write only when *some* path
-  from it reaches the loop's top again — a `continue`, a loop body's
-  fall-through end, or the code after its statement. `x = 1; break;` is a
-  single write even when a sibling path `continue`s, and a `loop` whose every
-  path `break`s/`return`s runs at most once. A `break` merges the writes on its
-  path into the post-loop state. Keep generated `let`s `mutable: true` so they
-  never trip this. Three edges the analysis must get right: every loop entry
-  pushes a `loop_cont` entry (not just `loop_reach`), or a nested block's
-  `saved_cont` defaults to `false` and a write in the nested block of a
-  repeating loop is missed; a `break` merges only the *prefix* of its snapshot
-  that lines up with the bindings present at loop entry, so a break path that
-  declared extra locals still contributes its outer-binding writes; and a
-  `loop` with no reachable `break` does not fall through, so an infinite inner
-  loop must not make the outer loop look repeating. Two more: an `if`/`while`
-  condition is evaluated like any other operand, so the break/reach walks
-  descend into condition expressions and every other evaluated child
-  (`expr_has_break`/`expr_contains_continue`), or `loop { loop { if { break;
-  true } {} } x = 1; }` wrongly accepts the second write; and a labelled
-  `continue` inside a nested loop still targets the outer loop, so the reach
-  walk descends into a nested loop body, threading a `nested` flag so an
-  unlabelled `continue` there no longer counts. A diverging condition
-  (`{ break; }`, `{ return; }`, `{ continue; }`) has type `!`, which rustc
-  accepts where `bool` is expected; the `if`/`while` condition type check must
-  not reject it. An *unlabelled* `break`/`continue` in a `while` condition has
-  no valid target (E0590), so the condition check rejects it via
-  `cond_has_unlabelled_exit`; a labelled one is fine.
-- **A compound assignment evaluates its place once.** `desugar_compound` binds
-  any component of the target that contains a call — the base or the subscript —
-  to a temporary and reuses it for both the read and the write, so `make().x += 1`
-  calls `make` once. A call-free `Var`/`Field`/`Index` is cloned directly.
-- **`sema` persists the inferred type on every `let`.** Codegen selects the
-  aggregate path from `Stmt::Let`'s `ty`, so leaving it `None` for `let a = [7; 2]`
-  silently initialises only one word.
-- **Struct-literal fields stay in source order.** Their layout offsets are
-  attached per field, so reordering them into declaration order would change the
-  order initializer side effects run in.
-- **A bounds check sees through a reference to an array.** `array_len_of` /
-  `array_len_ty` unwrap an `Expr::Ref` base, so `let r: &[i64; 3] = &a; r[i]`
-  traps on an out-of-range `i` by default instead of reading adjacent memory. A
-  field store through a shared `&T` is rejected by `place_writable` ("cannot
-  assign through a shared reference; use `&mut`"), and a `&mut` binding itself
-  is not reassignable unless declared `mut`.
-- **Bounds checks are on by default and cover `v[i]` on a `Vec`, not just a
-  fixed array.** An array's length is static, so `check_bounds` folds it in
-  codegen; a `Vec`'s length is a runtime header word, so the parser lowers
-  `v[i]` through `__rmc_vec_at(vector, index, stride)`, which reads the live
-  length and traps (`jae __rmc_bounds`) before forming the address. `rmc` used to
-  leave `v[i]` as plain pointer arithmetic unless `--bounds-checks` was passed,
-  so an out-of-range index read or wrote past the store with exit 0 where rustc
-  panics - a silent out-of-bounds read (CWE-125). Now the check is the default,
-  matching rustc, and `--no-bounds-checks` is the explicit unsafe opt-out. The
-  index is evaluated exactly once, inside the call, so a base or index with a
-  side effect still runs once, in order. `run.py`'s
-  `vec_read`/`vec_store`/`vec_struct` trap cases pin it under a plain `ld` link.
-- **A `v[i] = x` write needs a `mut` binding.** The index lowering forms the
-  element reference `&mut` or `&` from the binding's own mutability (`vec_mut`),
-  so a write through a read-only binding is a shared-reference write that sema
-  rejects, exactly as rustc does, while a read stays fine. (The earlier code
-  hardcoded `&mut`, so `let v: Vec<i64> = vec![..]; v[0] = 1;` was accepted.)
-- **Assignment evaluates its value before its place.** rustc orders assignment
-  operands right-to-left (the one expression that does), so `a[li(1)] = li(5)`
-  must run `li(5)` before `li(1)`. Codegen's general index/deref store path and
-  `store_through_addr` evaluate the value first and stash it across the address
-  computation whenever that computation can have an effect (`place_has_effect`,
-  which is `contains_call` plus a block/if that assigns a local), and the
-  aggregate copy is factored into `assign_aggregate` for the same reason. The
-  walk must reach every place form (`Deref`, `AddrOf`, `EnumPayload`, ...) and
-  must descend through `Bin`/`Un`/`Cast` and an `if` condition, or a target like
-  `r[{ y = 2; 0 } + 0]` is mis-ordered: `contains_call` alone misses a block
-  that assigns without calling. `assignorder.rs`, `refidxorder.rs` and
-  `tools/fuzz.py --mode order` pin this.
-- **A compound assignment binds its modifying operand first.** `desugar_compound`
-  evaluates the right-hand operand into a temporary ahead of the subscript
-  temporary, so `a[next()] += val()` runs `val()` before `next()`, matching the
-  right-to-left rule above. The subscript is still bound once, so `a[next()] += 1`
-  advances the counter once, not twice, and the cheap two-instruction form is
-  kept when the subscript has no call.
-- **A struct update evaluates its fields before its base.** `S { f: v, ..base }`
-  is desugared by `desugar_struct_update` into
-  `{ let v = <field value>; ...; let mut t = base; t.f = v; ...; t }`: every
-  written field value is bound to a temporary *before* the base runs, which is
-  rustc's order (verified against `rustc -O`). Evaluating the base first is a
-  silent wrong answer when a field value mutates the base, so
-  `tools/fuzz.py --mode update` emits `S { x: mutate(&mut base, ..), ..base }`
-  and pins it. The result is a fresh local, so it never aliases the base, and a
-  field written twice is rejected at parse time (the plain-literal path catches
-  that in sema). A comma may not follow the base (rustc rejects it), and a
-  struct literal *is* allowed as the base (`..P { ..a }`), unlike the
-  struct-literal-in-condition restriction.
-- **Statements vs. tail expressions.** Assignments inside a block must be
-  detected before the trailing-`;` check in `parse_block`, otherwise `x = ...;`
-  is parsed as an expression and rejected. An assignment's own `;` may be
-  omitted when it ends a block (`eat_semi_at_block_end`), so the check is not a
-  bare `expect`; a leading `;` is skipped first as an empty statement.
-- **Spill slots are frame slots.** `push_rax`/`pop_to` spill to a frame slot
-  rather than `push`/`pop`, so `%rsp` is static and a call needs no alignment
-  pad. This measured faster on every real program (`fib` +3.3%) because the pad
-  costs two instructions per call.
-- **`alloc`'s fast paths are a leaf.** The free-list scan, the arena carve and
-  the failure return touch only caller-saved registers, so `alloc` keeps no
-  frame pointer and saves no callee-saved registers; the prologue/epilogue that
-  a `push %rbp` + four `push`es cost was pure overhead on every allocation.
-  Measured +7% on `heap` (3.61 → 3.37 ms). Only the mmap slow path needs state
-  across the syscall: the total block size rides the stack (the syscall clobbers
-  `%rcx`/`%r11`) and the chunk length stays in `%rsi`. Keep new code off the
-  callee-saved set, or the whole-function frame comes back.
-- **Linking.** By default `src/elf.rs` assembles and links in-process; `as` and
-  `ld` are only used under `--binutils`. The in-process path is what makes rmc
-  ~4–5x faster to compile than the binutils path (the two child processes were
-  ~80% of the wall time) and gives a *smaller* artifact, because it never emits
-  a symbol table or a section-header table to begin with. It writes exactly two
-  `PT_LOAD` segments — one R+X for `.text`/`.rodata`, one R+W for `.data` — so
-  there is no W^X segment. Writable sections start on their own page: the kernel
-  maps each `PT_LOAD` rounded down to a page, so a RW segment sharing a page with
-  the RX one would have its `mprotect`-like mapping replace the execute
-  permission. The runtime's writable globals are all zero, so they are emitted
-  as `.bss` (`p_filesz = 0`, `p_memsz` set): mapping them from the file would
-  cost a page of padding and about 4 KB on every artifact. Only a *writable*
-  section may be demoted to `.bss`. A read-only `.rodata` that happens to be all
-  zeros — a program whose only string literal is `""` emits just `.quad 0` — is
-  still file-backed and part of the RX segment; demoting it left `rx_end`
-  reading its unassigned `file_off` of 0, so the RX segment covered 8 bytes and
-  the binary segfaulted on entry while the `--binutils` path worked. When adding an
-  instruction or a codegen form, remember the encoder only implements the subset
-  the code generator emits and errors on anything else — run `tests/run.py`,
-  which compiles every case through both paths and requires identical output.
-  The `--binutils` path still uses `ld --build-id=none -z noseparate-code
-  --strip-all`; `--no-strip` keeps the symbol table, `--min-size` also runs
-  `strip --strip-section-headers`. `--no-strip` and `--min-size` request
-  opposite artifacts, so `parse_args` rejects the pair instead of letting
-  `--min-size` strip the symbols `--no-strip` asked to keep. Do not change the
-  `--binutils` link back to `-n` (nmagic): it packs every section into one
-  read+write+execute `LOAD` segment, a W^X violation, and is *larger*.
-  `tests/run.py`'s `check_stripped` pins the size ordering of all four variants,
-  `check_no_rwx` fails on any writable+executable `LOAD` segment, and
-  `check_link_paths_agree` requires the two link paths to behave identically.
-- **In-process assembler gotchas.** The encoder in `src/elf.rs` is deliberately
-  narrow; these are the encodings that are easy to get wrong and were each a
-  real bug:
-  - Group opcodes: `inc`/`dec` are group-5 (`FF /0,/1`) but `not`/`neg` are
-    group-3 (`F7 /2,/3`). `FF /3` is `call far`, which faults at run time.
-  - `bswap %r64` (`0F C8+rd`) names its operand in the low three opcode bits,
-    *not* in ModRM: there is no ModRM byte, so the register index is REX.B
-    (`rex(true, 0, reg)`), and a `%r8`-`%r15` operand needs `0x49`, not `0x44`.
-    Using the REX.R helper here would silently swap the wrong register.
-  - ModRM direction: for `mov src, dst` and `op src, dst` the *source* is the
-    reg field (REX.R) and the *destination* is r/m (REX.B). Swapping them
-    silently moves the wrong register.
-  - SIB: a byte is required for an index, for no base, and for a base of
-    `%rsp`/`%r12` (rm encoding 100). `(%base,%index)` is two parts with an
-    implied scale of 1; parsing only three-part forms drops the index (a
-    `lea 0(%r,%r)` used as `x*2` came out as `x`).
-  - A base of `%rbp`/`%r13` (rm encoding 101) needs an explicit displacement,
-    or mod=00/rm=101 means "disp32, no base".
-  - RIP-relative memory (`sym(%rip)`) writes the disp32 *after* the ModRM, not
-    before the opcode; the fixup is recorded at the trailing four bytes.
-  - Byte operands: `mov $imm, mem` and byte `mov %dl, mem` use the byte opcodes
-    (the mnemonic `mov` carries no `b` suffix but a byte-width register makes it
-    a byte move). A byte register `%sil`/`%dil` (>= 4) needs a bare `0x40` REX
-    prefix to mean itself; `setcc` does *not* (a byte name is not an extended
-    register). `movzbq` sets REX.W, `movzbl` does not.
-  - `mov $imm, %r64` sign-extends a 32-bit immediate (`C7 /0`); a negative value
-    through the zero-extending `B8+rd` form would clear the high half.
-  - Symbol immediates (`mov $__rmc_overflow_len, %rdx`) come from `.set name,
-    . - other`; resolve them after all labels are placed, not during the walk.
-  - Operand size comes from the register the caller names, *not* from the
-    mnemonic. `div %ebx` is the 32-bit form (`F7 /6`, no REX.W) and `div %rbx`
-    is the 64-bit one; forcing REX.W turned every 32-bit divide into the 64-bit
-    instruction. On the divide-bound `mix` loop that was **14% slower** at run
-    time, and it made the in-process binary disagree with `as`+`ld` for the same
-    source. The generator picks the 32-bit form deliberately (see `emit_div`),
-    so the encoder must honour it. `enc_div` now derives REX.W from
-    `reg_is_64`; a `None` REX byte is omitted entirely, matching `as`.
-  - Register-operand width must survive encoding. A 32-bit register name
-    selects the narrow form and must not set REX.W: `xor %eax,%eax` is the
-    two-byte zeroing idiom (`31 C0`), `mov %ebx,%eax` is `89 D8`. Forcing W
-    gave `xor %rax,%rax`/`mov %rbx,%rax`, which grows the artifact and
-    disagrees with `as`. A bare `0x40` REX byte (no W, no R/X/B) is dropped
-    entirely, matching `as`; an extended register (`%r8d`) still needs its
-    REX.R. `reg_is_64`/`reg_is_32` decide, and `rex_if_needed` omits the
-    no-op byte.
-  - An unsuffixed `mov $imm, mem` is a *32-bit* store. `as` has no register
-    operand to infer a width from, so it picks `movl` and warns; only an
-    explicit `movq` stores 64 bits. The generator must therefore size every
-    immediate-to-memory store (`store_operand` does), and the encoder must
-    reproduce `as`'s default rather than promoting the store to 64 bits.
-    Getting this wrong leaves the destination's high four bytes stale, which
-    is only observable when the slot previously held a value with a set high
-    half — the payload-enum path zeroes the slot first, so the encoding test,
-    not a behaviour test, is what catches it.
-  - `.p2align n` means "align to 2^n", `.balign`/`.align n` mean "align to n
-    bytes". They shared one arm that treated both as a byte count, so every loop
-    the generator padded with `.p2align 4` came out 4-byte aligned in-process
-    where `as` gave 16. The bug was invisible to the behaviour-only
-    in-process-vs-`as` test; only a byte-level check catches it. `run.py`'s
-    `check_encoding_matches_as` now compares the decoded instruction streams
-    (folding branch targets and dropping alignment `nop`s), so an operand-size
-    or alignment regression fails the suite.
-- **`.balign`/`.p2align` pads executable sections with `nop`, not zero.** The
-  in-process encoder fills an aligned gap with `0x90` in a section whose ELF
-  flags include `X` and with `0x00` elsewhere. A zero byte decodes as
-  `add %al,(%rax)`, which faults if a jump lands in the pad; the one-byte `nop`
-  is safe (GNU `as` would emit a multi-byte `nop`, but the encoder only has the
-  single-byte form). `pad_to_align` is shared with `.rodata`/`.data`, where
-  zeros are what a reader wants, so the fill is chosen from the section flags.
-- **Runtime pruning.** `runtime.rs` stores the runtime as `PIECES`, each naming
-  the symbols it defines; `for_program(user_asm)` keeps `_start` plus every
-  piece the program (or a kept piece) names a symbol of, to a fixpoint. A new
-  runtime helper is a new piece, and its `defines` list must include *every*
-  symbol the linker needs — the function label *and* any global it owns (e.g.
-  `alloc`'s piece must name `__rmc_arena`/`__rmc_freelist`, or the arena
-  vanishes and the link fails with an undefined symbol). Symbol matching is
-  word-boundary aware and strips `#` comments, so `free` does not match inside
-  `__rmc_freelist` or in `alloc`'s "free list" comment. If a trap stops being
-  emitted, its piece drops out — that is the point, but a test that asserts on
-  runtime text must first force the construct that pulls the piece in (see
-  `the_bounds_handler_is_in_an_executable_section`).
-- **`for_program` must tokenise, not rescan per symbol.** The piece texts are
-  static, so their identifier sets are built once (`piece_idents`, a
-  `OnceLock`); the program is tokenised once (`idents`) and each symbol looked
-  up in the set. The old form called `mentions` for every (piece, symbol) pair
-  over the *whole* text — O(text × symbols), the single largest cost in a
-  compile. Keep the whole-identifier matching: a substring test would pull in
-  `free` for `__rmc_freelist`.
-- **Dead-function elimination feeds runtime pruning.** `dce.rs` runs just before
-  codegen and drops every function `main` cannot reach, so a dead function that
-  called `print_str`/`alloc` no longer drags those pieces into the binary
-  (`unused_helper` calling both: 1688 → 1016 bytes). Reachability
-  over-approximates on purpose — a call in a branch that cannot run still keeps
-  its callee — because dropping a live function is a miscompile while keeping a
-  dead one is only size. A program with no `main` is left untouched so the
-  "undefined reference to `main`" link error survives. Unit tests that inspect a
-  helper's own codegen must now either have `main` call it or use
-  `asm_no_inline`; twelve such tests were updated when the pass landed.
-- **A runtime function must be emitted in `.text`.** `-n` merged sections so a
-  misplaced handler still ran under the CLI link, but with any sane link (the
-  library path, or the CLI's `-z noseparate-code`) a handler left in `.rodata`
-  is mapped without execute permission and faults. `__rmc_bounds` follows a
-  `.rodata` message, so it re-opens `.text` first; check this whenever a trap is
-  added after a `.section .rodata` block. `tests/run.py` links out-of-range
-  programs with a plain `ld` to catch it, across every optimiser configuration (a
-  hoist or inline that drops the `cmp`/`jae` would let the program read or write
-  out of range), and across the index shapes: a block or call base, a local
-  array, a negative and a computed index, a struct-field array, and a store.
-- **Every runtime piece after the first must re-open `.text`.** The bit-method
-  helpers (`__rmc_count_ones`, `__rmc_leading_zeros`, `__rmc_trailing_zeros`,
-  `__rmc_swap_bytes`, `__rmc_reverse_bits`, `__rmc_rotate_left`,
-  `__rmc_rotate_right`) follow `__rmc_clamp`, whose last message ends in
-  `.section .rodata`. Without a `.text` line they were emitted into `.rodata`
-  and faulted under a link that honours section permissions (`--binutils`, or
-  the library path). The fuzzers did not see it because a bit method that traps
-  was never combined with the CLI's `-n` merge. When adding a piece, copy the
-  leading `.text` from a neighbour; `tests/run.py` links bit-method programs with
-  a plain `ld` to catch a regression.
-- **A `.set` resolves against the section current when it appeared.** The
-  in-process encoder recorded `.` for a `.set` against the *last* section the
-  file switched to, so a `.set` after a `.section .rodata` block (the trap
-  message lengths) resolved against the wrong section and mis-sized the
-  immediate. Each `.set` now carries the section it was seen in.
-- **`array_len_of` must cover every array-typed base.** It reads the length from
-  a `Var`/`Field`/`Call` type and from a block's or `if`'s tail. A base it does
-  not recognise silently skips the bounds check; extend it alongside any new
-  array-valued expression form.
-- **Evaluate the base before checking bounds.** Rust runs the base and index
-  before the bounds check, so a call or block base with a side effect must run
-  even when the index is out of range. `check_bounds` uses no register, so
-  emitting `gen_expr(base)` first leaves the address in `%rax` for the load.
-- **A repeat literal `[v; n]` has no address.** Codegen only materialises an
-  `ArrayLit` in `let`-initialiser position (the splat path); anywhere else it
-  must be built into a buffer first, or it is emitted as a bare scalar and
-  dereferenced as a pointer. Sema rewrites a value-position `[v; n]` to
-  `{ let __rep = [v; n]; __rep }` via `check_let_init`, which reuses the splat.
-  The list form `[a, b, c]` is unaffected: the parser already desugars it to a
-  block. Keep `check_let_init` special-casing only the *direct* initialiser; a
-  flag around the whole initialiser leaks into nested literals (a struct
-  literal's fields are checked while it is set).
-- **`gen_addr` must handle every aggregate-valued base.** A field or index
-  whose base is a call result, a block, an `if`, or a struct literal is a
-  *temporary*: its value is its own address. `gen_addr` matches those forms and
-  evaluates the base, leaving the address in `%rax`. Only `Var`/`Field`/`Index`
-  are true lvalues; the catch-all is `unreachable!`, so a new aggregate-valued
-  expression form must be added here too or the compiler aborts on
-  `mk().y`-style access.
-- **Benchmark inputs must be opaque.** Programs read their workload via
-  `arg_i64` (rmc) or `env::args()` + `black_box` (Rust), so LLVM cannot
-  constant-fold the workload away. Do not "simplify" them to constants.
-- **`print_bool` prints 0/1**, not `true`/`false`, despite the name.
-
-## Benchmark gotchas
-
-- Runtime is process-spawn dominated for small programs; use large enough
-  workloads (see `ARGS` in `bench/run.py`) for a meaningful runtime comparison.
-  At the recorded sizes the small-program ratios swing several percent run to
-  run (a re-measure of `fib`/`mandel` at the same `ARGS` landed at 0.99/1.00
-  where `RESULTS.md` had 0.80/0.85), so treat the run column as indicative and
-  never chase a sub-percent runtime difference without many repetitions.
-- **A `*` of two runtime values is not provably non-negative.** `(x*x)/C` looks
-  like it can skip the signed-division sign fixup, but `i64` multiplication
-  wraps, so `x*x` may be negative and rustc keeps the fixup. Removing it is
-  unsound; do not add a "square is non-negative" case to `gen_div_const`.
-- **`bench/run.py` measures both compilers and both binaries the same way:** wall
-  and CPU time from `wait4()`, and peak RAM from the child's own `VmHWM`. Do not
-  read peak RAM from `wait4()`'s `ru_maxrss`: a freshly spawned child shares
-  Python's address space before `exec`, so it floors at Python's RSS (~15 MB) and
-  hides the real number. `VmHWM` is sampled until the child exits and taken as
-  the max over reps, because a sub-millisecond run can exit between samples and
-  read back as zero. It raises if a produced binary exits non-zero, which
-  catches the classic "measured a nonexistent path" bug. `--markdown PATH` writes
-  the dated result to a file; the current one lives at `bench/RESULTS.md`.
-- **Every harness reports RAM on every axis, console and markdown alike.** Both
-  the compile side (`rss`/`compile_rss`) and the run side (`run_rss`) are
-  columns in each of `run.py`, `run_codegen.py`, `run_fair.py`, `run_four.py` and
-  `run_mir.py`, and each is scored in the per-axis mean and the verdict table. Do
-  not drop one: the RAM axes are part of the "faster on every axis" claim, so a
-  table missing them understates the comparison. `run.py`'s console table
-  carries the same nine columns as the others (`wall_ms cpu_ms rss_kb size_b
-  run_ms run_cpu run_rss`) so the terminal view and the recorded markdown agree.
-- **A ratio must guard a zero denominator.** A run that exits between two `/proc`
-  reads reports peak RSS 0, and `rustc/rmc` on 0 would crash the harness. Each
-  harness divides through a guard (`run.py`'s `ratio()`, `run_codegen.py`'s
-  `speedup()`, `run_mir.py`'s `safe_div()`) that returns 0/None instead, and the
-  run axes below the sampler floor are left unmeasured rather than scored.
-- **Cranelift is the fair baseline for the "no LLVM" claim.** The headline
-  opponent is `rustc` with LLVM, but LLVM is a far stronger optimiser than rmc
-  has, so a run-time loss to it may only mean LLVM optimised harder, and a
-  compile-time win may only mean rmc skipped the optimiser. `rustc
-  -Zcodegen-backend=cranelift` runs the *same* rustc frontend with a backend
-  that also does not use LLVM, so the gap between it and rmc is rmc's own codegen
-  and in-process link, not the optimiser. It is a nightly-only component
-  (`rustc-codegen-cranelift-preview`); `bench/run.py` detects it via `rustup
-  which --toolchain nightly rustc` and drops the column when absent, so the
-  suite still runs on a stable-only host. `RMC_BENCH_CRANELIFT_RUSTC` overrides
-  the path. Cranelift rejects `-C lto`, so that flag is omitted from its
-  invocation; the rest matches the LLVM column. Read the Cranelift *run* column
-  when judging rmc's generated code, and the LLVM column when judging rmc
-  against the best available optimiser. The recorded run is strong for rmc: it
-  beats Cranelift on both axes at once - ~30x faster to compile, and faster at
-  run time on every program (closest are `heap` 1.06x and `mandel` 1.15x, widest
-  `forloops` 2.73x). So the "no LLVM" win is not merely "rmc skipped the
-  optimiser": against the one other LLVM-free backend it also wins on the
-  generated code. The remaining gap is to LLVM, which is the harder target.
-- **The sampler yields, it does not spin.** The `VmHWM` poll calls
-  `os.sched_yield()` between reads. A tight `wait4(WNOHANG)` spin keeps the
-  harness runnable for the whole child lifetime and competes with the benchmark
-  on a single-core host, inflating the wall time it is trying to measure. A
-  `sleep` would fix that but drops the sample rate enough to miss the peak of a
-  sub-millisecond process (`hello` read ~0.8 MB instead of the true ~2 MB), so
-  the loop yields and keeps polling.
-- **`heap` compares equal strides, not equal allocators.** rmc's `alloc` returns
-  a payload 8 bytes past a size header, so its 16-byte nodes are 24 bytes apart.
-  The Rust twin must use the same 24-byte stride or its smaller working set
-  flatters the walk; it still does not run a free list, so the ratio is about the
-  generated pointer code, not the allocators.
-- **`refs` is the reference-read case, and the hoist is provenance-gated.** The
-  loop reads a fixed struct through `&self` accessors. `licm` hoists a read
-  through a reference only when a provenance pre-pass proves the reference is
-  bound to a live local (`&x`, `&x.field`): rmc lets a reference outlive its
-  referent (`0 as &i64` is accepted), so a speculative deref of a reference of
-  unknown origin can fault on a loop that never runs, where the in-body read
-  would not. `refs` binds its reference to a local, so the accessor sum is
-  hoisted and rmc wins (~1.7x). A loop that reads through an unproven reference
-  (a parameter, a cast, a mutable ref) is still recomputed every iteration and
-  loses; a frame-based loop of the same shape is hoisted and wins. The loop is
-  kept real for *both* compilers without an in-loop `black_box`: the struct is
-  built from an opaque `black_box`ed seed and the accumulator is reduced by a
-  data-dependent branch, so LLVM can neither constant-fold the accessor sum nor
-  close the loop into `K * n` nor vectorise it. An in-loop `black_box` was the
-  earlier design; it was withdrawn because rmc lowers `black_box` to the identity
-  while rustc makes it opaque, so the barrier charged rustc a store/reload rmc
-  never emitted and the 2.2x it produced measured the barrier, not the loop.
-- **The two builds must carry matching safety semantics.** rmc checks bounds by
-  default and leaves overflow checks *off*; `rustc -O` keeps bounds checks *on*
-  and overflow checks *off*. `bench/run.py` relies on rmc's default and passes
-  rustc `-C overflow-checks=off`, so both carry bounds checks and neither
-  carries overflow checks. If rmc skipped a per-index check rustc emits, the
-  comparison would be unfair; the check costs ~1% on the array-heavy programs,
-  so it does not decide any ratio. Never build the two sides with different
-  check settings.
-- **`light` and `heavy` bracket the load spectrum, and both must stay.** `light`
-  is the short, cache-resident case (a 2 KiB table scanned with a data-dependent
-  branch for a few ms), so process startup and per-iteration codegen are a real
-  share of its cost. `heavy` is the long, throughput-bound case (~1e9 iterations
-  over two accumulators, hundreds of ms), where the measured time is the
-  generated loop and a startup-only win cannot flatter rmc. Together they stop a
-  regression in either regime from hiding behind a win in the other; keep both
-  when editing `ARGS` or `PROGRAMS`. Both keep the loop real for *both*
-  compilers the same way as `refs`/`heap` - the trip count is read from `argv`
-  and a data-dependent branch (plus a second accumulator in `heavy`) defeats
-  LLVM's loop-closing and vectoriser - and neither uses an in-loop `black_box`.
-- **`callrec` is the call-heavy case, and it used to lose.** Non-tail recursion
-  (`tree(n) = 1 + tree(n-1) + tree(n-2)`) cannot be inlined by either compiler,
-  so it measures raw call overhead plus argument setup, where the stack-based
-  generator with no register allocator is weakest. It was ~0.60x rustc until the
-  self-recursion pass learned to fold the right spine of `1 + f(n-1) + f(n-2)`
-  (not just the `f(g) + f(h)` shape), which leaves one call per level like rustc;
-  it now sits at parity. The shape the pass still does not match is the losing
-  case, so keep this benchmark: it is what stops the runtime story from being a
-  uniform "rmc wins" claim.
-- **Artifact size depends entirely on the rustc reference build.** The headline
-  table compares against `-O` + fat LTO + `codegen-units=1` + `panic=abort` +
-  stripped, which is the *smallest* rustc output (~290 kB) and therefore the
-  least flattering to rmc (~85x). A plain `rustc -O` is ~4.5 MB (~1335x) and a
-  stripped static build is ~1.2 MB (~350x). `bench/run.py` records all three
-  (`measure_rustc_plain`, `measure_rustc_static`) so no single choice overstates
-  the gap; report the reference whenever quoting a size ratio.
-- **Run-time ratios are noisy and machine-dependent.** A program near parity
-  (`fib`, `mandel`) flips between a small rmc win and a small rmc loss from run
-  to run and host to host. Do not quote a single ratio for such a program as a
-  stable property, and re-measure on the target machine before drawing a
-  workload-specific conclusion.
-- **A compiled rmc binary's few-kB RSS is mostly "no libc".** Its ~24 kB peak is
-  real but is a property of linking no C library, not of the generated code
-  being leaner: a dynamically linked rustc binary floors at ~2 MB because of
-  `ld.so` + `libc`. Say so when the RAM gap comes up, or it reads as a
-  code-quality claim it is not.
-
-## Tests
-
-`tools/fuzz.py --mode reject` compiles a list of programs `rustc` rejects and
-requires `rmc` to reject each one cleanly; it pins the soundness checks below,
-which the differential fuzzers cannot see (they only compare programs both
-compilers accept). `tools/fuzz.py --mode mutate` is the complement: it applies
-random splices, deletions and duplications to the generators' programs and the
-`robust` corpus and requires every mutant to fail cleanly (exit 0 or 1, no
-signal, no panic). It needs no rustc, so it runs anywhere, and it reaches error
-paths the hand-written corpora miss.
-
-`tests/run.py` compiles each `tests/cases/NAME.rs` with both compilers
-and diffs stdout and the exit status. Every case is then recompiled with the
-optimiser passes disabled in turn (`--no-inline`, `--no-licm`, `--no-tco`, and
-all three at once), because a bug in one pass can hide behind another or only
-show on the unoptimised path; the Rust twin is built once and reused. `aggsem`
-(by-value aggregate assignment,
-inferred aggregates, nested fields, indexing a returned array), `cmpsem`
-(single evaluation of a side-effecting subscript in a compound assignment,
-struct-literal field order), `utf8` (non-ASCII string literals), `inlmulti`
-(a callee that assigns its parameter, a non-trivial argument evaluated once, and
-nested inlining with a call argument), `assignorder` (value-before-place
-assignment order, plain and compound), `licmref` (a field read that must not
-be hoisted past a `&mut` store in the loop), `iflet` (the `if let`
-desugaring: integer, binding, payload-binding, `else if let` chain,
-side-effecting scrutinee, and value position) and `consts` (top-level `const`
-items in expression position, as array lengths and repeat counts, as a `for`
-bound, in conditions, and as `match` patterns, including a negative constant and
-one defined in terms of another, plus a `const`/`static` declared inside a block,
-usable before its declaration and shadowing an outer one) guard the
-front-end/codegen fixes below. There is no separate rmc dialect: each case is a
-single `.rs` file that rmc compiles directly, and rustc compiles the same file
-as the reference, so rmc can stand in for rustc on the supported subset. When
-adding a case, remember that `rustc` infers `i32` for unsuffixed
-literals, so large literals need an `i64` suffix on the Rust side. `args.json`
-maps a case name to a list of argv vectors. Verify a new case actually detects
-the bug it guards: revert the fix and confirm the case fails.
-
-The parser bounds nesting depth (`MAX_DEPTH` in `parser.rs`, currently 100). A
-recursive-descent parser with no bound overflows the native stack and aborts on
-deeply nested or very long input, which is a crash on untrusted input. Each
-expression level threads through every precedence function, so a debug build
-costs on the order of 10 KiB per level and the full 100 levels is close to the
-2 MiB a default test thread gets; the two depth tests in `tests/compile.rs`
-therefore run on a dedicated 32 MiB thread via `with_big_stack`, so they test
-the limit rather than the harness's thread size. The CLI runs on the 8 MiB main
-thread. `fuzz.py --mode robust` guards the limit end to end. If you add a new
-recursive construct, count a level with `bump_depth` on entry.
-
-An enum is a set of unit variants represented by its `i64` tag (the declaration
-index). `Expr::EnumVariant` keeps its node and its enum type so re-checking it
-(as a method receiver is) stays consistent; codegen emits the tag. Enum names
-resolve to `Type::Enum` through `resolve_ty`, which every type site uses, and
-enum patterns are a `Pat::Variant` the parser desugars into an `EnumVariant`
-comparison. `as` may not target an enum, matching rustc.
-
-A variant may write its tag explicitly (`enum E { A = 5, B, C }`). The tag is
-then the written value, not the index, so it is computed once in `layout_enum`
-(a variant with no `= N` is the previous tag plus one) and carried in the fourth
-field of `EnumInfo::variants`. Every tag use goes through `tag_of`/the tuple, so
-a `match` arm and an `as i64` both read the written value. `layout_enum` also
-rejects a duplicate tag, and a variant with no `= N` after `i64::MAX` (rustc
-E0370) — the check is lazy, so a final `= i64::MAX` is fine. The parser rejects
-`= N` on a payload variant and folds `-9223372036854775808` to `i64::MIN`.
-
-A pattern is a wildcard, an integer or `bool` literal, an `Enum::Variant`, or a
-bare binding name. A `bool` pattern (`true`/`false`) desugars to a `BoolTest`,
-a node like `VariantTest` that compares the scrutinee word; a chain of two of
-them covering both values is exhaustive, so `match b { true => .., false => .. }`
-is a value. The node exists precisely so a hand-written `if b == true { .. }
-else if b == false { .. }` (a plain `Bin(Eq, ..)`) is *not* mistaken for an
-exhaustive chain — rustc rejects that in value position, and rmc must too. A
-`bool` pattern on a non-`bool` value is rejected. rmc's `match` desugaring also
-evaluates a non-trivial scrutinee once through a `\0mt<n>` temporary, so a side
-effect in the scrutinee runs exactly once regardless of the arm count.
-
-A `match` is desugared into a chain of `if`s, so a `match` with no `_` arm has
-no final `else` and, used as a value, would trip the "`if` without `else`" check
-in sema. When the arms name *every* variant of one enum it is total, and rustc
-accepts it as a value, so sema recognises exactly that case:
-`Sema::if_chain_is_exhaustive` walks the chain, requires every condition to be a
-`VariantTest` over one enum (or a `BoolTest` over one variable), and compares the
-number of distinct variants (or bool values) tested against the enum's variant
-count (or two). Because the desugared chain is checked
-outside-in, the innermost `if` is seen first; `Sema::match_chain`/`match_total`
-carry the verdict down the chain so the last `if` (no `else`) may stand for a
-value. The two flags are set only on the `else` path of a *total* chain, so a
-wildcard arm body that is itself an `if` is still checked as an ordinary root.
-
-Every `match` must be exhaustive, in *any* position, exactly as rustc requires
-(E0004). The value-position case is caught by the `if`-without-`else` check; the
-statement-position case is not, because the arms are unit-typed and the
-fall-through to `()` is harmless, so `Sema`'s `MatchBoundary` arm also decides
-exhaustiveness (`match_chain_is_exhaustive`, plus the catch-all flag the parser
-records) and errors when it fails. Do not relax this to statement position only:
-rustc rejects a non-exhaustive `match` there too, and rmc must match rustc.
-
-A guard (`PAT if COND => body`) is desugared, not given a node: `desugar_arm`
-folds it into the pattern test as `Bin(And, test, cond)`, and an *irrefutable*
-arm's guard (no test of its own) becomes the whole `if` condition, paired with a
-literal `true` test so the exhaustiveness walk can still recognise the arm. A
-failed guard falls through to the next arm, so the guard is evaluated at most
-once and only after its pattern matched. Three rules matter for exhaustiveness,
-all matching rustc (RFC 2005):
-  - a *guarded* arm covers **nothing** — the guard may be false — so
-    `if_chain_is_exhaustive` skips it entirely (`arm_guard`). Counting it would
-    wrongly accept `match e { E::A if c => 1, E::B => 2 }`, which rustc rejects
-    (E0004).
-  - a guarded *binding* arm (`n if c`) is not a catch-all, so `has_catch_all`
-    is set only for an *unguarded* irrefutable arm. The parser's `true`-test
-    marker is what distinguishes the two: without it, `n if c` would either be
-    miscounted as a catch-all or (with no pattern test) abort the walk.
-  - a repeated variant (only reachable when one of the duplicates is guarded and
-    therefore skipped) is redundant, not a gap: `seen_variants` is a set, and a
-    duplicate is ignored rather than treated as non-exhaustive.
-`arm_pattern_test`/`arm_guard`/`is_pattern_test` peel the guard off a condition.
-They must not mistake a *range* pattern (which also folds to `Bin(And, ..)`) for
-a guarded one, so they strip only when the left operand is itself a pattern test.
-
-Two exhaustiveness-walk bugs this exposed are fixed. A payload-binding arm
-(`O::S(v) => ..`) wraps its `if` in a block holding the binding `let`s, and that
-block used to hide the chain: `match o { O::Some(v) => v, O::None => 0 }` (no
-`_`) was wrongly rejected. `chain_tail` now unwraps block wrappers while
-descending the chain, and the walk no longer requires an arm's `else` block to
-have empty `stmts`. `tests/cases/guard.rs` and the `pat` fuzzer cover
-guards; the `reject` fuzzer's `guard_*` cases pin the exhaustiveness rules.
-
-A nested or refutable variant argument (`O::W(I::A)`, `E::A(1)`) is handled by a
-second walk, `chain_is_exhaustive_nested` → `chain_covers`, tried after
-`if_chain_is_exhaustive`. `if_chain_is_exhaustive` counts only the outer
-`VariantTest`s, so it would call such a chain total even when a payload arm
-covers just one payload value; `chain_covers` instead groups the arms by outer
-variant and, for each variant whose arms carry `sub_tests`, unions those tests
-and recurses through the payload enum, so `O::W(I::A) => .., O::W(I::B) => ..,
-O::Z => ..` is total while `O::W(I::A) => .., O::Z => ..` is not. An arm that
-binds the whole field (`O::W(x)`, `O::W(_)`, no `sub_tests`) covers its variant
-outright; a variant whose payload is a scalar, struct or tuple field cannot be
-shown covered, so the walk reports it non-exhaustive (safe — rustc needs a `_`
-arm there too unless the field has a single value).
-
-The `match` desugaring wraps its first step in `Expr::MatchBoundary`, a
-transparent node that marks where the chain begins. Its `bool` field records
-whether some arm is a catch-all (`_` or a binding), which makes the match
-exhaustive regardless of the variants named. The marker exists because a wildcard
-arm body can itself be a `match`: `match a { A => 1, _ => match a { B => 2 } }`
-and `match a { A => 1, B => 2 }` desugar to the *same* `if` chain, yet only the
-second is exhaustive. Without the marker, `if_chain_is_exhaustive` walks through
-the wildcard body into the nested match and counts both matches' variants
-together, wrongly accepting a program rustc rejects. The boundary stops that
-walk and resets `match_chain`/`match_total`, so each `match` is judged on its
-own. It is transparent everywhere else: codegen, the inliner, LICM and TCO treat
-it exactly like `Expr::Block`, and `is_block_like` lists it so a `match`
-statement still needs no trailing `;`. A subtle-scrutinee comparison would *not*
-work: the two programs above share the same scrutinee, so the boundary is the
-only thing that keeps them apart.
-`tests/cases/exhmat.rs` covers value position, reordering, nesting,
-references and a loop; a non-exhaustive or duplicate-variant match still errors,
-and `tools/fuzz.py --mode reject` pins the nested-wildcard and statement-position
-cases.
-
-A method is an ordinary free function whose name is mangled to `Type$method` and
-whose first parameter is `self` of the impl's struct type; the parser produces
-it, sema inserts the `self` parameter before building signatures, and a method
-call is rewritten by sema into a `Call` with the receiver prepended. Codegen
-therefore has no method case — keep it that way. Method resolution accepts a
-receiver whose type is `Struct`, `Enum` (unit) or `EnumData` (payload); all
-three give the same mangled prefix, and a `self` method on an aggregate receiver
-passes it by pointer. `Self` resolves through the parser's `current_impl`.
-
-A function in an `impl` block with no `self` is an **associated function**. The
-parser sets `takes_self = false` and emits the same `Type$name` mangling with no
-receiver parameter; sema inserts the `self` parameter only when `takes_self` is
-true, so an associated function registers like a free function. A call
-`Type::name(..)` arrives as `Expr::EnumCtor` (the parser cannot tell a
-payload-variant constructor from an associated function), so sema checks whether
-the enum has that variant; if not and `Type$name` is in `sigs`, it rewrites the
-node to a `Call`. A struct qualifier always takes this path. `Qual::name` with
-no call and no matching variant is reported as an associated function that must
-be called (rmc has no function values), not as an unknown enum. Calling an
-associated function with `.` (`p.new(1)`) passes the receiver as an extra
-argument, so it fails on arity — which matches rustc's E0599 closely enough.
-
-A **nested `fn`** (`fn f() { .. }` as a statement) is an item, not a closure:
-Rust forbids it from capturing an enclosing local (`E0434`), so it sees only the
-program's items. That is what makes it cheap to support: the parser hoists it to
-the top level and appends it to `Program::fns`, so sema, codegen and every later
-pass treat it as an ordinary free function with no new case. Two things make it
-behave like rustc's block scoping, both in the parser:
-
-- *Name resolution and shadowing.* `parse_block_inner` pushes a scope frame
-  filled by `scan_block_fns`, a token-index pre-scan of the block's direct
-  statements (it skips any `{ .. }`/`( .. )`/`[ .. ]` region, so a `fn` inside an
-  inner block or a body is not seen here). The pre-scan gives each nested `fn` a
-  unique symbol (`rmc$nf<n>$<name>`, keyed in `fn_at` by the `fn` keyword's token
-  index) and records `name -> unique` in the frame. Because the frame is filled
-  before the statements are parsed, a nested `fn` is in scope for its whole block
-  (a call before its declaration, or a sibling declared later, both resolve), and
-  a nested `fn` shadows a top-level one of the same name inside the block.
-  `resolve_fn_name` rewrites a call through the innermost frame that names it.
-  Two `fn`s of one name in a block is rustc's `E0428`, reported by the pre-scan.
-- *The symbol.* `$` is used, not a NUL: the in-process encoder takes any bytes,
-  but the `--binutils` path writes the label into GNU `as`, which rejects a NUL.
-  A user identifier is `[A-Za-z0-9_]`, and a method mangles to `Type$method`
-  (one `$`), so `rmc$nf<n>$name` (two `$`) cannot collide with either.
-
-The definition is parsed under its pre-scanned name (`fn_at`), so the hoisted
-function and its call sites agree. A nested `fn` captures nothing, so this is
-exactly rustc's semantics for the subset — including that a nested `fn` in a
-`loop` body is the same function every iteration (it is not re-created).
-
-An array's element type may be a scalar (`i64`, `bool`, a `char` or a unit
-enum), `str`, a reference, a nested array, a struct or a payload enum. A unit
-enum is one 8-byte slot emitted like `i64`, so `[E; N]` lays out and indexes
-correctly. `str` and a reference are one-word pointers, so `[&str; N]` and
-`[&T; N]` are arrays of pointers. A list literal `[a, b, c]` is parsed as
-`Expr::ArrayList` and rewritten by sema, which infers the element type from the
-values — the parser must not guess it, because it does not type-check, and
-guessing `i64` is what made `[true, false]` fail.
-
-`let _ = e;` (and `let _: T = e;`, and the no-op `let _: T;`) is a **discard**.
-The parser lowers it to a block holding a hidden `let _ = e;` binding, so the
-initializer is still evaluated once and an annotation is still checked, then the
-binding is dropped. The hidden binding is literally named `_` so a type-mismatch
-diagnostic reads `variable `_``; `_` cannot be written as an ordinary binding
-(`expect_ident` rejects it), so the name never clashes with user code. Bare
-`let _;` with no annotation is rejected at parse time (rustc's E0282).
-
-## Soundness checks
-
-The differential fuzzers only compare programs that *both* compilers accept, so
-they are blind to the dangerous direction: a program `rmc` accepts but `rustc`
-rejects. Such a program is never run against the reference (the reference does
-not build), so a wrong-answer or memory-safety bug it triggers is invisible to
-the suite. `tools/fuzz.py --mode reject` pins this class instead: a deterministic
-list of programs `rustc` rejects, each of which `rmc` must also reject (cleanly,
-exit 1). When you find a new `rmc`-accepts/`rustc`-rejects divergence, add it
-there. The hand-audit harness that found the original set lived outside the repo
-(`/tmp/audit5/`); the durable record is the reject corpus.
-
-The checks, all in `sema.rs`:
-
-- **Mutability (`E0384`/`E0594`/`E0596`).** A write must target a mutable
-  *place*. The check is `Sema::place_writable`, which walks a target to its root
-  binding: a `mut` binding, or a reference whose referent is mutable
-  (`&mut T`), is writable; a shared reference (`&T`) is not; an uninitialized
-  binding is writable when the caller passes `allow_uninit` (an assignment
-  initializes it — whole, by field, or by element, matching rustc's partial
-  initializer), but not for a `&mut place` borrow (borrowing an uninitialized
-  place is itself E0381). A bare-`Var` write of a non-`mut` binding that is
-  already initialized is E0384; a field/element write through a non-`mut` root
-  is E0594; `&mut x` on a non-`mut` binding is E0596. Checking the *place* rather
-  than just the target node is what closes field/element assignment and
-  `&mut`-borrow divergences that a bare-`Var` check missed. `mut` on a parameter
-  is recorded in `FnDef::param_mut` (the parser used to accept and discard it)
-  and a parameter is otherwise immutable: `fn f(x: i64) { x = 1; }` is rejected,
-  `fn f(mut x: i64) { x = 1; }` is not. The scope entry is a `Binding` struct
-  carrying `mutable` and `init`. Because a `&mut self` receiver has type `&mut
-  Self`, `self.n = ..` stays legal without `mut self`.
-- **Definite initialization (`E0381`).** `Binding::init` records whether a
-  binding is initialized at the current point, and is set only by a whole-binding
-  write — a field or element write does not initialize the aggregate, matching
-  rustc's "partially assigned" rule, so reading it afterwards errors. A read of
-  an uninitialized one errors. An `if`/`else` keeps a binding initialized only if both arms (or the
-  entry state) initialized it; a branch with no `else` does not count, because it
-  may not run, and a `while`/`for` body does not because the loop may run zero
-  times. A `loop` body counts only when every `break` that leaves the loop
-  initializes the binding: the loop runs at least once, but an exit taken before
-  the assignment leaves the binding uninitialized (rustc E0381), so the state at
-  each `break` is captured and merged. This is deliberately conservative — it rejects
-  the uninitialized-array-filled-in-a-loop pattern (`let mut a: [i64; N]; while
-  ... { a[i] = ..; } a[0]`), which rustc also rejects. Write the array with `= [0;
-  N]` instead; the corpus cases do.
-- **A short circuit has two outcome states, and a chained guard needs both.**
-  `&&`/`||` run their right operand on only one path, so `check_expr` records
-  the true and false entry states in `cond_then_init`/`cond_else_init` for the
-  `if`/`while` that branches on the condition. Checking a right operand against
-  the scope's merged "either path" state loses a write the guard guarantees:
-  `(a && { x = 7; true }) && x == 7` reaches the comparison only where the inner
-  `&&` was true, yet the merged state says `x` is uninitialized (E0381). Compose
-  the outcomes per operand instead — check the right operand under the left-true
-  state for `&&` (left-false for `||`), then merge for the true, false and
-  post-expression states. The post-expression state stays conservative, so a
-  value use (`let b = a && { x = 7; true }`) still cannot assume `x` is set.
-- **Constant array bounds.** A constant index outside the array (`a[5]` on a
-  `[i64; 2]`, the negated `a[-1]`, or an expression like `a[1 + 4]`) is a compile
-  error, with or without `--bounds-checks`, matching rustc (`E0080`/`E0608`).
-  The index is folded with `const_i64`, which evaluates the integer operators
-  (`+ - * / % & | ^ << >>`) as well as unary `-`, so an index written as an
-  expression is caught too — an earlier version folded only literals and let
-  `a[1 + 4]` read adjacent stack memory. `Sema::const_of` extends this to a
-  constant *local*: `let i = -1; a[i]` is folded the way rustc's constant
-  propagation folds it, which an earlier version did not, letting `a[i]` read
-  past the array. Both folders see through the identity cast `i as usize` (the
-  usual spelling of an index in real Rust), so `a[i as usize]` is caught
-  exactly like `a[i]`. A *variable* index is still unchecked by default (see
-  Scope).
-- **String typing.** A string literal is `Type::Str`, not `i64`. It cannot be an
-  arithmetic operand (`1 + "hi"` was accepted as integer addition on the
-  string's address, `E0369`) and cannot be passed where an `i64` is expected
-  (`print_str(42)` used to compile and then segfault, dereferencing the integer
-  as a pointer). `print_str` takes `Type::Str`.
-- **String comparison.** A `str` value is the address of its `{len, bytes}`
-  record, so a machine `cmp` compares *pointers*: `"abc" == "abc"` answered
-  false because the two literals live at different addresses (a silent
-  wrong-answer bug — rustc says true). `Sema::str_cmp` rewrites `==`/`!=`/`<`/
-  `<=`/`>`/`>=` on two strings into calls to the runtime helper `__rmc_str_lt`,
-  which walks the bytes, so ordering matches Rust's. Both operands are pure
-  literals or variables, so the helper is never double-evaluated. Comparing a
-  `str` with an `i64` is rejected (`E0308`), as rustc does. `str` is a builtin
-  type nameable in a signature, field or `let` (`fn f(s: str) -> str`,
-  `struct M { s: str, n: i64 }`): `resolve_ty_rec`/`resolve_in` map `Named("str")`
-  to `Type::Str`, one word passed by value, rather than reporting "unknown type".
-- **`str::len` and array `.len()`.** `len()` is special-cased in the `MethodCall`
-  arm of sema *before* the struct/enum method lookup, because `str` is a pointer:
-  a `str` receiver lowers to `Call __rmc_str_len` (the record's first word), and
-  an array receiver folds to the constant `N`, keeping the receiver only for side
-  effects (dropped entirely when it is a named local). A user `len` on a struct or
-  enum still falls through to the mangled-method path. rmc's `.len()` is `i64`
-  where rustc's is `usize`, so a differential twin casts with `as i64`.
-- **`str::starts_with` / `str::ends_with` / `str::contains`.** The other three
-  `bool`-returning string methods, special-cased in the same `MethodCall` arm
-  right after `len`, and only when the receiver's type is `Str` (so a user method
-  of the same name on a struct or enum is untouched). Each lowers to a runtime
-  helper that walks the two `{len, bytes}` records: `__rmc_str_starts` and
-  `__rmc_str_ends` scan the first / last `needle.len` bytes, and `__rmc_str_find`
-  returns the first matching byte index or `-1`, which `contains` tests against
-  `-1`. A `&str` receiver is dereferenced to its one word first, as for `len`.
-  Each helper is its own runtime piece, so a program that never searches a string
-  does not carry one. `find` itself is *not* exposed: rustc types it
-  `Option<usize>`, and rmc has neither, so a bare `s.find(..)` still falls
-  through to the "not a struct or enum" error rather than mis-typing the result.
-- **`is_empty()`.** Special-cased in the same `MethodCall` arm as `len` and the
-  three searches, and only for a `str` or array receiver. `str::is_empty` is
-  `Call __rmc_str_len` compared `== 0`, so it carries the length helper but no
-  search helper; `<[T; N]>::is_empty` folds to the constant `N == 0`, dropping a
-  named receiver as `len` does. A user `is_empty` on a struct or enum is
-  untouched.
-- **Empty array literal `[]`.** The parser accepts `[]` as an empty
-  `ArrayList`, but with no element to infer from sema rejects it unless the
-  context supplies the element type (`let z: [i64; 0] = [];` sets the expected
-  element type; a bare `let a = [];` is an error, as rustc's `E0282`). It lowers
-  to a block whose value is the zero-length array, with no assignment; `z.len()`
-  is `0` and `z.is_empty()` is `true`, and `for x in &z` runs zero times.
-- **Array element width comes from the context.** An array literal takes its
-  element width from the surrounding declared type the way a bare integer literal
-  does. `expected_elem_int` (sema state) is armed in the point positions — a
-  `let` annotation, a struct field, a call argument and a `return` expression —
-  and by `expected_ret`, which is set only while checking a function body's tail
-  expression so a tail array literal (`fn g() -> [u8; 3] { [1, 2, 3] }`) is
-  typed. `expected_ret` is consumed at the top of `check_block_inner`, so it
-  never leaks into a nested block. The width is threaded through nested array
-  literals too (`[[u8; 2]; 2] = [[1, 2], [3, 4]]`). Known gap: a literal element
-  does not yet *coerce* to a sibling element's inferred width (`[9u8, 8]` is
-  rejected, as is a wide `let a = [..]` bound to a `[u8; 3]`), and the expected
-  element type is not propagated through an `if`/`match`/block arm — rustc
-  accepts both.
-- **Built-in `i64` methods
-  (`abs`/`min`/`max`/`clamp`/`signum`/`is_positive`/`is_negative`/
-  `div_euclid`/`rem_euclid`/`midpoint`/`pow`/`wrapping_add`/`wrapping_sub`/
-  `wrapping_mul`/`saturating_add`/`saturating_sub`/`saturating_mul`/
-  `count_ones`/`count_zeros`/`leading_zeros`/
-  `trailing_zeros`/`leading_ones`/`trailing_ones`/`swap_bytes`/`reverse_bits`/
-  `rotate_left`/`rotate_right`).**
-  Like `len()`, they
-  are special-cased in the `MethodCall` arm of sema before the struct/enum lookup,
-  and only when the receiver's type is `i64`, so a user `min` on a struct is
-  untouched. `desugar_i64_method` rewrites the call into an expression over the
-  operators rmc already lowers, so codegen gains no case
-  (`clamp`'s `min > max` panic and the sixteen helper methods — the ten bit
-  methods and the six arithmetic methods — are the exceptions: a
-  call to the `__rmc_clamp` / `__rmc_count_ones` / `__rmc_leading_zeros` /
-  `__rmc_trailing_zeros` / `__rmc_swap_bytes` / `__rmc_reverse_bits` /
-  `__rmc_rotate_left` / `__rmc_rotate_right` / `__rmc_pow` /
-  `__rmc_wrapping_add` / `__rmc_wrapping_sub` / `__rmc_saturating_add` /
-  `__rmc_saturating_sub` / `__rmc_saturating_mul` runtime
-  pieces, each linked only when its method appears):
-  `abs` is `if x < 0 { -x } else { x }` (so `i64::MIN` maps to itself, matching
-  `rustc -O`; under `--overflow-checks` the `neg` traps, matching a debug build),
-  `signum` is `(x > 0) as i64 - (x < 0) as i64` (comparisons only, so `i64::MIN`
-  never overflows), `min`/`max` compare `y` against `x`
-  (`if y < x { y } else { x }` for `min`), returning `x` on a tie,
-  `clamp(lo, hi)` is `if lo > hi { __rmc_clamp() } else if x < lo { lo } else if
-  x > hi { hi } else { x }` (the `lo`/`hi` binds run in argument order, then the
-  range check, so `g().clamp(g(), g())` calls `g` three times as rustc does and
-  the inverted-range panic fires before either bound is used), and
-  `is_positive`/`is_negative` are the bare comparisons `x > 0` / `x < 0` (so
-  `0` is neither, and both return `bool`, unlike the `i64`-valued seven).
-  `div_euclid`/`rem_euclid` bind `q = x / y` and `r = x % y`, then round: when
-  `r < 0`, `div_euclid` is `q - 1` (positive `y`) or `q + 1` (negative `y`), and
-  `rem_euclid` is `r + y` (positive `y`) or `r - y` (negative `y`), the latter
-  arm written as a subtraction so no synthesized `-y` needs the neg lint exempted.
-  `rem_euclid` is phrased `r ± y` (not `r + abs(y)`) precisely so a `MIN` divisor
-  does not overflow a dead arm: with `y == MIN` the remainder is never negative,
-  so `r - y` never runs. They reuse `/` and `%`, so a zero divisor and
-  `MIN.div_euclid(-1)` panic at run time as the operators do.
-  `midpoint(y)` is the mean rounded toward zero, which is *not* the floor: it is
-  `(x & y) + ((x ^ y) >> 1)` (the floor, since `x + y = (x & y) + (x | y)` and
-  `(x | y) = (x & y) + (x ^ y)`) with a one-step correction for an odd negative
-  sum — `(x ^ y) & 1` is 1 exactly when the sum is odd, and the half-sum is
-  negative exactly when the sum is, so the correction is
-  `((x ^ y) & 1) & ((half < 0) as i64)`, added once. Nothing is negated and no
-  arm can overflow (the `&`, `^`, `>>` and `+` of the floor stay in range, and
-  the correction is 0 or 1), so `MAX.midpoint(MAX)` is `MAX` and
-  `MIN.midpoint(MAX)` is `0` with or without `--overflow-checks`. The half-sum is
-  bound to a temp so the sign test reads the same value the `+` does. This is
-  exactly `rustc`'s definition, so no helper is added.
-  `pow`/`wrapping_add`/`wrapping_sub`/`saturating_add`/`saturating_sub`/
-  `saturating_mul` each bind the receiver then the argument (so each runs once,
-  left to right) and call a two-argument runtime helper. They cannot lower to a
-  bare operator: `pow` is binary exponentiation, and the `saturating_*` family
-  clamps, which no `BinOp` expresses; `wrapping_add`/`wrapping_sub` *are* the
-  bare `add`/`sub`, but are still a helper so operand evaluation matches an
-  operator's without a `BinOp` variant (unlike `wrapping_mul`, which reuses the
-  existing `WrappingMul` op). `pow` wraps in two's complement like `rustc -O`
-  (`2.pow(64)` is `0`, `(-2).pow(63)` is `MIN`); the `saturating_*` helpers test
-  the overflow flag (`jno`) and select a bound — by the sign of `a` for `+`/`-`,
-  by the sign of `a ^ b` for `*`. All six are `jno`-guarded and trap-free, so the
-  result is the same with and without `--overflow-checks`. Because the encoder
-  rejects `test $imm, reg`, `pow`'s low-bit test is `mov`+`and $1, %ecx`, and the
-  `saturating_mul` sign test is `xor`+`jns` rather than two byte-register
-  `setl`s (which the encoder mis-encoded in combination).
-  `count_ones`/`leading_zeros`/`trailing_zeros` take no argument and lower to a
-  `Call __rmc_<name>` on the receiver (no operators): the usual `x & (x - 1)`
-  bit trick overflows for `i64::MIN`, and rustc's answer for `MIN` is exact
-  (`count_ones` 1, `leading_zeros` 0, `trailing_zeros` 63), so each helper is a
-  plain loop over the 64 bits that neither negates nor decrements — the result
-  is the same with and without `--overflow-checks`. `swap_bytes` is the same
-  shape with a single `bswap` (`enc_bswap` in the encoder: `0F C8+rd`), and
-  `reverse_bits` is a per-bit loop. `leading_ones`/`trailing_ones`/`count_zeros`
-  need no piece of their own: `leading_ones(x)` is `leading_zeros(!x)`,
-  `trailing_ones(x)` is `trailing_zeros(!x)` and `count_zeros(x)` is
-  `count_ones(!x)`, so the desugar wraps the receiver in `!` (`not`, which
-  cannot overflow) and calls the matching helper. `rotate_left`/`rotate_right`
-  are the one bit family that takes an argument: the desugar binds the receiver
-  then the count and calls `__rmc_rotate_left` / `__rmc_rotate_right`, which are
-  a single `rol`/`ror` (`enc_shift` gained the `/0` and `/1` group-2 encodings).
-  The hardware masks the count to 6 bits, which is exactly Rust's `n % 64`, so
-  every count is accepted (no panic) and no count is negated — the result is the
-  same with and without `--overflow-checks`. They reuse the same
-  bind-receiver-once path, so `g().count_ones()` calls `g` once, and the
-  `call`/`defines` pruning drops each helper unless its method appears.
-  Each desugar reads an operand more than once, so every non-trivial operand is
-  first bound to a fresh `\0im<n>` temporary (`Sema::tmp`), receiver before
-  argument — `g().abs()` calls `g` once, as rustc does; a plain variable or
-  literal is reused directly. A method with an argument snapshots a *variable*
-  receiver into a temp too, even though `bind` would leave it as a direct read:
-  rustc evaluates and copies the scalar receiver before its arguments, so
-  `x.min({ x = 9; 7 })` must compare against the original `x` (5), not the value
-  the argument's block wrote. A literal receiver cannot be mutated, and any
-  other receiver shape already gets a temp. The euclidean *receiver* instead goes
-  through `Sema::force_temp`, which binds it even when it is a plain variable or
-  literal: a literal or a const-tracked variable would let the synthesized
-  `x / y` (or the dead `r - y` arm) fold and trip the overflow lint on
-  `MIN.div_euclid(-1)` / `7.rem_euclid(MIN)` — programs rustc accepts, since it
-  never folds the stdlib body. The divisor is deliberately left as `bind` so a
-  literal divisor stays literal and `gen_div_const` can still strength-reduce
-  `x % d` to a magic multiply. A `\0`-named temp is never entered into
-  `const_locals` (the same reason). The desugar returns its result type (`i64`,
-  or `bool` for the predicates) so the caller reports the right type without
-  re-deriving it.
-  `abs`'s synthesized `-x` is exempt from the compile-time neg-overflow lint
-  (`Sema::in_builtin_neg`, named for the neg it suppresses), because rustc
-  accepts `i64::MIN.abs()`: a written `-i64::MIN` is still rejected.
-- **Parameter names (`E0415`) and `main` (`E0580`).** A function's parameters
-  must be uniquely named; `check_fn` rejects a duplicate (rmc used to bind both
-  to one slot). The parser applies the same check earlier
-  (`check_dup_param_names`), because a parameter *pattern* binds names the
-  semantic pass never sees as parameters: `fn f(S { x }: S, x: i64)` is rejected
-  at parse time. `main` takes no parameters, checked in `analyze`.
-- **Aggregate parameter patterns.** A parameter may be written as a struct or
-  array pattern, `fn f(S { x, y }: S)` / `fn f([a, b]: [i64; 2])`. The parser
-  (`parse_param`) keeps an ordinary parameter of the annotation's type (a hidden
-  `\0p<n>` name) and stores the per-binding `let` statements in `FnDef::param_pats`
-  (parallel to `params`); `check_fn` splices them at the top of the body before
-  checking, so sema and codegen gain no case — the expansion is exactly the
-  matching `let` destructuring, reading through the parameter. A refutable
-  pattern (literal, variant, or-pattern) is rejected (`param_pat_binds`), and
-  `mut` on the whole pattern is rejected. `sema` inserts a `None` into
-  `param_pats` when it prepends the `self` receiver, keeping the vectors aligned.
-- **Enum payload sub-patterns.** A payload variant's argument list takes any
-  sub-pattern rmc can test and bind: `E::A(_, y)`, `E::A(mut x)`,
-  `E::A(S { x })`, `E::A([a, b])`, a nested variant pattern (`O::W(I::A)`), a
-  scalar or or-pattern test (`E::A(1)`, `E::A(1 | 2)`), and a trailing `..`
-  (`E::A(x, ..)`, `E::A(..)`). `Pat::Variant` carries `Option<(Vec<(bool, Pat)>,
-  bool)>` — the argument patterns and the `..` flag. `desugar_arm` reads each
-  argument as `EnumPayload { idx }` (the payload at its field index) and feeds it
-  to `pat_binds_into`, which recurses through `struct_pat_binds` /
-  `array_pat_binds` / `pat_binds` (a nested variant), so a nested pattern reads
-  *through* the payload at its offset rather than copying the whole aggregate
-  first. `VariantTest` carries `n_binds` (the argument count), `has_rest`, and
-  `sub_tests` — the tests of the refutable sub-patterns, each over the matching
-  payload read. `check_expr` requires `n_binds == fields.len()` unless
-  `has_rest`, rejects a payload read past the last field, and checks each
-  sub-test through its read (filling in the inner variant's tag). Codegen `&&`s
-  the sub-tests after the outer tag test, so `E::A(1)` compares the payload and
-  `O::W(I::A)` tests the inner tag, and a nested read only runs once the outer
-  tag matched. Exhaustiveness (`chain_covers`) recurses through payload enums:
-  an arm that binds the whole field (`O::W(x)`, `O::W(_)`) covers its variant,
-  and arms with sub-tests for one variant are combined and must themselves cover
-  the payload enum; a variant whose payload is not an enum cannot be shown
-  covered, so such a match needs a `_` arm.
-- **Casts (`E0054`/`E0605`/`E0606`).** `check_cast` restricts `as` to the
-  conversions rustc allows plus rmc's two documented extensions. A reference may
-  only become a reference to the same type (`&mut T` may lose mutability to
-  `&T`, never gain it), and never a scalar; any other scalar may not become a
-  reference. The extensions are `i64 as bool` (rustc spells it `x != 0`) and the
-  raw pointer cast `i64 as &T` / `i64 as &mut T` (rustc needs `as *const T`
-  first), both used by the corpus (`boolops`, `listptr`) and the heap benchmark.
-  Before this, `r as i64`, `r as &mut T`, `&T as &U` and `bool as &T` all
-  compiled, reinterpreting a pointer as a value or forging mutability.
-  `as` is parsed at its own precedence level (`parse_cast`, between `parse_mul`
-  and `parse_unary`), looser than the unary operators and tighter than `*`. It
-  used to live in `parse_postfix`, which bound it tighter than unary, so
-  `*r as i64` parsed as `*(r as i64)` and a valid program failed with a
-  reference-cast error. Rust's `as` sits just above `*` in the binary chain; this
-  level is the same place, and the right-hand side is a type, so there is no
-  operand recursion and no depth cost.
-- **Constant arithmetic (`E0080`-like).** `const_binop` folds an operator whose
-  operands are both constant (through `Sema::const_of`) and rejects the cases
-  rustc denies: division/remainder by zero, `MIN / -1`, `+`/`-`/`*` overflow,
-  and a shift amount outside `0..64`. Under the overflow checks rmc emits each
-  of these traps, so an accepted one would fault at run time (rmc used to emit an
-  `idiv` that raised SIGFPE). A constant local counts as constant, so `let d =
-  0; 1 / d` and `let x = i64::MAX; x + 1` are diagnosed like the literals, as
-  rustc does.
-- **Narrow-integer width is a first-class part of the value, not an `i64`
-  annotation.** A `u8`/`i8`/`u16`/... value must be range-checked at *its* width
-  everywhere rustc does, because the 64-bit instruction that computes it does not
-  overflow when the narrow result does (`250u8 + 10` wraps to `4` with no 64-bit
-  overflow flag). Four places carry the width:
-  - *Overflow.* `Codegen::arith_narrow` reads the narrow width of an `+`/`-`/`*`
-    operand and `check_overflow_ty` compares the 64-bit result against its
-    width-extended self (`shl` to drop the top bits, `sar`/`shr` back, `cmp`), so
-    the trap fires before `narrow_trunc` discards the excess. Negation keeps the
-    operand's width too (`i8::MIN` traps).
-  - *Division.* `i8::MIN / -1` overflows an `i8` even though `-128 / -1` is fine
-    at 64 bits, so the `MIN / -1` guard compares the dividend against *its own*
-    minimum (`cmp $-128, %rax`), not `i64::MIN`; the constant-divisor `-1`
-    shortcut needs the same bound instead of the free `jo` after `neg`.
-  - *Shifts.* The count is valid in `0..bits` for the left operand's width
-    (`u8 << 8` traps), and a constant count is checked at compile time in the
-    inlined/immediate path (`check_shift_count_imm`), which the ordinary
-    `check_shift_count` does not see.
-  - *Casts and literals.* A cast is a type boundary: its operand is checked at
-    its own width (clear `expected_int` while checking it) and only the cast
-    narrows, so `300u16 as u8` is `44` while `300 as u8` is `literal out of
-    range`. A negated literal cast keeps its sign — `-128 as i8` is accepted,
-    `-129 as i8` is out of range, and `-1 as u8` is `cannot apply unary - to an
-    unsigned type`. A struct field's declared width types a literal in its
-    initializer (`S { a: 200 }` for `a: u8`), exactly as `let x: u8 = 200` does.
-  A narrow `const` carries its declared width through resolution
-  (`ConstVal::NarrowInt(i64, Type)`), so a use is substituted at that width and
-  folds/checks like a literal of it; `consts::resolve` is fallible so a
-  non-folding item is a compile error rather than a silent widen. The
-  initializer folds at that width too: `consts::eval_int_at` threads a
-  `ctx: Option<(signed, bits)>` down the expression, an operand's own suffix or
-  cast overrides it, and `+`/`-`/`*` route through `int_const_binop` at the
-  width, so `const N: u8 = 250 + 10` is an `E0080` overflow rather than an
-  unbounded `i64` fold of 260. A cast target does *not* type its operand
-  (`(250 + 10) as u8` folds the sum as `i64`, then narrows), matching rustc. The
-  same evaluator folds the `wrapping_*`/`saturating_*`/`pow` methods
-  (`eval_int_method`), which the parser sees in method-call form — sema lowers
-  them to runtime helpers only later — so `const W: u8 = 200u8.wrapping_mul(2)`
-  and `const P: u8 = 3u8.pow(5)` resolve. `eval_int_at` returns the shared
-  `NOT_CONST` message for an unresolved name, and `resolve_with` treats exactly
-  that string as "retry next fixpoint pass" while any other error (an overflow,
-  a division by zero) is fatal — otherwise a forward reference to a narrow
-  constant was reported as an overflow instead of resolving.
-- **Constant-local propagation, matching rustc.** `Sema::const_locals` maps a
-  slot to a known constant, and `const_of` reads it. A local is entered only
-  when rustc would know it: its initializer is constant and it is assigned at
-  most once in the whole function and never taken by `&mut`. `collect_assigns`
-  pre-scans the body (before slots exist, so it keys on names) for `=`
-  assignments and `&mut` borrows. The whole-function, order-independent test is
-  what keeps the fold in step with rustc: `let mut x = i64::MAX; x = x + 1;` is
-  *accepted* because `x` is assigned twice, so rustc does not propagate its
-  constant and neither must rmc (folding it would wrongly reject the program).
-  A deferred single init (`let i; i = -1;`) is the one assignment that is
-  folded, via the `Assign` arm, which is also where the target's slot is
-  resolved. This is the safe direction: rmc folds a strict subset of what rustc
-  folds, so it never accepts a program rustc rejects.
-
-`!` on an integer is bitwise not, as in Rust: sema accepts `bool` and `i64`
-operands (it yields the operand's type) and codegen emits `not %rax` for the
-integer form and a `sete` for the `bool` form. The operand's type is taken from
-`Codegen::static_ty` (falling back to `gen_expr`'s return value for a node it
-does not model), *not* from `gen_expr` alone: `gen_bin` reports `i64` for a
-`&`/`|`/`^` because the emitted instruction is the same for a 0/1 `bool` and an
-integer, so `!(a | b)` on `bool` would otherwise be a bitwise `not`. The same
-reasoning is why `licm::expr_ty` types a `bool` `&`/`|`/`^` as `Bool` (a hoisted
-one bound to an `i64` slot turns a later `!` into a bitwise not) and follows the
-operand for a `!` so a hoisted bitwise not is bound to an `i64` slot, not a
-`bool` one.
-
-The `i64::MIN` literal `-9223372036854775808` is accepted: the lexer parses the
-magnitude `9223372036854775808`, which exceeds `i64::MAX`, as a distinct
-`IntMinMagnitude` token rather than an error, and the parser folds a `-` that
-directly precedes it into `Int(i64::MIN)`. Anywhere else the magnitude is out of
-range and rejected, as in rustc — `9223372036854775808` alone, `0x10000000000000000`,
-and `- -9223372036854775808` all error. Negating a constant `i64::MIN` (from the
-literal or a constant local) is rejected by the same `arithmetic_overflow` check
-rmc applies to constant arithmetic, matching rustc's deny lint. The magnitude
-test is structural (`is_i64_min_magnitude`), covering decimal, hex, binary and
-octal; a spaced `- 9223372036854775808` still folds, as in rustc.
-
-`tools/fuzz.py` is the differential fuzzer. `expr` mode builds random integer
-expressions with calls, guarded division and comparisons (`(x < y) as i64`,
-which is the only generator that feeds `emit_cmp`'s operand-class dispatch:
-immediate/immediate, immediate/memory, memory/immediate, memory/memory);
-`stmt` mode builds loops,
-conditionals, `match`, arrays and aggregate calls, and deliberately places
-side-effecting scalar and aggregate arguments in every position (this is what
-found the argument-evaluation-order bug); `opt` mode builds a self-recursive
-right-spine function (TCO), a loop with an invariant subexpression (LICM) and
-calls to small helpers with trivial and non-trivial arguments (inlining) — the
-shapes the other two modes never emit, so the optimiser passes are exercised
-with randomised inputs rather than only the fixed corpus cases. `arith` mode
-builds overflowing arithmetic near `i64::MAX` — a `lea`/`imul` shape and a
-loop-carried accumulator, the two strength reductions `gen_expr_into_reg` makes
-— so the `--overflow-checks` trap actually fires: the other modes use small
-values, so no generated program ever traps and the trap was reached only by the
-`ovf` corpus case. `nest` mode builds nested aggregates — a struct holding
-another struct and an array, and an enum whose payload is a struct — with a
-deep copy (`let mut o1 = o0`) and a nested-path write (`o1.mid.f = ...`,
-`o1.arr[0] = ...`) that the copy must not alias: `stmt` mode only ever gives a
-struct plain `i64` fields, so the field-offset arithmetic for a nested path and
-the aggregate copy were never generated. `nest` mode also builds nested arrays
-(`[[i64; c]; r]`) and arrays of structs: a list literal, a nested splat, a
-variable-index read, an element write and a whole-element copy. Those pin the
-stride (`size()/8` slots per element, so `array_off` takes `n * stride`) and the
-splat loop, which for a wide element over the 8-word threshold copies one source
-value into every element instead of walking the source along with the
-destination. `ref` mode builds references (`&T` / `&mut T`): a reference to a
-scalar local, a struct field, a nested field, an array element and a nested
-array element, each read and written both directly and through a callee, plus a
-whole aggregate read and written through a reference. A reference is one word
-holding an address, so a wrong address on a *place* that is not a plain local
-(`&mut o.mid.f`, `&mut a[i]`, `&mut m[i][j]`) writes a neighbouring word; no
-other mode generates `&`/`*` at all, so this is the only randomised coverage of
-the reference codegen. `pat` mode builds `match`
-expressions: a multi-variant unit enum, a variant with two payload fields, a
-binding pattern, a negative literal, a nested `match`, an `if let` (integer,
-binding, payload-binding, `else if let` chain and a side-effecting scrutinee),
-and a non-trivial
-side-effecting scrutinee (a call) tested against several arms — the last is
-what exercises `desugar_match`'s temporary, which must evaluate the scrutinee
-exactly once (re-evaluating it per arm repeats a side effect). `nestpat` mode
-builds nested struct sub-patterns (`S { a: A { m: B { .. }, n }, b }`) through a
-chain of distinct struct types, so the pattern nests several levels deep, and
-emits each pattern in `let`, `match` (through a reference), `if let` and `for`.
-The expansion is a chain of field reads, so a wrong field order or a missing
-intermediate read shows up as a wrong final value; `letdestr`/`fordestr` only
-reach one level, so a deeper sub-pattern had no randomised coverage. `enumpat`
-mode builds payload variant patterns with sub-patterns (`_`, `mut x`, a trailing
-`..`, and a nested struct or array pattern inside `E::V(..)`), in `match`,
-`if let` and a method, and reads them through a `&E` scrutinee (match
-ergonomics), which no other mode emits; each function is called twice
-so a shared slot or a leaked `mut` write is observable. It compares
-stdout and exit status against `rustc -O`, and it recompiles each program with
-every optimiser pass off in turn (`--no-inline`, `--no-licm`, `--no-tco`, all
-three), the same matrix the corpus suite uses — a pass-specific bug is otherwise
-invisible, because the fuzzer used to run only the default configuration.
-`--bounds` adds runs with `--no-bounds-checks` (every generated index is in
-bounds, so a spurious trap or a check-codegen miscompile shows up) and
-`--overflow` adds
-`--overflow-checks` runs, each compared against a `rustc` built with
-`-C overflow-checks=on` (the default `rustc -O` wraps, so it would disagree by
-design). The temp directory is per-PID: two concurrent fuzz runs sharing one
-would overwrite each other's `p.s` and report a bogus assembler failure.
-A generated shift amount must stay `i64`-typed: rustc infers
-`i32` for an unconstrained literal and masks the count to 5 bits, while rmc is
-`i64`-only and masks to 6, so an untyped count reports a divergence that is not a
-bug. `stmt` mode's reference build also has to be valid Rust in its own right:
-`rustc` indexes an array with `usize`, so every generated `arr[...]` in the
-reference carries an `as usize` cast (rmc is `i64`-only), and the `fn h` helper
-is inserted at the *front* of the reference — inserting it after the struct's
-`#[derive(Copy, Clone)]` puts that attribute on a function, which rustc rejects
-outright. When that happened the whole `stmt` mode was vacuous: rustc refused
-every generated program, the fuzzer skipped all of them, and the mode reported a
-clean run while testing nothing. If a fuzz mode ever reports a suspiciously
-pristine run, check its skip rate rather than trusting the summary.
-
-`--encoding` makes the fuzzer compile each program both ways and compare the
-decoded `.text` instruction-for-instruction (branch targets folded, alignment
-nops dropped, immediates reduced to a placeholder), the same normalisation the
-corpus suite's `check_encoding_matches_as` uses. This is what catches an
-operand-size or alignment bug that both builds execute identically — the
-in-process encoder and `as`/`ld` can produce the same behaviour from different
-bytes, and only the decoded stream shows it.
-
-The fuzzer's grammar is narrower than the language, so it does not reach every
-construct; three divergences found by hand-probing were an enum `match` with no
-`_` arm used as a *value* (not a statement), a method on a *payload* enum, and an
-array of a unit enum. `stmt` mode now emits all three, so a regression in any of
-them fails the fuzz job at `iter=0`. `expr` mode emits `str::len` and array
-`.len()`. When adding a language feature, extend the
-generator to exercise it — a clean fuzz run only covers the shapes it emits.
-
-`--mode mutate` is the counterpart to the differential modes: it needs no rustc
-reference at all. It seeds from the generators' programs and the `robust` corpus,
-applies one to four random edits (splice a token, delete a run, duplicate a run),
-and requires every mutant to fail cleanly — exit 0 or 1, no signal, no
-`panicked`/`overflowed its stack` in stderr. A differential mode only compares
-programs *both* compilers accept, so a crash on invalid input is invisible to it;
-`mutate` and `robust` are the two modes that look for exactly that, the first
-reaching error paths the fixed `robust` corpus does not. `--keep` writes a
-failing mutant out for shrinking.
-
-A new generator must be checked for *validity*, not just a clean run. The first
-`ref` generator wrote `r.i0` (a field of the referent struct, not of the nested
-one), which rustc rejected for every seed; the fuzzer skips a program rustc
-cannot compile, so the mode reported "all match rustc" while generating nothing.
-Run a new mode's programs through both compilers and count the rejections before
-trusting the summary — a mode with a 100% skip rate is silent, not clean.
-
-## Scope
-
-This is a small, self-contained compiler, not a general Rust compiler. Do not
-claim otherwise. It supports only the subset in `docs/language.md` (scalars,
-arrays, structs, enums, `for`, aggregates across calls, references `&T`/`&mut T`
-with no borrow checking). It has no *general* register allocator: whole-function
-locals are promoted to callee-saved registers by mention count (`promote`), and
-temporaries crossing a call use `SPILL_REGS`, but a dying temporary's register is
-not reused for a later local (roadmap item 1). The optimiser is an AST inlining
-pass (small, straight-line, scalar functions), a self-recursion-to-loop pass
-(`f(x) = t(x) op f(h(x))` with `op` associative and `t` any pure expression that
-may contain a self-call becomes a loop with one call per level, halving the call
-tree of both `fib` and `tree`), a loop-invariant code motion pass, plus a
-small peephole pass (operand/comparison/array-address folding, constant folding,
-division by a constant, a 32-bit `div` fast path for a variable divisor). A *constant* index out of
-range is a compile error; a *variable* index is bounds-checked by default,
-matching rustc: an out-of-range one traps with exit 101 and `rmc: index out of
-bounds`. `--no-bounds-checks` is the explicit unsafe opt-out that drops the
-check (see the codegen notes and "Soundness checks").
-
-The macro surface is lowered at parse time and is deliberately tiny.
-`print!`/`println!` take a literal format string and rewrite each `{}` to a
-`__rmc_print` call whose argument's checked type picks the runtime writer
-(`__rmc_write_i64`, `__rmc_write_bool`, `__rmc_write_str`, `__rmc_write_char`);
-`println!` appends the newline itself. Every `{}` argument is evaluated before
-the first byte of output, in source order (matching Rust), so the lowering
-binds each argument to a fresh local first and the `{}` writes read those —
-otherwise `println!("A{}B{}", f(), g())` would print `A` before `f` ran.
-`format_arguments_run_before_the_first_write` and `tests/cases/fmtorder.*`
-pin it; the fmtorder twin uses `println!` on both sides so the comparison
-rests on the ordering rule, not on `print_str`'s trailing newline. The `char`
-type is a distinct scalar (a Unicode scalar value in an 8-byte slot, so `c + 1`
-is rejected); its literals take the usual escapes, `as i64` yields the code
-point, and `match` accepts `'a'..='z'` / `'a'..'z'` range arms (lowered to the
-same two comparisons as an integer range; an empty range or a non-`char` bound
-is rejected). The `print_char(c)` builtin writes the UTF-8 bytes then a newline.
-`assert!`/`assert_eq!`/`assert_ne!`/`panic!`/`unreachable!`/
-`todo!`/`unimplemented!` desugar to `if !(cond) { exit(101) }` (or a bare
-`exit(101)`), so a failure matches rustc's panic exit code; the message
-arguments are parsed and discarded. `use` items are skipped at the top level
-and inside a block; a `use` of a `std` subtree is recorded so a later
-`process::exit(0)` after `use std::process;` resolves, and only
-`std::process::exit` and `std::hint::black_box` are understood among `std::`
-paths. A `pub` qualifier (on an item, a struct field, an `impl` method or a
-nested `fn`, with any `(crate)`/`(super)`/`(in ..)` restriction) is dropped by
-`skip_pub`, since every name resolves in one flat namespace; the prescan and the
-block-body loop skip it too. `scan_block_fns` reads the name directly after the
-`fn` keyword (the `pub`, if any, is a separate earlier token and is never landed
-on, since the scan advances one token at a time), and `fn_at` is keyed to that
-same `fn` token. An inline `mod NAME { .. }` is skipped by `skip_mod` (its items are
-not visible); a `mod NAME;` that would load another file is a compile error. `str`
-and `&str` are the same one-word value, so `ref_coerces` lets them
-be exchanged at a variable, parameter, struct-field, enum-variant-field or
-comparison site; there is no lifetime checking, so a `&'static str` field or
-`&str` parameter may be written `str`.
-
-There is no `Vec` type in sema, but the parser lowers the supported shapes to
-runtime helpers that keep a real growable vector. A `Vec<T>` *value* is the
-address of its element store; a two-word header `{length, capacity}` sits
-immediately before that address, so `.as_ptr()`/`.as_mut_ptr()` is the value
-itself and `v[i]` is `*(v + i * elem)` with no header offset. Three helpers in
-`runtime.rs` implement the model: `__rmc_vec_new(cap, width)` allocates
-`16 + cap * width` bytes, writes the header and returns the data address;
-`__rmc_vec_push(vec, value, width)` appends one element, growing (doubling, with
-`std`'s minimum non-zero capacity of 8 for a one-byte element and 4 otherwise)
-by `alloc`ing a fresh block, copying the old elements and returning the *new*
-address; `__rmc_vec_len(vec)` reads the length word. `__rmc_vec_cap` reads the
-capacity word.
-
-The parser recognises each shape in a `let` initializer: `Vec::new()` and
-`Vec::with_capacity(k)` call `__rmc_vec_new`, `vec![e; n]` calls
-`__rmc_vec_new(n, width)` plus a `__rmc_fill` (or `__rmc_fill_bytes` for a
-one-byte element, which fills `n` bytes with `rep stosb` rather than `n` words),
-and `vec![a, b, c]` reserves `__rmc_vec_new(3, width)` then one `__rmc_vec_push`
-per element. `v.len()`/`v.capacity()` become runtime loads (never constant
-folds, so they stay correct after a `push` grows the vector), `v.is_empty()` is
-`__rmc_vec_len(v) == 0`, and `v.push(x)` is `__rmc_vec_push(v, x, width)`.
-Because a grow can move the store, the push result (the new address) is written
-back into the receiver: `expr_stmt` rewrites a `v.push(x);` statement whose
-receiver is a simple `v` binding into `v = __rmc_vec_push(v, x, width)`. That
-write-back lives in `expr_stmt`, which both the block-body statement path and
-`parse_stmt_into` call, so the assignment is emitted wherever the statement
-appears. `v[i]` is the element read through the store, and `v.as_mut_ptr()`
-keeps the address so a later `.add(off)` is `p + off * elem`, scaling by the
-element width from the `Vec<T>` annotation (`Vec<u8>` stays byte-addressed, and
-a `type Byte = u8` alias is chased to its target). Each shape is recognised only
-directly in a `let` initializer; anywhere else the `\0`-prefixed parser marker
-reaches sema, which reports the source construct (see the `\0vecnew` arm). An
-args-vector is never built: `std::env::args()...collect()` records the binding,
-`for v in &args` desugars to `for i in skip..__rmc_nargs()`, and `args[i]`
-becomes `__rmc_arg_or(i + skip, 0, 0, 0)`. The `__rmc_arg_or`, `__rmc_nargs`,
-`__rmc_fill` and `__rmc_fill_bytes` helpers live in `runtime.rs`.
-
-The `args().nth(i)` chain has two independent failure points, and
-`finish_args_nth` tracks them in `__rmc_arg_or`'s last two arguments: `missing`
-(the `Option` unwrap) and `parse` (the `Result` unwrap). `.unwrap_or(d)` leaves
-both 0 and yields `d` for either failure; `.unwrap()` sets `missing`, so an
-absent argument exits 101 while a present non-integer takes the fallback when
-only `parse` is 0. The `and_then(|s| s.parse().ok())` chain recovers both, so it
-sets neither. A present non-integer argument must not be read as zero, and the
-turbofish `parse::<i64>()` type name lexes as a keyword token, not an
-identifier.
-
-Two relaxations make the pointer
-shapes type: `*mut T as i64` is allowed (rmc maps `*mut T` and `&mut T` alike,
-and rustc allows the raw form) and an integer/pointer coerce both ways, matching
-the existing `i64 as &T` extension; a shared reference still may not become a
-`&mut` one.
-
-The three `for` forms over a vector desugar to index loops, all bounded by
-`__rmc_vec_len(v)` read once at the loop head: `for x in &v` binds `x` to
-`&v[i]`, `for x in v.iter()`/`iter_mut()` map onto the `&v`/`&mut v` forms, and
-`for x in v` binds the vector's address to a hidden `\0fv` local before the loop
-and reads each element by value, so a `push` in the body grows the original
-binding without moving the bound.
-
-`String` is a growable byte buffer with no `std` type in sema: its *value* is the
-address of a `{len, bytes}` record, exactly what a `str` is, so `s.as_str()` is
-the value itself and every `str` helper (`__rmc_str_len`, `__rmc_write_str`,
-`__rmc_str_lt`, `__rmc_str_starts`, ...) reads a `String` with no change, and a
-`String` compares byte-wise against a `str` or another `String` through the
-existing `str` compare. The capacity is the word *before* the length: the block
-is `[cap][len][bytes...]`, the value points at `[len]`, and `s.capacity()` reads
-`-8`. `__rmc_str_new(cap)` allocates and returns the empty record,
-`__rmc_str_from(src)` copies a `str` record (so `String::from("lit")` is owned
-and growable, with capacity equal to the literal's length, as in `std`),
-`__rmc_str_push_str(s, src)` and `__rmc_str_push_char(s, cp)` append (the latter
-UTF-8-encodes the code point into a stack scratch), and `__rmc_string_cap(s)`
-reads the capacity. Both push helpers grow to `max(2*cap, needed)`, never below
-the minimum capacity of 8 (`std`'s `String` policy), and return the possibly
-moved record; `expr_stmt` writes that result back into a simple receiver
-binding, as it does for a `Vec` push. The parser recognises `String::new`,
-`String::with_capacity` and `String::from` in a `let` initializer (the
-`\0strnew`/`\0strfrom` markers) and rewrites the `capacity`/`as_str`/`push_str`/
-`push` methods on a name in `string_names`; `len`, `is_empty`, `starts_with`,
-`ends_with` and `contains` are left to the `str` handling in sema, because the
-layout is identical.
-
-A byte *referent* is tracked. `*const u8`, `*mut u8` and `*mut i8` parse to
-`Type::U8`/`Type::I8` (through `parse_referent_type`, so a `type Byte = u8`
-alias works), and only there: the byte-ness is a property of the pointer, not of
-the value, so a deref still yields an `i64` (sema's `byte_value_ty`, which is
-also why `&mut *m` borrows `U8` while reading `*m` gives an `i64`). Codegen then
-emits a one-byte `movzbq`/`movsbq` load and a `movb` store; a plain `mov` read
-eight bytes, so `*p` on a `vec![7u8; 8]` printed `0x0707070707070707` and a
-`*p = x` clobbered the following seven bytes. A pointer *cast* normalises the
-byte-ness (`byte_value_ty`), so `*mut u8 as *mut i8` and `*mut u8 as *mut i64`
-both type, but an implicit `&mut u8` -> `&i64` coercion must not: the referents
-have to match exactly (`ref_coerces`), or a deref would read eight bytes from a
-one-byte referent (rustc rejects it with E0308). A `&&u8`/`& &u8` keeps the byte
-referent (`parse_referent_type` on the `AmpAmp` path), and a byte reference in a
-scalar `match` compares against an `i64` pattern (the `PatScrutinee` deref also
-normalises with `byte_value_ty`, while leaving `U8`/`I8` on the node for the load
-width).
-
-The `Vec`/pointer name tables (`vec_names`, `vec_elem`, `ptr_vars`,
-`args_vecs`) are lexically scoped like the nested-`fn` frames above:
-`parse_block_inner` pushes a frame onto `name_scopes` and every binding pushes an
-undo entry first (the `note_*` helpers), so `pop_name_scope` at block exit
-removes a binding the block introduced and restores one it shadowed. Without
-this, a nested `let v: Vec<i64>` would leave an outer `v: Vec<u8>` with an
-eight-byte stride once the block ended.
-
-The README's roadmap lists the intended next steps.
-
-## Codegen notes
-
-- Every expression leaves its result in `%rax`; `%rcx`/`%rdx` are the only
-  scratch registers used. No other register is written by expression code, which
-  is what makes the direct-argument call shortcut safe (see `gen_call`).
-- **A benchmark twin must `black_box` its workload.** rmc's `arg_i64` is opaque
-  to rmc, but the Rust twin's `std::env::args().nth(1).parse()` is not opaque to
-  LLVM: it sees the whole program and can fold a loop into a closed form. The
-  `refs` twin did exactly that — LLVM reduced the loop to `acc = 128 * n`, so the
-  recorded "rustc 0.83 ms" was its own constant folding and the ratio read 0.18x
-  instead of the honest ~1.0x. Every twin with a loop now threads its trip count
-  or a term through `std::hint::black_box`. When a rustc twin's time matches its
-  `hello` time, suspect folding before celebrating. The `heap` twin uses a bump
-  arena rather than `Box`/`malloc`, so the comparison is the generated pointer
-  code, not rmc's free list versus glibc.
-- **A destination address must survive the value it is assigned.** Assigning a
-  whole aggregate to a field or element computes the destination first, and
-  `gen_expr(value)` may clobber `%rdi` (a call, or another aggregate copy), so
-  the address is pushed to a frame slot and popped back after the value. Writing
-  `%rdi` before evaluating the value silently corrupts the destination.
-- **The direct-argument call shortcut needs `%rdi`/`%rsi` preserved.**
-  `contains_call` is not enough: a block's `let` initialiser can copy a whole
-  aggregate (`copy_words_rdi_rsi`) with no call in sight. `clobbers_arg_regs`
-  catches that case; add to it, not just to `contains_call`, when a new
-  expression form can copy an aggregate.
-- **A value-returning function must not fall off the end.** `check_fn` rejects a
-  `Unit` body (no tail, or a tail like an `if` without an `else`) unless every
-  path returns, using `block_diverges`. It is deliberately conservative: an
-  `if` with no `else`, a `while`, and a `loop` are not treated as guaranteed
-  returns.
-- **A bounds-checked array element is never a bare operand.**
-  `simple_operand` returns `None` for `Expr::Index` when bounds checks are on, so
-  every access is materialised through `gen_expr`/`gen_addr`, which emit the
-  check. If you add a code path that folds an element into an instruction
-  operand, it must also emit the check, or an out-of-range index can bypass it.
-- **`lea_shape` must keep its displacement in the signed 32-bit range.** Each
-  constant in a folded `k*x + c` chain is representable alone, but their sum is
-  not; `disp_ok` guards the fold, and a rejection falls back to ordinary code.
-- **Generated temporaries use unspellable names.** Compound-assignment
-  desugaring introduces `let`s whose names contain a NUL byte, which no source
-  identifier can contain, so they can never shadow a user variable. Do not
-  switch them back to a spellable `__rmc_...` name.
-- **`copy_words_rdi_rsi` must not touch `%rax`.** It copies through `%r8`, so a
-  caller can hold a live value in `%rax` across the copy (a pending operand, or
-  an argument already loaded into a register). It also clobbers `%rdi`/`%rsi`,
-  which is why `contains_call` treats a struct/array literal as call-like: a
-  literal is materialised through this copy, so it must not be selected by the
-  direct-argument shortcut that requires register preservation.
-- **`gen_expr_into_reg` folds arithmetic into one `lea`.** `lea_shape` recognises
-  `k*x + c` for the scales `lea` can express (1, 2, 3, 4, 5, 8, 9) and a constant
-  offset, so `2*i+3` becomes one instruction. It is only valid when overflow
-  checks are off (a `lea` cannot trap); with `--overflow-checks` it falls through
-  to `gen_expr`, which emits the `jo`.
-- **`x * k` for a small constant `k` is a `lea`, not an `imul`.** The immediate
-  arm of `gen_bin`'s `Mul` calls `lea_mul_scale`: for a positive `k` in
-  {1,2,3,4,5,8,9} it emits one `lea 0(,%rax,scale)` (1 cycle) instead of
-  `imul $k` (3 cycles), and `k == 1` drops the multiply entirely. This is the
-  `2 * zr` in `mandel`'s inner loop — worth ~3% there. It needs the same
-  overflow-checks guard as the `lea_shape` fold, because `lea` sets no flags and
-  `imul`'s `OF` is what the trap test reads. `imul` is still used for a
-  non-`lea` scale (`7 * x`) and for a negative constant (`-2 * x`, where the
-  scale cannot be encoded). `gen_expr_into_reg(e, dst)` is also the
-  safe way to materialise an expression straight into a destination register
-  during argument setup, and a scalar `let`/assignment writes straight into a
-  promoted local's register rather than bouncing through `%rax`.
-  - **Retargeting a trailing `mov SRC, %rax` to `dst` was measured and
-    rejected.** When `gen_expr` ends with a move into `%rax` (the modulo-by-
-    constant tail's `mov %r8, %rax`), emitting `mov SRC, dst` instead of
-    `mov SRC, %rax; mov %rax, dst` saves an instruction, but it measured neutral
-    at run time (the loops are latency-bound, and register renaming hides the
-    extra move) and shrank the artifact by only 8 bytes on two of eight programs.
-    The transform also has to be careful: truncating to the pre-expression
-    offset wipes the whole expression, not just the final move.
-- **A constant initialiser stores straight to its frame slot.** `store_imm`
-  folds `let x: i64 = 7` and an unpromoted struct field `P { x: 1 }` into one
-  `movq $7, off(%rbp)` instead of the `mov $7, %rax` + `mov %rax, off(%rbp)`
-  bounce the value would otherwise take through the accumulator. It only fires
-  when the destination is memory (a promoted local keeps its register store) and
-  only for a constant the `small_imm` path accepts, so no overflow check is
-  owed. This is the eight-field struct literal in `refs` and the small scalars
-  in `stats`/`mandel`; the instruction count drops without changing behaviour.
-- **`emit_cmp` folds a register operand.** `cmp %r, %r` and `cmp %r, mem` are
-  legal, so a comparison between two promoted locals is one instruction; only a
-  `mem, mem` compare must materialise one side into `%rax`.
-- **Aggregates are copied, not aliased.** Whole-aggregate assignment, struct
-  fields of aggregate type, array elements of aggregate type, and struct-literal
-  fields all copy their words. A field or element read of aggregate type yields
-  an *address*, not a value, and `simple_operand` returns `None` for it so no
-  scalar path can treat the address as data.
-- `simple_operand` returns operands usable with no register at all: immediates,
-  scalar locals, constant-index array elements, and struct fields of a local.
-  `array_elem_operand` returns the `disp(%rbp,%rax,8)` form whose index must
-  first be loaded into `%rax`.
-- Folding arithmetic memory operands into `add`/`imul` and the plain two-operand
-  in-place `x = x + e` form were both tried and measured *slower* on the Zen
-  cores this was tuned on, so they were removed. Keep the plain two-register
-  form unless you re-measure on the target CPU.
-  - Folding a *register* operand (never a memory one) into `+`, `-`, `*`, `&`,
-    `|`, `^` is the one exception and was measured faster: it drops the
-    `mov y, %rcx` bounce, taking `mandel` from 1.03× to 1.10×. The distinction is
-    the load: a memory operand lands in the instruction's dependency chain (and
-    regressed `mandel` by ~19% when tried), a register operand does not. Only
-    `simple_operand` results that start with `%` fold.
-  - **Commutative spill fold.** When neither operand is simple, the
-    order-preserving path evaluates the right operand, moves it to `%rcx`, then
-    restores the left from the spill. For a commutative op (`+`, `*`, `&`, `|`,
-    `^`) the left can be popped straight into `%rcx` instead, one move fewer;
-    `eval_operands` takes a `commutative` flag and `sub`/`div`/`mod`/comparisons
-    pass `false`. Measured ~10% on `stats`.
-  - **`idiv` reads a promoted-local divisor directly.** `a / y` no longer bounces
-    `y` into `%rcx`; the divisor is already in a callee-saved register and
-    `gen_expr(a)` plus `cqto` only touch `%rax`/`%rcx`/`%rdx`, so it stays live.
-  - The multi-term **accumulation fold** (`gen_accumulate`) is a narrower form
-    that was measured neutral: it applies only when `x` is promoted, no term
-    reads `x`'s register, and every term is already a single operand. It cuts
-    instruction count (a running sum over locals drops to one `add`/`sub` per
-    term; the `refs` loop goes 22 → 12) with no wall-clock regression, because
-    these loops are latency-bound on the serial add chain and register renaming
-    hides the extra moves.
-  - **A term that needs evaluating folds too, when overflow checks are off.**
-    `sum = sum + f(i)` emits `call f; add %rax, dst` — one `add` on the
-    accumulator — instead of `call f; mov %rax, %rcx; mov dst, %rax; add %rcx,
-    %rax; mov %rax, dst`. That is three instructions fewer per iteration in
-    `mix` (the call-heavy benchmark), byte-identical output for `refs`/`stats`
-    (their loops are fully inlined and have no such term), and neutral-to-better
-    at run time. Terms are still emitted in source order, so a call that writes
-    a local an earlier term read is unaffected (`mut_aliasing` tests cover it).
-    An earlier rejection of this idea (a ~12% `refs` regression) predates the
-    inliner: that `refs` loop still held three calls, and folding them reordered
-    reads around them. With the loop inlined there is nothing to reorder.
-  - **CSE into frame slots was measured and rejected.** De-duplicating repeated
-    inlined subexpressions *within* a statement by binding each to a fresh slot
-    (`refs`: 18 → 28 ms) loses to recomputing: the extra slot loses the
-    five-register promotion contest and the loop round-trips through memory.
-    Hoisting the same value out of the loop entirely (LICM) is what wins, because
-    the slot is written once, not per iteration.
-- Division or modulo by a literal divisor does not use `idiv`. `gen_div_const`
-  emits the Hacker's Delight magic multiply (the same algorithm LLVM uses),
-  with a sign fixup and, for roughly a quarter of divisors, an extra add of the
-  dividend. Powers of two use a shift with a `2^k-1` sign bias.
-  - **`imul` clobbers `%rax`** with the low product, so the fixups must read the
-    dividend from the `%r8` copy taken before the multiply, not from `%rax`.
-    Using `%rax` here silently produces wrong results for large dividends.
-  - **The sign bias is required** for power-of-two divisors; without it a
-    negative dividend rounds toward negative infinity instead of toward zero.
-  - `small_imm` accepts a negated literal, so `x / -1000` takes the fast path.
-  - `tests/cases/div.rs` covers both variants, powers of two, negatives,
-    and boundary dividends, and is the regression guard for all of the above.
-- Division or modulo by a *variable* divisor uses `idiv`, but only after a
-  32-bit fast path. `emit_div` tests whether both operands fit in 32 bits by
-  ORing them and shifting the top 32 bits out (`mov %rax, %rdx` + `or <rd>`,
-  `%rdx` + `shr $32, %rdx` + `jnz <slow>`); when both fit, `div <reg>d`
-  computes the same result in ~20 cycles instead of ~30–40, and when either does
-  not, the 64-bit `cqto` + `idiv <reg>` runs. Its `gcd` operands are always
-  small, so `mix` takes the narrow path every iteration — this is what keeps
-  `mix` close, though it is still the documented weak spot (0.92×, division-
-  bound; see `bench/RESULTS.md`).
-  - **The fit test must be unsigned.** ORing the two operands and reading the
-    top 32 bits is an unsigned test: a negative operand has a high bit set and
-    the shift leaves a non-zero result, so it falls through to the 64-bit path,
-    exactly as the earlier `cmp $2^32`/`jae` pair did. A signed test would send
-    a negative dividend down the 32-bit path and truncate it. (This replaced the
-    pair of `cmp`/`jae` against `mov $4294967296, %rdx`; the OR form is one
-    instruction fewer and needs no 10-byte `movabs` in the loop. Copying the
-    dividend into `%rdx` first is what lets the shift run without destroying
-    `%rax`, which the old 2^32 form could not do.)
-  - **The 32-bit divide reads `%rdx` as the dividend's high half**, and the
-    `shr $32, %rdx` above already left it zero, so no `xor` is needed before
-    `div <reg>d`. `%rdx` is scratch on the fast path because `cqto` has not run.
-  - The divisor is read from its own register (`idiv %rbx`) when it is a
-    promoted local, and from `%rcx` otherwise; `r32` maps each to its 32-bit
-    half. A one-off sweep of 1042 `q(a,b)` pairs across the full `i64` range —
-    negatives, the 2^32 boundary, and near-`i64::MAX` — matched rustc exactly.
-- **Under `--overflow-checks`, a shift count is range-checked before the shift.**
-  `check_shift_count` emits `cmp $63, <count>; ja __rmc_shift_overflow`, because
-  the hardware masks a 64-bit shift count to 6 bits: without the check `x << 64`
-  silently shifts by 0, while Rust panics. The count is only known to be in range
-  when it is a compile-time constant (`const_of`); a run-time count always gets
-  the check. With overflow checks off, the shift is unchecked, matching Rust's
-  default `<<` (which does not panic on an out-of-range count in release).
-- **`tests/cases/divtrap.rs` and `shovf.rs` pin the trap codegen.** `divtrap`
-  exercises `MIN / -1` (SIGFPE on x86 `idiv`) and division by zero, both of which
-  trap *without* `--overflow-checks` (Rust panics on them by default); it covers
-  the constant `-1` divisor (strength-reduced) and a runtime divisor (`idiv`).
-  `shovf` (with a `.overflow` marker) exercises an out-of-range shift count under
-  `--overflow-checks`. Both are differential (stdout and exit status must match
-  the rustc twin) and are what catch a trap that fires when it should not, or
-  fails to fire when it should.
-- **The `MIN / -1` guard sits in the 64-bit slow path, not before the split.**
-  `emit_div` splits on whether both operands fit in 32 bits; a dividend that does
-  is never `MIN` (its high bit is clear), so the `movabs $0x8000...; cmp; jne`
-  guard only runs on the `idiv` path. Putting it before the split cost every
-  division a `movabs`+`cmp`+branch for nothing. The zero-divisor check *must*
-  stay before the split: zero fits in 32 bits and would otherwise reach `div`.
-- **The self-recursion pass must synthesise the AST the parser would build.** It
-  runs after sema, so it has no `Sema` to allocate slots or resolve names. It
-  reuses the parameter's own `(name, slot, ty)` for the loop variable, and takes
-  one fresh slot (`f.nslots`, then `f.nslots += 1`) for the accumulator; the
-  synthesized `Call` carries `arg_slots: vec![(-1, 0)]` and `ret_slot: -1`
-  directly, because a scalar `i64` argument needs no hidden buffer and a scalar
-  return needs no hidden pointer. Every synthesized `Expr::Var` must carry the
-  right `slot`/`ty`, or codegen emits a load from the wrong frame word.
-- **The pass is guarded to be exact, not approximate.** Only `+`/`*` (associative)
-  qualify; `cond`, `guard` and `h` must be call-free and return-free, and `t` must
-  be return-free and call only the function being transformed, or the loop would
-  duplicate a side effect or leave without adding the accumulator. It
-  is also skipped entirely under `--overflow-checks`, since reassociating checked
-  arithmetic traps on a different intermediate than the recursion. A shape that
-  does not match is left completely alone. `tests/cases/tco.rs` diffs `fib`
-  and `fact` against rustc and `tests/cases/callrec.rs` covers the
-  `1 + f(n-1) + f(n-2)` shape; unit tests pin the non-associative
-  `f(x-1) - f(x-2)` case, a `return` in an argument, a foreign call in the left
-  operand, and overflow checks.
-
-## MIR back-end benchmark tuning (fair harness)
-
-`bench/run_fair.py` compares the same `bench/mir/*.rs` source through both
-back ends: `mir` = `rustc --emit=mir -O -Zno-codegen` + `rmcmir`, `llvm` =
-`rustc --emit=obj -O -C lto=fat -C codegen-units=1` + `ld`, both linked against
-rmc's own freestanding runtime. Read the harness before trusting a number.
-
-- **Count the whole pipeline's peak RSS on both sides.** The `mir` column's RSS
-  is `max(rustc --emit=mir, rmcmir)`; counting only `rustc` on the LLVM side
-  (leaving out `ld`) credits LLVM with a free link step and turns a tie into a
-  fake win. `measure_llvm` takes `max(c, ld)`.
-- **`-Zno-codegen` is the whole point of the front end.** With it, `rustc
-  --emit=mir` stops before LLVM codegen: `hello`/`stats` front-end CPU drops
-  from ~267/538 ms to ~54/408 ms. rmc sets `RUSTC_BOOTSTRAP=1` on the child
-  rustc; the harness mirrors that. Without the flag the MIR front end is as
-  expensive as the LLVM one.
-- **`rustc --emit=mir` uses ~3-5 MB *more* RSS than `--emit=obj`** (85892 vs
-  85220 KB on `stats`), reproducibly, with `-Zthreads=1`, `debuginfo=0`,
-  `mir-opt-level=2` and `incremental=false` all failing to close it. The
-  compile-RSS axis is therefore an inherent front-end tie (~0.99), not
-  something the back end can fix; the front end is rustc in *both* pipelines.
-  A second sweep (`-Zmir-opt-level=0/1/2`, `-Zmir-include-spans=no`,
-  `-Zshare-generics=no`, `-Zalways-encode-mir=no`, `-C strip=symbols`,
-  `-Zno-parallel-llvm`) caps the recoverable RSS at ~1.2 MB
-  (`-Zmir-opt-level=0`, at the cost of MIR quality), and `-C incremental=off`
-  saves ~10 MB but saves *more* on the LLVM side (79.8->62.2 MB vs
-  83.2->72.2 MB), so applying it to `mir` alone would be gaming the benchmark,
-  not optimising. Do not chase this axis.
-- **Report the back-end-only split too.** Because the front end is rustc in
-  both pipelines and dominates both RSS peaks, the whole-pipeline RSS ratio
-  hides the stage this experiment actually swaps. `run_fair.py` therefore also
-  prints a `back-end-only comparison`: `ld` over `rmcmir` per program, on wall,
-  CPU, RSS and size. rmc's own back end wins all four (`wall ~1.12`,
-  `cpu ~1.13`, `rss ~1.40`, `size ~18.8x`): `rmcmir` peaks at ~3.2 MB against
-  `ld`'s ~4.7 MB. That is the honest "rmc beats LLVM" claim; the whole-pipeline
-  RSS tie is the shared rustc front end, which neither pipeline controls.
-- **The compile CPU win is real and large** (~1.2x): skipping LLVM codegen.
-  Wall time is a near-tie because both fronts pay rustc's ~25-30 ms startup.
-  The win does not depend on the aggressive LLVM flags: on `stats`,
-  `rustc --emit=mir -O -Zno-codegen` is 26.2 ms wall / 25.8 ms CPU, a plain
-  `rustc --emit=obj -O` is 29.9/30.4, and the harness's
-  `-C lto=fat -C codegen-units=1` build is 30.2/30.7. The MIR front end is
-  cheaper than the LLVM one even when LLVM does no LTO at all.
-- **Ratios inside +/- 0.02 are a tie.** The run axes take the minimum of 50
-  interleaved samples, but two runs of the *same* binary still land within
-  ~1% of each other on this host (measured spread 0.8-1.3% for `mix`/`heap`),
-  so `0.99` carries no signal. `NOISE_BAND = 0.02` keeps the verdict from
-  calling a tie a loss; the harness also prints the mean speedup per axis, so
-  one program's tie cannot hide a regression. On the current host that mean is
-  `wall 1.08, cpu 1.12, rss 1.00 (tie), size 18.8, run_wall 1.10, run_cpu 1.11,
-  run_rss 1.20`: six wins and the one documented front-end tie.
-- **`run_rss` above 1 is rmc *winning*.** rmc's `_start` is a bare syscall exit
-  with no libc, so a short program peaks at ~36 kB while the LLVM+`ld` binary
-  pays the ELF loader's ~48 kB. A `run_rss` of 1.2-1.3 is a 12-33% RAM win, not
-  a loss; do not "fix" it.
-- **Strip the LLVM link (`ld -s`).** rmc's linker emits no section headers, so
-  its binary is symbol-free already; leaving LLVM's symtab in credits rmc with
-  ~5.7 kB it did not save. `run.py` strips rustc for the same reason.
-
-### The harness gates on output equality and interleaves sampling
-
-Two properties make the verdict defensible, and both are easy to lose when
-editing the harness:
-
-- **Correctness gate.** `verify_outputs` runs both produced binaries once and
-  aborts if stdout or exit status differ, before any run-time number is
-  reported. A back end is only "faster" on a workload the other also computes
-  correctly; without the gate, a back end that miscompiles (or traps early)
-  would look fast.
-- **Interleaved sampling.** `measure_stages` times the four compile stages
-  (`mir.front`, `mir.back`, `llvm.front`, `llvm.back`) round-robin in one pass,
-  and `measure_interleaved` does the same for the produced binaries, so CPU
-  frequency and thermal drift cannot favour whichever pipeline ran first. A
-  sequential sweep can flip a near-parity run axis (`mix`/`heap` sit at ~1.00)
-  on its own.
-- **`run.py` is the end-to-end claim, and it reports a machine-checked
-  verdict.** rmc's own front end *and* back end against rustc/LLVM on one
-  source, so unlike `run_fair.py` there is no shared front end to excuse a tie:
-  a tie there would be a real limit of the whole compiler. `verdict`/`axis_means`
-  print the mean `rustc/rmc` ratio per axis with a `win`/`tie`/`loss` word
-  (`NOISE_BAND = 0.02`, matching `run_fair.py`), list every per-program loss, and
-  print `ALL AXES WON` only when all seven axes win; `write_markdown` records the
-  same table under `## Verdict`. The current run is `ALL AXES WON`
-  (`compile_wall 1156x`, `compile_cpu 1246x`, `compile_rss 52x`, `size 301x`,
-  `run_wall 1.46x`, `run_cpu 1.71x`, `run_rss 72x`). The run axes are the honest
-  ones: 1.46x/1.71x/72x, not the four-digit compile ratios.
-
-`bench/run.py` (AST path) carries the same gate (`verify_outputs`) and
-round-robin run sampling (`measure_runs`). `bench/run_mir.py` does *not*: its
-`mir` column compiles `bench/mir/*.rs` while its `ast`/`llvm` columns compile
-`bench/rust/*.rs`, so its run-time axes compare two different programs. Treat
-its run numbers as indicative and use `run_fair.py` for the apples-to-apples
-claim; the caveat is recorded in its docstring.
-
-### The rustc-front-end / rmc-back-end pipeline: state and gaps
-
-`docs/mir-roadmap.md` is the milestone plan. The measured facts behind it, so a
-future session does not re-derive them by hand:
-
-- **The MIR path is far more capable than its own doc comments say.** Probes
-  (compile + run + diff against a native `rustc -O` twin) show `f64`/`f32`
-  arithmetic and loops, `i128` arithmetic/division/comparison, capturing and
-  non-capturing closures *called directly*, by-value struct/tuple returns,
-  `&mut` through a reference, `impl`/trait static dispatch, slice iterators,
-  `Option`/`Result`, monomorphised generics, and 2-D/array-of-struct all
-  **produce correct results**. But `classify_unsupported` in `mir.rs` still
-  claims "floating-point types are not implemented" and "128-bit integers are
-  not implemented". Trust the probe, not the message; fixing the list is P1.
-- **Function pointers and indirect calls are implemented (P4).** Taking a
-  function as a value (`add as fn(i64, i64) -> i64`, MIR
-  `PointerCoercion(ReifyFnPointer)`) reifies its address, and a call through a
-  `fn`-typed place lowers to an indirect `call *%reg`. Covered by
-  `tests/mir/fnptr.rs`: a pointer passed as an argument, returned from a
-  function, stored in a struct field, and held in an array. Three latent bugs
-  had to be fixed, each of which would break *any* operand-shaped callee:
-  `split_top_args` counted the `>` of a `->` as a closing angle bracket (so a
-  `fn(..) -> ..` parameter swallowed every later argument); the inliner cloned
-  `CallTarget::Indirect` verbatim (so an inlined indirect call still named the
-  *caller's* local); and the MIR use/def and rewrite passes ignored the callee
-  operand (so a `fn` pointer local looked dead and its definition was dropped).
-  Still open: a closure passed as `impl Fn` becomes an indirect call but needs
-  the closure *value* to be built, which is a separate aggregate gap; `dyn
-  Trait`; `Range` as a value (`(0..10).step_by(2)`) hits `aggregate constant
-  not yet materialised`. `Vec`/`Box`/`String` fail earlier, at the front end,
-  because the `#![no_std]` stub has no `alloc`.
-- **LLVM emits `memset` for a wide zero-init; rmc's runtime must provide it.**
-  `bench/mir/light.rs`'s `[0i64; 256]` made LLVM call `memset`, which rmc's
-  freestanding runtime did not define, so `run_fair.py` failed at the link with
-  `undefined reference to memset`. The `mem*` primitives are now runtime pieces
-  (`compiler/src/runtime.rs`), selected only when a program names them, so rmc's
-  own output is byte-identical; they are verified against a C harness and pinned
-  by `runtime::tests`. Any future runtime piece that a *compiler* may emit a
-  call to (not just the user) needs the same treatment.
-- **The honest scoreboard is `run_fair.py`'s "some axes lost".** After the P3
-  codegen work the whole-pipeline mean is wall 1.08, cpu 1.11, rss 1.00 (tie),
-  size 18.8, run_wall 1.12, run_cpu 1.13, run_rss 1.31. The one remaining
-  per-program flag is `hello` **compile RSS 0.97**, which is the shared rustc
-  front end (below), not rmc. `light` run wall is now 1.11 — the old 0.81 loss
-  is closed. Back-end-only compile is still behind `ld` on `refs`/`sieve`/
-  `mandel` (0.81/0.85/0.89), a slow path in rmc's own assembler, not in the
-  codegen: the one-process `cb` pipeline beats LLVM on all three.
-- **`fold_lea_terms` closed the `light` run-time loss.** An array element access
-  was `lea base(%rbp), %rax; mov index, %rcx; lea (%rax,%rcx,8), %rax` — three
-  instructions where x86-64 fits base, scaled index and displacement in one.
-  The pass fuses the chain into `lea base(%rbp, index, 8), %rax` and drops the
-  index copy, but only when `%rcx`'s next mention is a pure write (a `mov`/`lea`
-  whose destination is `%rcx` and whose source is not), so a live scratch value
-  is never clobbered. It sits after `fold_addresses` in the fixed-point loop and
-  is pinned by `an_indexed_address_chain_folds_to_one_lea` plus the negative
-  `an_indexed_chain_whose_scratch_is_still_live_is_not_folded`. Measured: `light`
-  run wall 0.81 → 1.11; no program is below 0.98.
-- **The `hello` compile-RSS flag is rustc's front end, not rmc.** `rustc
-  --emit=mir -Zno-codegen` peaks ~3.5 MB above `--emit=obj` on the same source
-  (84.2 vs 80.9 MB), because emitting the MIR text keeps every body resident,
-  while `--emit=obj` frees them once LLVM has consumed them. rmc's own back end
-  peaks at 3.2 MB against `ld`'s 4.7 MB, so on the stage this experiment swaps
-  rmc wins by 1.4x. The whole-pipeline ratio is `max(front, back)` on both
-  sides and the shared front end dominates both peaks, so this axis is a
-  structural tie; do not chase it (a flag sweep in the MIR-bench section shows
-  the recoverable headroom is ~1 MB and only at the cost of MIR quality).
-- **Do not promise "beats LLVM on every axis".** The compile/memory/size axes
-  are structural wins (skip LLVM codegen, link no libc), and the back-end-only
-  split wins all four. The whole-pipeline run-time axis is now a win too, but
-  it is the least structural: the back end still has no real register
-  allocator, so a scheduler-sensitive kernel could lose it back.
-  `docs/mir-roadmap.md` P3 is the work that keeps it closed.
-
-### The codegen-backend pipeline (`cb`): the dylib must be a `cdylib`
-
-`backend/` builds rmc as a rustc `-Zcodegen-backend` dylib, the complete form
-of the pipeline the printed-MIR prototype (`rmcmir`) stands in for: rustc hands
-the backend the same optimised MIR LLVM would see, and rmc lowers it straight
-to a freestanding ELF. `bench/run_codegen.py` compares it to `rustc -O -C
-lto=fat` per program.
-
-- **`cb` wins every mean axis against LLVM.** Measured: wall 1.33, cpu 1.36,
-  rss 1.11, size 21.0, run_wall 1.09, run_cpu 1.09, run_rss 1.25. No per-program
-  cell is below the band any more (the old `hello` compile-RSS loss is gone; see
-  the visible-path note below). Against the printed-MIR prototype (`mir`) it is
-  faster to compile (wall 1.25, cpu 1.24, rss 1.08) at identical run time: one
-  process, no MIR text, no `ld`. Against rustc's Cranelift backend it wins every
-  axis too (wall 1.13, cpu 1.16, size 20.9, run_wall 1.61).
-
-- **The backend is x86-64/executable only, and says so.** `assemble` writes
-  x86-64 ELF and rmc supplies its own `_start`, so `codegen_crate` fatals on a
-  non-x86-64 `--target` and on any `--emit` other than an executable
-  (`--emit=obj`/`asm` would otherwise get a silently mislabeled ELF), and on a
-  non-`bin` crate type.
-- **`-C opt-level` must be passed by the caller.** opt-level drives rustc's MIR
-  passes, which run *before* `codegen_crate`, so the backend cannot set it. The
-  `backend/rmc-rustc` wrapper supplies `-C opt-level=3` by default (a later
-  `-O`/`-C opt-level=N` on the command line still wins); `bench/run_codegen.py`
-  passes it explicitly.
-- **`overflow_checks` is read from the session and threaded through.** The MIR
-  dump only carries the checked-arithmetic shapes under `-C overflow-checks=on`,
-  and `switchInt(OverflowChecks)` folds to a different arm, so `codegen_crate`
-  passes `tcx.sess.overflow_checks()` to both `mir::parse_with` and the loop
-  rewrites (`tco`, `close_counted_loops`), which would otherwise move a trap.
-- **`crate-type = ["cdylib"]`, not `["dylib"]`.** A `dylib` exports every
-  `pub` symbol of its dependency, so all 194 `rmc::*` items stay dynamically
-  exported and the linker cannot drop the unused AST front end
-  (parser/sema/lexer, ~17k lines). A `cdylib` exports only
-  `__rustc_codegen_backend`, the `.so` halves (2.1 -> 1.2 MB), and the
-  whole-pipeline compile-RSS mean moves from a loss to a tie. Add `lto = true`,
-  `strip = true`, `codegen-units = 1` to match the compiler crate's profile.
-- **Drive the backend through `rustc` directly, not the `backend/rmc-rustc`
-  shell wrapper.** The wrapper's extra `sh` process is a fixed ~1.9 ms tax; the
-  LLVM row is one `rustc` process, so the harness must be too or the comparison
-  is unfair. `run_codegen.py` passes `-Zcodegen-backend=<so>` to `rustc +nightly`
-  itself. The `.so` carries an rpath to the toolchain `lib` (set by
-  `backend/build.sh`), so no environment fixup is needed.
-- **`interleave_div_pairs` is the whole of `mandel`'s gap to LLVM.** Its inner
-  loop computes `zr*zr/1000` and `zi*zi/1000`: two adjacent
-  `mov;imul;mov %rax,%r10;<magic divide>` units. Each is short enough that the
-  CPU cannot hide the second `imul` behind the first unit's tail, so the pair
-  runs serially. The pass hoists the second multiply above the first divide and
-  parks the two products in `%r10`/`%r11` (scratch on this path). Constant
-  hoisting alone does *not* help (verified, 5 sites) -- the win is purely ILP.
-  The pair must be independent: `match_div_pair` rejects it when the first
-  divide's destination is the second's multiplicand, since reordering would
-  then square the register's pre-division value.
-- **`gen_div_const` takes its sign correction from `%rdx` on the plain path.**
-  Only the biased (`add`) path -- where the magic `m` does not fit a positive
-  `i64` and the product does not carry the dividend's sign -- needs the dividend
-  copy in `%r10`. The plain path reads `%rdx >> 63` straight after the `imul`,
-  keeping `%r10` off its critical path (and free for the interleave pass).
-- **`-C opt-level=3` (with rustc's MIR optimiser) is mandatory, not a knob.**
-  `-Zmir-opt-level=0` compiles `hello` ~1 ms faster and ~1 MB lighter, but
-  `mandel` runs 1.6x slower, `stats`/`forloops` 2x, and `fib` is wrong. rmc
-  reuses rustc's optimised MIR; it does not re-do those passes.
-- **The remaining `hello` compile-RSS loss (0.97) is structural.** Stubbing out
-  rmc's lowering entirely (`compile_mir_text` returns early) still peaks at
-  84.6 MB against LLVM's 83.0 MB, so it is the shared rustc front end plus the
-  ~1.4 MB cost of loading a codegen backend at all -- not rmc's codegen. The
-  mean RSS is a tie (1.01); do not chase the per-program flag.
-
-### The harnesses must not hard-code mangled names, and the toolchain is pinned
-
-The differential and benchmark harnesses once hard-coded v0-mangled panic
-symbols with the crate hash of one libcore build:
-
-```
-_RNvNtNtCskADBYZwJmSU_4core9panicking11panic_const24panic_const_add_overflow
-_RNvNtCskADBYZwJmSU_4core9panicking18panic_bounds_check
-```
-
-The hash is not stable across toolchains, so on any other build the reference
-link failed with `undefined reference to ...panic_bounds_check` and the
-harness aborted or reported a false failure (reproduced on stable 1.97 and on
-`nightly-2026-11-12`, the channel this branch uses).
-
-- **Read the undefined symbols off the object.** `tests/mir/run.py`
-  (`flow_checks` cases) and `bench/run_fair.py` now run `nm -u` on the
-  reference object and stub exactly the `panic`/`overflow` names it reports,
-  rather than a literal list. The stub set then adapts to whatever codegen
-  emits. `nm` prints an undefined name either as a `U`-typed three-column line
-  or as a bare name, so match both forms.
-- **Pin the toolchain for the backend, not the repo.** `backend/rust-toolchain.toml`
-  pins the exact nightly plus `rustc-dev`, `llvm-tools` and
-  `rustc-codegen-cranelift`. It is scoped to `backend/` on purpose: a root pin
-  would force the AST/MIR prototype suites and CI's stable `test` job onto
-  nightly. rustup resolves the nearest pin from the *working directory*, so
-  `backend/build.sh` cds into `backend/` first, and `backend/rmc-rustc` passes
-  the channel explicitly (`rustc +"$channel"`) since it may be run from
-  anywhere. Every harness reads the channel back out of the TOML
-  (`backend/rust-toolchain.toml`) instead of writing `+nightly`, so the pin is
-  the single source of truth and the backend dylib is always loaded by the
-  toolchain it was built against.
-- **The harness creates its own directories.** `bench/run_codegen.py::build_runtime`
-  does `os.makedirs(OUT, exist_ok=True)` because `bench/run_four.py` calls it
-  directly and only creates its own `/tmp/rmcfour`; a fresh machine previously
-  hit `FileNotFoundError` for `/tmp/rmccodegen`.
-- **CI proves it on a fresh machine.** The `bench` job installs only the pinned
-  toolchain (channel read from the TOML) plus binutils, builds, and runs both
-  harnesses from empty output directories. A hard-coded mangling only breaks on
-  a toolchain the author did not use, so a fresh-machine job is the only way to
-  gate it.
-
-### A codegen backend must not swallow a real diagnostic
-
-`codegen_crate` calls `tcx.dcx().reset_err_count()` to disarm the "must produce
-a diagnostic" guard rustc arms around MIR printing, but `reset_err_count` also
-discards any *real* error. Assert the count is 0 first, so a genuine error
-reaching codegen aborts instead of being silently cleared (`codegen_crate` only
-runs after type checking passed, so a non-zero count there is itself a rustc
-bug). `tests/cb/run.py` pins it: a program with a type error must exit non-zero
-through `rmc-rustc`, print the `E0308` diagnostic, and write no binary.
-
-### An unsupported construct must exit 1, never panic
-
-Three separate panics on *expected* input were found and fixed (P1):
-
-- `compiler/examples/rmcmir.rs` used `.expect("mir parse")` and
-  `.expect("assemble")`, so an unsupported construct printed a Rust panic and a
-  `RUST_BACKTRACE` note with status **101**. Both now exit 1 with `rmc-mir:
-  error: ...`, matching the `.rs` path in `main.rs` (which already propagated
-  errors). `f_minmax` (`.min(3.0)`, an undefined float intrinsic) panicked at
-  `assemble` on `elf: undefined symbol`.
-- A `dyn Trait` coercion was parsed as an identity pointer cast; the virtual
-  call then became a direct call to a method with no symbol, so the user saw
-  `elf: undefined symbol 'area'` at link time. `parse_rvalue` now rejects a
-  `dyn` cast target where the construct is still visible.
-- `classify_unsupported` claimed "floating-point types are not implemented" and
-  "128-bit integers are not implemented". Both are false: `tests/mir/float.rs`
-  and `tests/mir/wideint.rs` compile and run. Only float `%` and the intrinsics
-  (`min`/`max`/`abs`/`powf`) are unsupported. Trust a probe over the message.
-
-The invariant is now enforced, not just documented: `tests/mir/reject/` holds
-cases rustc accepts but rmc must refuse, and `tests/mir/run.py` asserts status 1
-plus a `note:` (status 101 would be a panic). `tools/mir_survey.py` had been
-calling `rmc` *without* `--rustc-frontend`, so it surveyed the AST path and
-could not see any of these crashes; it now passes the flag and runs in CI.
-
-
-### Branchless min/max (`cmov`) was tried and rejected
-
-A min/max diamond (`if v > acc { acc = v }`) lowered to a branch; LLVM emits
-`cmov`. Adding `enc_cmov` to `elf.rs` and a `plan_cmovs` fold to
-`mir_codegen.rs` made `stats` **1.16x slower** (3.27 -> 5.08 ms on the same
-binary, `taskset -c 2`, best of 13) and was neutral (0.99-1.02) on the rest.
-The reduction branches in these benchmarks are predictable — the accumulators
-start at `i64::MIN`/`MAX` and the update usually takes the same side — so the
-branch predicts ~perfectly while the `cmov` only adds a data dependency to a
-latency-bound loop. LLVM wins `stats` because it *unrolls by two* and strength-
-reduces the `i * 2654435761` multiply into two induction variables, not because
-of `cmov`. Do not re-add the fold without measuring a program whose min/max
-input is genuinely unpredictable.
-
-### Recurring wide constants are hoisted into idle callee-saved registers
-
-An i64 immediate that does not fit a sign-extended i32 needs a `movabs` to
-materialise, and one named inside a loop pays that on every iteration (`stats`'s
-`i * 2654435761` and the `% 1000003` magic multiplier are two per iteration).
-`hoist_consts` ranks the constants that recur by loop depth (a single use in a
-loop clears the bar) and materialises each into a callee-saved register once, at
-function entry; `const_operand` and `gen_div_const` then read the register
-instead of re-emitting the immediate.
-
-Promotion runs first and claims the registers it wants; hoisting only fills what
-is left. That ordering matters: hoisting *first* (so it claimed the spare
-registers) displaced `stats`'s hot `count` local into memory, and the extra
-load/store per iteration cost more than the two `movabs` it saved. A promoted
-local is worth more than a hoisted constant -- a load versus a `movabs` -- so
-hoisting is the tie-breaker, not the priority. It is a wash on programs whose
-hot loop already uses all five callee-saved registers (`mandel`) and helps those
-with registers to spare.
-
-### No-op arithmetic (`add $0, %reg`) must be dropped
-
-A struct field at offset 0 lowers to `add $0, %rax`. The instruction cannot
-change its destination, but it *does* block the store-forwarding peephole that
-would otherwise fold the pointer's round-trip through its frame slot, so every
-field write keeps a reload. `drop_noop_arith` removes `add $0`/`sub $0` unless
-the next instruction reads the flags it sets (`flags_used_by`). Measured on the
-`heap` linked-list fill: one load per node removed, run 1.08x vs LLVM; `refs`
-1.04x, `mix` 1.01x.
-
-### A drop-glue read of a promoted caller-saved local must come from its spill slot
-
-`gen_drop` spills the promoted caller-saved locals once, before the destructor
-tree, and restores them after the whole tree. That is correct for the tree's
-*calls*, but not for a read that happens *inside* the tree after one of them: the
-destructor call clobbers the register, so a later `place_addr` that reads the
-local gets garbage. Dropping `arr[i]` is the reachable case — the index local
-feeds `Proj::IndexLocal`, and a struct whose first field drops before a second
-field is addressed (`struct S { a: [Inner; 2], b: Inner }`) reads the index again
-after the array's destructors have run, dropping `b` at `arr[<garbage>]`. While
-`in_drop` is set, `local_operand` returns the local's caller-spill slot (written
-by the tree's own spill) instead of the register. The index must be *promoted*
-for this to bite: it needs a use count of at least 2 (`indexdrop.rs` raises it
-with nested loops), otherwise it stays in its frame slot and the bug is latent.
-Regression: `tests/mir/indexdrop.rs`.
-
-### An aggregate literal is a variant only if a real `::variant` segment follows the type
-
-Both aggregate-classification paths (`reclassify_enum_aggregate`, which uses the
-destination local's type, and `is_enum_variant_name`, which decides by
-capitalisation) must strip generics *before* looking for the variant segment. A
-generic struct literal prints as `G::<T> { .. }`; splitting the raw name takes
-the turbofish as the variant and adds a phantom tag word, shifting every field by
-one (`G::<T>` with a module-qualified argument gave 12 instead of 119). Reducing
-first makes `Option::<i64>::Some` -> `Option::Some` (a variant) and `G::<T>` ->
-`G` (a struct). Regression: `tests/mir/genstruct.rs`.
-
-### Overflow checks are rustc's rewrite, not the back end's switch
-
-On the MIR path the back end must never emit an overflow trap of its own. rustc
-encodes a checked `+`/`-`/`*` as `AddWithOverflow`/`SubWithOverflow`/
-`MulWithOverflow` followed by an `assert`, and encodes the wrapping forms
-(`wrapping_add`, and rustc's own range/iterator desugaring, which prints as
-`AddUnchecked` and friends) as a bare `Add`. So a trap is always an explicit
-`assert` in the MIR, and the instruction itself is identical either way. The
-back end's job is only to lower both spellings to the same instruction; whether
-the operation traps is decided entirely by whether rustc put the `assert` there.
-
-For the same reason `bin_op` maps `AddUnchecked`/`SubUnchecked`/`MulUnchecked`
-(and the shift forms, and the older `UncheckedAdd` spelling) straight to
-`BinOp::Add` and friends rather than to separate variants. A separate variant
-would lower correctly but would also stop matching the many loop passes that
-pattern-match `Rvalue::Binary(BinOp::Add, ..)` on a literal, so the counter
-induction of a `for i in 0..n` written over a slice (where rustc emits
-`AddUnchecked`) would silently stop strength-reducing while the same loop over a
-plain range (which emits `AddWithOverflow` + `assert`) still did.
-
-`--overflow-checks` is therefore passed to the *rustc* invocation
-(`-C overflow-checks=on|off` in `main.rs`), not to `mir_codegen`. An earlier
-version had the back end add `jo __rmc_overflow` after every `add`/`sub`/`mul`,
-which is wrong twice over: it traps `wrapping_add` (rustc emits it as a plain
-`Add`, so nothing should trap) and it double-traps the checked forms (rustc's
-`assert` already fires). It also cannot see a value that is only out of range at
-run time, so a runtime `i64::MAX + 1` slipped through until the flag was passed
-through to rustc. `mir_codegen::Options` has no `overflow_checks` field for this
-reason. Division overflow is the one case rustc guards regardless of the flag
-(`assert(!(y == -1 && x == i64::MIN))` before a `Div`), so `gen_div_const`'s
-`neg %rax` needs no trap either.
-
-Regressions: `tests/mir/wrapping.rs` (the wrapping family and a range `for`,
-compiled with checks *off* — must not trap), and `tests/mir/ovfcheck.rs` +
-`ovfcheck.overflow` (checked arithmetic compiled with checks *on* — must exit
-101 on overflow). The `.overflow` marker makes `tests/mir/run.py` pass
-`--overflow-checks` to rmc and `-C overflow-checks=on` to the reference, and
-link the reference against small stubs that route core's
-`panic_const_*_overflow` symbols to `__rmc_overflow`.
-
-### `strength_reduce` may not reuse a multiply destination read after the loop
-
-`strength_reduce` rewrites `p = i * C` inside a loop into a running value
-(`piv`) advanced by `s * C` in the latch, and it reuses the multiply's own
-destination for `piv` to avoid spending a fresh local. The advance is inserted
-after the increment, so it also runs on the final iteration: once the loop
-exits, the reused destination holds `n * C`, not the `(n - 1) * C` the last body
-execution stored. `while i < n { p = i * 7; i += 1 }` printed 70 instead of 63.
-
-Reuse is gated on `reuse_ok`: the destination may double as the running value
-only when every read of it is inside the loop, after the multiply and before the
-latch's increment. That is the window in which the running value equals the
-multiply's original result. A destination read after the loop, or before the
-multiply (where the running value is one step ahead), gets a fresh private local
-instead. The gate is precise enough to keep the optimisation where it pays:
-`stats`'s `v = i.wrapping_mul(2654435761)` feeds only an in-loop accumulator, so
-it still strength-reduces with no `imul` in the hot loop. Regression:
-`tests/mir/srread.rs`.
-
-### A type spelling is relative to the item that mentions it, and it can be qualified
-
-rustc prints a type relative to the body that mentions it, and that relative
-spelling is not always bare: inside `outer::get`, the nested type `outer::a::A`
-prints as `a::A`, while the crate root spells it `outer::a::A`. A qualified
-spelling looks like a complete path, so `canonicalize_types`' global bare-name
-pass skips it (it must: `a::A` in two modules can name two distinct types). The
-callee then keys a *different* type than the caller built, its layout is empty,
-and field reads fall back to `k*8`, reading the wrong word past a multi-word
-field. `Function::module` keeps the body's own module prefix from the raw header
-(before the printer's relative spellings are resolved) and a per-body pass in
-`canonicalize_types` resolves each qualified body spelling against it, longest
-prefix first. Regression: `tests/mir/modrelpath.rs` (reads `1 5` instead of
-`1 13` without the per-body pass). The inliner masks this: the callee needs a
-large body (or `#[inline(never)]`) to be emitted at all.
-
-### A masked index's bounds check is dropped, and the index is promoted anyway
-
-`table[i & 255]` with `table: [i64; 256]` keeps a `cmp`/`jge` on every
-iteration: the bounds `assert(i & 255 < 256)` is provably true. `AssertFacts`
-gained two facts to see that -- `masked` (`d = x & M` puts `d` in `[0, M]`, and
-a widening `IntToInt` cast carries the bound along) and `lt` (`b = x < LEN`) --
-and `drop_redundant_asserts` drops the assert when the index's bound is below
-the length. Both facts survive a join only when the two sides agree exactly.
-
-Dropping the assert leaves the index with a *single* textual use, and the
-register allocator's two-use threshold then spilled it, which ate the whole win
-(the assert is one branch per iteration; a spilled index is a load plus a store).
-The fix is in the same change: a local used as an array index is promoted with
-one use when it is read inside a loop. Every other local keeps the two-use rule,
-so `fib`'s `n - 1`/`n - 2` temporaries still fold into `lea` and do not take a
-register and a spill -- relaxing the threshold globally cost `fib` 22 -> 31 ms.
-
-`light` run_wall went 0.85 -> 1.11 against LLVM on this change alone.
-
-### The `hello` compile-RSS loss was rustc's visible-path resolution
-
-The `cb` pipeline used to read 0.97 on `hello`'s compile RSS. The cause was not
-rmc's back end but `write_mir_pretty`: for every type it prints, the pretty
-printer resolves a *visible* path, which walks `visible_parent_map` and
-`module_children` and caches the resulting per-crate maps for the rest of the
-process. On `hello` that alone is ~9 MB of peak RSS, for text rmc immediately
-parses and discards.
-
-A no-op codegen backend pinned it down. Forcing only `mir_keys` costs 0.1 MB
-over `-Zno-codegen`; forcing `optimized_mir` for every key costs ~15.6 MB; and
-`def_path_str` on every key costs ~8.8 MB on its own, which is the whole gap.
-Rendering to a `sink` costs the same as rendering to a `Vec`, so the text is
-not the cost — the path resolution is.
-
-The fix is to render under both path guards:
-
-```rust
-rustc_middle::ty::print::with_no_visible_paths!(
-    rustc_middle::ty::print::with_no_trimmed_paths!({
-        write_mir_pretty(tcx, &mut mir_bytes)
-    })
-);
-```
-
-`with_no_visible_paths!` is the one that pays: `with_no_trimmed_paths!` alone
-moves nothing (`trimmed_def_paths` is a separate query, ~8.1 MB, but the printer
-reaches it only after the visible-path walk). Neither guard changes the
-semantics rmc needs — the parser reads the canonical `core::panicking::panic`
-spelling just as well — and all 12 benchmark programs still produce identical
-output. The `DiagCtxt` "must produce a diagnostic" guard that rendering arms is
-still cleared with `reset_err_count()`; the guards do not disable it.
-
-With the fix, `cb` reads 1.07-1.13 on `hello`'s compile RSS and the whole
-benchmark is `ALL CB WINS` (mean RSS 1.111, wall 1.340, cpu 1.370, size 21.0,
-run_wall 1.079, run_cpu 1.088, run_rss 1.282).
-
-Superseded notes, kept for the record: `opt-level=1`/`0` and `mir-opt-level=1`/`2`
-shave 0.5-1 MB but make `light` uncompilable (`const LEN`/`wrapping_mul` leak
-through to rmc's parser); `-Z embed-metadata=no` is a no-op for `--emit=mir`;
-`-Zno-embed-metadata` (no `=`) is not a flag at all, and rustc exits before
-compiling, which is why a naive RSS probe reads a bogus ~33 MB;
-`MALLOC_ARENA_MAX=1`/`2` does not move the peak; and `-Zmir-opt-level=0`
-reaches 82.8 MB, still above LLVM.
-
-### The `cb` route reaches MIR the printed-MIR prototype never sees
-
-`with_no_visible_paths!` is not the only difference between the two routes.
-`-Zno-codegen` and `-Zcodegen-backend` stop the pipeline at different points,
-so the backend sees MIR that `--emit=mir` has already folded away, and it sees
-it spelled with *defining* paths. `tests/cb/` is the differential suite for the
-real backend path (it skips cleanly when nightly `rustc-dev` is absent); the
-cases below are each a shape the prototype never encounters:
-
-- **Defining vs visible paths.** `std::io::stdio::_print`,
-  `core::marker::PhantomData`, `core::intrinsics::compare_bytes`,
-  `core::mem::size_of`. The front end keys every one by path *tail*, so both
-  spellings land on the same symbol.
-- **Bare unit-struct constants.** `--emit=mir` folds `let _p = P;` away;
-  the backend leaves `_1 = const P;`. `parse_const` accepts a bare identifier
-  only when it starts uppercase — a lowercase one (`add`, the operand of
-  `add as fn(..)` in a cast the caller has not split off) must stay a place, or
-  the fn-pointer tests segfault on a lost operand.
-- **Split promoted chains.** `--emit=mir` folds a promoted referent to one
-  line; the backend can leave `_2 = size_of::<i32>(); _1 = Mul(move _2, const
-  4_usize)` (`unsupported constant main::promoted[0]`). `eval_promoted_referent`
-  is a small forward evaluator over the block that resolves earlier locals as
-  binary-op operands.
-- **`core::intrinsics::integer_min`/`integer_max`.** The backend inlines
-  `Ord::min` but not the intrinsic, so the call survives where the prototype
-  sees `<T as Ord>::min`. `parse_const` read the path as a unit-struct constant;
-  it now maps to the same `__rmc_{i,u}min/max` helper.
-- **`core::panicking::todo_default_msg`/`unreachable_default_msg`.** The
-  prototype folds `todo!()` to `panic(const "...")`; the backend leaves the
-  no-argument helper (an undefined symbol). Both abort, so both map to
-  `__rmc_panic`.
-- **`const ZeroSized: {closure@..}`.** A closure returned but never called in
-  place; `--emit=mir` folds it away, the backend spells it out. Treated as the
-  zero-sized constant it is, alongside `PhantomData`.
-
-With all of these the divergence scan over `tools/mir_survey.py`'s corpus is
-clean: every case the prototype compiles now compiles identically under the
-backend. The suite's runner compares "both succeed or both abort" rather than
-the exact status, because rmc's panic sink exits 101 where libstd raises
-`SIGABRT`.
-
-## Pushing
-
-A push needs a token with `contents: write`. The `GITHUB_TOKEN` in this
-environment is sometimes such a token and sometimes a read-only GitHub App
-installation token (`ghu_` prefix, empty `x-oauth-scopes`), which fetches fine
-but answers every write with `403 Resource not accessible by integration` on
-`receive-pack` and on the git-refs API alike. The repo permission list can
-still read `push: true` for the app's own account, so that is not a reliable
-signal. Check `git ls-remote` first, then try the push; if it 403s, ask the
-user for a write-capable `ghp_` token and push with it — do not scan
-conversation logs for one.
-
-The token must never be persisted in `.git/config` or a file, so `origin` is a
-plain token-free URL (`https://github.com/irhasar/rmc.git`). But the environment
-*does* install a global credential helper
-(`~/.openhands/git-credential-helper`, via
-`credential.https://github.com.helper`), and it answers with the same read-only
-token as `GITHUB_TOKEN`. A `-c credential.helper=<mine>` only *appends* to that
-list, so the global helper still runs first and the push still 403s — the token
-is never even consulted. Clear the list and install the one-shot helper on the
-URL-specific key:
-
-```
-RMC_PUSH_TOKEN=<token> git \
-  -c credential.helper= \
-  -c credential.https://github.com.helper= \
-  -c credential.https://github.com.helper='!f(){ echo username=x-access-token; echo "password=$RMC_PUSH_TOKEN"; };f' \
-  -c credential.https://github.com.username=x-access-token \
-  push origin <branch>
-```
-
-The two empty `-c` assignments reset the inherited helpers; the helper text
-names the *variable*, not its value, so the token never reaches `argv` or shell
-history (an inline `https://x-access-token:<token>@...` URL is visible in both
-`ps` and the history file, and an output filter cannot hide either copy). A read
-works the same way:
-
-```
-RMC_PUSH_TOKEN=<token> git \
-  -c credential.helper= \
-  -c credential.https://github.com.helper= \
-  -c credential.https://github.com.helper='!f(){ echo username=x-access-token; echo "password=$RMC_PUSH_TOKEN"; };f' \
-  -c credential.https://github.com.username=x-access-token \
-  fetch origin <branch>:refs/remotes/origin/<branch>
-```
-
-Do not `export` the token into the persistent shell either; pass it on the one
-command that needs it, so it is gone when that command exits.
-
-**Always push at the end of every session.** After committing, push the current
-branch so the remote branch is never behind the local one. Verify with
-`git rev-parse HEAD` vs `git rev-parse origin/<branch>` (they must match)
-before reporting done. Do not open a PR unless asked — the push is the expected
-end state.
-
-## PR branch stack
-
-The four PRs stack linearly: `rmc-1-core` -> `rmc-2-optimiser` ->
-`rmc-3-artifact-size` -> `rmc-4-patterns`, each targeting the one below it.
-Review fixes land on the branch the finding names, then propagate *upward*:
-merge the fixed lower branch into the branch above it. A fix that both a lower
-and an upper branch already carry independently (because it was carried upward
-before it landed below) will conflict on the duplicate hunks; resolve by keeping
-either side — the content is identical — and commit the merge so the upper
-branch descends from the corrected base and the PR reports `mergeable`.
-
-Do not reach for `-X ours` (or `-X theirs`) to skip that resolution. When the
-upper branch added a *method* the lower branch does not have, `-X ours` drops
-the lower branch's copy of a *different* method silently, and the next build
-fails with "duplicate definitions with name ..." once both are in the tree. A
-plain merge surfaces the overlapping hunks; resolve them by hand. After any
-such merge, rebuild and run `cargo test` plus `tests/run.py` before committing.
-
-## Definite-initialization analysis (`sema.rs`)
-
-The loop/branch init merge is where most rustc divergences have come from.
-Rules that took real work to pin down, each verified against rustc and now
-covered by a test in `compiler/tests/compile.rs`:
-
-- **A `while` condition runs at least once.** A binding it initializes is
-  initialized on the fall-through exit even if the body never runs, so
-  snapshot the state *after* checking the condition and require it on every
-  exit (the fall-through and each `break` that leaves the loop). Do not
-  restore the pre-condition snapshot.
-- **A `while` condition is re-evaluated whenever the body completes.** So a
-  write to a plain `let` in the condition is a second write (E0384). Seed the
-  condition's continuation (`loop_cont`) with the body's reachability before
-  checking the condition, or the back edge is invisible to the condition's
-  own block walk.
-- **A `for` range bound is evaluated before the loop's own label enters
-  scope.** A `break 'a` in a bound names the enclosing `'a` loop even when the
-  `for` reuses that label, so the bound scanners must *not* apply the
-  shadowing (`outward`) test; only the body is shadowed.
-- **An `if` whose two branches both diverge does not fall through.** Merging
-  such branches as "uninitialized" clobbers a binding that was live before the
-  `if`; keep the pre-`if` state instead.
-- **rustc counts unreachable breaks.** `'a: loop { loop { break; break 'a; } }`
-  is rejected (E0308) because the dead `break 'a` still makes the outer loop
-  `()`, not `!`. `block_has_break_at` must therefore scan *every* statement,
-  including ones after a `break`/`return` — a "stop at non-falling stmt" walk
-  is wrong here.
-- **Check ordering matters for the message.** rustc reports an unlabelled
-  `break`/`continue` in a `while` condition before it evaluates the condition,
-  so that check must precede `check_expr`.
-- **`&&`/`||` short-circuit, so track the two branch states, not one merge.**
-  The right operand runs on only one of the two paths, so a binding it
-  initializes is not initialized after the expression unless it was already.
-  A *global* merge (both operands required) is wrong: rustc is path-sensitive,
-  and it over-rejects valid `if a && b { .. }` (true path ran `b`) and
-  `if a || b { .. }` (true path may have skipped `b`). `check_expr` instead
-  records `cond_then_init`/`cond_else_init` — the state on entry to the true
-  and false branch — and `check_stmt`'s `if`/`while` restore them before
-  checking each branch. For a single `a && b`, the true state is the
-  right operand's outcome and the false state merges both ways it can be false;
-  `a || b` is the mirror. The two states are composed per operand, not read off
-  the scope — see the chained-guard rule below. Leave the scope with the
-  "either path" state for a value use (`let x = a && b`). Only a *top-level*
-  short circuit splits the branches; consume the slots on every condition so a
-  nested one cannot leak.
-- **A chained guard checks its right operand under the left-true state, so
-  compose outcomes rather than reading the scope.** `(a && { x = 7; true }) &&
-  x == 7` reaches the comparison only where the inner `&&` was true — exactly
-  where `x` was assigned — but the inner short circuit has already written the
-  merged "either path" state onto the scope, so checking the comparison there
-  wrongly rejects `x` (E0381). Each operand therefore has a *true* and a
-  *false* outcome state: `check_expr` leaves a logical operand's pair in the
-  `cond_*` slots, and any other operand's single exit state is both. The right
-  operand is checked under the left-true state for `&&` (left-false for `||`),
-  and the two outcomes are merged for the resulting true, false and
-  post-expression states. `outcome_states` consumes the slots for every
-  operand, so a nested short circuit cannot leak. The post-expression state is
-  still the conservative merge, so a value use cannot assume the right operand
-  ran.
-- **A `for` bound `continue` targets the enclosing loop even when the label is
-  reused.** The bounds are evaluated before the `for`'s own label enters scope,
-  so `stmt_contains_continue` must inspect `start`/`end` regardless of the
-  shadowing test and guard only the body. Missing this hid the back edge to a
-  `while` condition, letting a repeated immutable write pass (E0384).
-- **rustc's `arithmetic_overflow` lint is best-effort, and rmc is stricter.**
-  rmc folds a constant expression and rejects an overflow it can see. rustc's
-  lint can silently give up once a function body grows (a second statement in
-  `main` suppresses the diagnostic for an overflowing `*`), so a large generated
-  program where rustc accepts but rmc rejects is a known false-rejection, not a
-  bug in the fold. The differential fuzzers keep generated values small so this
-  never triggers under CI.
-
-Tests that claim to guard a runtime bug must *execute* the program and assert
-the result (`run_exit_code` / `run_output`); an `asm(...).contains("main:")`
-assertion passes even when the emitted code is wrong.
-
-## Array-literal lowering is re-check-safe
-
-`Expr::ArrayList` (`[a, b, c]`, list form) desugars in sema to a block
-`{ let mut \0list: [T; n]; \0list[0] = a; ...; \0list }`. The `let` is
-deliberately uninitialised (an aggregate element type has no default to spell),
-and the desugar returns without re-checking the block. A *method* receiver,
-though, is checked twice — once to resolve its type, once when the rewritten
-call is re-checked — so `unwrap()` on such a block walked it a second time. The
-second walk re-allocated the `\0list` slot and read it as a possibly-
-uninitialised binding. `[3, 1, 2].iter().max().unwrap()` is the shape that
-exposed this. The fix marks a `\0`-prefixed `let` initialised even with no
-initialiser, since its only reads are the writes that follow it.
-
-A related trap in the same area: the parser's chain-head recogniser
-(`try_array_list_lit`) must accept a *single-element* list `[5]` (no trailing
-comma) as well as `[5,]`. A `[T; n]` repeat still has a `;` after the first
-element, which is the shape to reject.
-
-## `for x in a.iter()` vs a chain
-
-The iterator-chain lowering demands a terminal method, so a bare `a.iter()`
-must be left as a `MethodCall` for the `for` desugar. The postfix method loop
-therefore only lowers a chain when a `.` follows the `.iter()`/`.into_iter()`
-call; otherwise `for x in a.iter()` is misread as an unterminated chain.
-
-## `Vec<T>` element stride reuses sema's layout
-
-The parser has to know a `Vec<T>` element's byte stride *before* sema runs (the
-stride scales the `v[i]` address, and the element type is needed to type the
-place). It must not re-derive struct/enum layout itself: an ad-hoc pass
-silently disagreed with sema on any struct holding a `u8`/`i8`, an array, a
-tuple, an enum, or a nested struct, mis-scaling the stride and corrupting the
-store. The rule is that the parser never computes a second layout.
-
-Instead, the pre-scan records the token index of every top-level `struct`/`enum`
-(`type_def_starts`), and `compute_struct_sizes` re-parses each definition with
-the real parser once aliases and constants are known, then feeds the resulting
-`StructDef`/`EnumDef` list (plus the tuple `StructDef`s in `tuple_defs`) to
-`sema::layout_sizes`, which is `resolve_layouts` under a thin wrapper. The
-parser and sema therefore agree by construction. A definition sema will reject
-(a recursive struct, an unknown field type) is skipped, leaving its size absent;
-the `Vec<T>` annotation falls back to the word width and sema reports the real
-error. The re-parse must save/restore `self.i` and is read-only apart from the
-`tuple_defs` it legitimately produces for tuple fields.
-
-Because `parse_program` injects the `Option`/`Result` prelude *after* this pass,
-a struct with a prelude-typed field (`struct W { value: Option<i64> }`) would name
-a type `layout_sizes` cannot see. That one failure rejects the whole batch, so
-*every* struct size is dropped and an unrelated `Vec<P>` silently reverts to a
-word stride. The size pass therefore injects the prelude's enum definitions too,
-under the same condition `parse_program` uses (the user owning no `Option`/
-`Result` struct or enum), so a bad field fails alone. `vecoption.rs` pins this.
-
-A `Vec<T>` element is stored by address only when `T` is a genuine aggregate
-(`is_aggregate`: struct, payload enum, array). A *unit* enum is an eight-byte
-scalar, so `Vec<Color>` must widen each element to a word on `push`/`repeat`/
-`vec![..]`; treating it as an address stored a pointer and lost the tag
-(`vecenumunit.rs`). A zero-sized aggregate element (`struct Z;`) is rejected:
-the runtime marks an aggregate by *negating* its width, but `-0` is `0`, so it
-would take the scalar path and write past the header.
-
-Two more element checks live in sema's call check, keyed on the width the
-constructors pass as the helper's last argument. `__rmc_vec_push`/
-`__rmc_vec_repeat` must see an element whose size equals the vector's stride
-(a `v.push(Q{..})` on a `Vec<P>` is otherwise accepted and copies the wrong byte
-count), and a scalar element is cast to a word so its type need not match the
-declared `I64`.
-
-A *size* check alone cannot tell a valid element from a different aggregate of
-the same size: `struct P { x: i64, y: i64 }` and `struct Q { x: i64, y: i64 }`
-are both 16 bytes, so `v.push(Q { .. })` on a `Vec<P>` would store `Q` and a
-later `v[i].y` would read `Q`'s second word as `P::y`. The value argument is
-type-erased to `I64` (a scalar word, or an aggregate's address), so the element
-type is not otherwise recoverable at the call. `Expr::Call` therefore carries an
-`elem_ty: Option<Type>` — the element type the destination `Vec<T>` was declared
-with, recorded by the parser for the `__rmc_vec_push`/`__rmc_vec_repeat`/
-`__rmc_veclist` shapes and `None` for every other call. sema compares it against
-the argument type: an aggregate element must equal it (a struct, a payload enum,
-an array, a tuple), a scalar element is rejected when the vector's element is an
-aggregate and vice versa. `rustc` agrees (`E0308`). The check is skipped when
-`elem_ty` is `None` (an unannotated `Vec` whose element type was not inferred),
-leaving the width check as the only guard.
-
-## Capacity overflow traps at run time
-
-A `Vec`/`String` constructor asked for a capacity that does not fit must trap
-(exit 101, message `rmc: capacity overflow`, mirroring a panic) rather than
-corrupt memory. The capacity often comes from a parameter, so sema cannot reject
-it at compile time; a negative value read as `usize` is enormous, and the byte
-size `cap * width` then wraps to a small positive number, so the store is
-allocated too small and the header — or the element write — lands past it (a
-`String`'s length word was misread, and a `Vec` faulted). `__rmc_vec_new`,
-`__rmc_vec_repeat` and `__rmc_str_new` each test their byte size before
-allocating: `test reg, reg; js __rmc_cap_overflow` for a negative size, plus
-`jo __rmc_cap_overflow` after the `imul` that scales by the element width (the
-repeat can overflow for a huge positive count too). The `test` is not optional:
-`imul` leaves `SF` undefined, so a `js` right after it is width-dependent and
-misses the negative case. `__rmc_cap_overflow` lives in its own piece.
-
-## Every runtime piece names its own section
-
-A `Piece`'s assembly is concatenated with the other kept pieces into one
-translation unit, so a function piece must emit its own `.text` (and a data
-piece its own `.data`/`.rodata`/`.bss`). A piece that omits it inherits whatever
-section the previous piece left current — after a `.rodata`-ending piece (for
-example `__rmc_cap_overflow`'s message), a following `__rmc_str_new` assembled
-into `.rodata` and faulted at run time under `as`+`ld` because the section is not
-executable (the in-process encoder did not, masking it). The
-`every_piece_names_its_own_section` test in `runtime.rs` pins the invariant.
+`fullbench.sh` passes no `--sysroot`, which is correct — each `rustc-rakit`
+must use its own. Do not add one; pointing `--sysroot` at
+`dist/lib/rustlib/<triple>` produces `E0463: can't find crate for std`.
+Rebuild with `./y.sh build --sysroot rakit` in both trees before measuring.
+
+## Session 2026-11-17 — divisibility folding pass
+
+**New pass: `rakit/src/div_test.rs`** rewrites `x % C == 0` / `!= 0` /
+`brif` on a remainder into a multiply-compare, dropping the `urem` entirely.
+Commit `8aa1dfb` in `rmc_clone` (subtree layout, branch
+`replace-main-with-rakit-experiments` = PR #10's head).
+
+Identity for odd `C`: `x % C == 0 <=> (x * C^-1 mod 2^64) <= (2^64-1)/C`.
+Even `C` peels its power of two as a mask first. `srem` is left alone
+(truncating division rounds toward zero, so negative `x` breaks the identity).
+
+Two traps worth remembering:
+
+1. **Two use-site shapes need different rewrites.** `brif rem, ..` uses the
+   remainder *as* the condition — swap `blocks` targets and feed the new test
+   in. `icmp eq rem, 0` produces a *separate value* that other code consumes —
+   redirect that result with `detach_inst_results` + `change_to_alias`, never
+   the comparison's operands. Getting this wrong is silent and type-checks:
+   the icmp ends up testing its own boolean result, so `filter(|x| x % 3 == 0)`
+   keeps the complement and `t_iter` prints exactly 2x the right number.
+   Eight benchmarks all passed while this bug was live — `t_iter` is the
+   regression test that catches it.
+2. **`RAKIT_*` tunables are read at compile time, not run time.**
+   `RAKIT_NO_DIVTEST=1 ./binary` disables nothing; it must prefix the
+   `rustc-rakit` invocation.
+
+Result: `p1_arith` 104.8 -> 96.7 ms (LLVM 82.2), `mulq` gone from the hot loop,
+isolated kernel 108.7 -> 55.9 ms vs LLVM's 61.3 ms (faster than LLVM because
+`cmovbe` beats `setb`+`xor`). Remaining `p1_arith` gap is the branchy saturating
+`f64->u64` conversion in `rakit-codegen`, not the pass.
+
+Also gated `store_forward`'s timing counters behind `RAKIT_SF_TIME`; they
+called `Instant::now()` twice per block unconditionally.
+
+**Loop folding can look impossible.** `p5_inline` (300M iterations) runs in
+6.8 ms = 48 G iter/s. Not a miscompile: unroll-128 plus strength reduction
+collapses it to a closed form, and the value matches Python. Passing `n` as a
+runtime argument restores linear scaling (364 ms for 300M), which proves the
+folding is compile-time.
+
+**PUSHED.** The injected `GITHUB_TOKEN` is read-only for this repo (403 on both
+`git push` and `PATCH /pulls/10`), but a user-supplied `repo`-scoped classic PAT
+worked. Recipe that keeps the token off disk and out of `.git/config` — write it
+to a 600 file, read it in the helper, delete it after:
+
+    printf '%s' "$PAT" > /tmp/.ghpat && chmod 600 /tmp/.ghpat
+    git -c credential.helper= \
+        -c credential.helper='!f(){ echo username=<user>; echo "password=$(cat /tmp/.ghpat)"; }; f' \
+        push origin replace-main-with-rakit-experiments
+    rm -f /tmp/.ghpat
+
+Remote head is now `5e7730e`; PR #10 is `mergeable=True`, `mergeable_state=clean`,
+77 commits, 889 files, and its description was updated to the final numbers.
+
+## Negative result: branchless saturating `f64->u64` is not worth it
+
+The "remaining `p1_arith` gap is the branchy saturating conversion" note above
+was tested and is wrong. A branchless sequence was implemented in
+`rakit-codegen`'s `Inst::CvtFloatToUintSeq` emit arm (two `cvttsd2si`, one
+`subsd`, `sar`/`and`/`or` for the `+2^63`, `cmovs` for `>=2^64`, `ucomisd`+
+`cmovb` for `<0`/NaN), verified bit-exact against LLVM on 81188 inputs, and
+benchmarked A/B against the identical tree with the path disabled:
+
+* `p1_arith` 98 -> 109 ms (**+10%, a regression**), `cast3` +3%, everything else
+  within noise, `pure` conversion loop a wash.
+* LLVM's loop wins because it keeps both float constants in registers outside
+  the loop. In `rakit-codegen` the constants are materialized in `emit`,
+  which runs after LICM, so they are reloaded every iteration and the extra
+  `movabs`+`movq` outweigh the saved branch. The branchy version is also
+  predicted almost perfectly on the monotonic values real code produces.
+
+Lesson: a "predictable branch" in a hot loop is cheaper than six extra
+instructions. Before attacking one, check that the constants the replacement
+needs are already loop-invariant at the level where you are generating code.
+Do not re-attempt this without first making the constants RAKIT values so LICM
+can hoist them; that is the prerequisite, not the sequence itself.
+
+## Three more negative results, and the real shape of the remaining gap
+
+Chased the two worst runtime gaps (p8_minmax 2.2x, p2_mem 3.2x vs LLVM). All
+three candidate fixes measured, all rejected:
+
+1. **Block-order / RPO successor swap** (`dominator_tree.rs`, `ForwardGraph::
+   successors`). Hypothesis: RPO emits `header, exit, body`, so each iteration
+   takes two branches (`jae` out + `jmp` back). Swapping the two-way successor
+   order compiles and produces *different bytes*, but the loop shape is
+   unchanged: Rakit lowers `brif` + back edge to test-at-top plus an
+   unconditional back jump regardless of which arm is laid out first, and the
+   layout code picks fall-through by its own rules. Runtime unchanged on all 8
+   programs (only p4_simd moved 96->87 ms, which did not reproduce as a
+   structural change; the jump count was identical). Reverted.
+
+2. **Inliner budget/caps** (`RAKIT_INLINE_GROWTH`, `INLINE_MAX`,
+   `INLINE_LEAF_MAX`, `INLINE_USES`). Instrumented `CguInliner::inline` and
+   found 206 rejects and 170 not-in-map on the p2 workload; the dominant reason
+   is the *growth budget*, not the size cap (`REJECT size=116 cap=128
+   budget=66`). But raising the budget 150 -> 1000 with every cap lifted only
+   moves p2big 527 -> ~490 ms (~5%) and leaves 37 `call`s inside
+   `partition_lomuto_branchless_cyclic`. The closures that matter are reached
+   through the sort machinery's generic layers, so the budget is not the binding
+   constraint at the sites that are hot. Not worth the compile-time cost
+   (146 -> 165 ms). Reverted.
+
+3. **`RAKIT_UNROLL_CLONE`** on p8: 38 -> 46 ms. Actively worse.
+
+### Where the gap actually comes from
+
+`p2_mem` is dominated by `core::slice::sort` and `hashbrown`, not by the loop
+bodies the passes above touch. Profiling (tools/sampler.c + sym.py) shows LLVM
+folding `find_inner`, `Hasher::write`, `swap_if_less` into their callers while
+rakit keeps them out of line: the LLVM binary has 601 local symbols on the
+same program, the rakit one has 1680. In rakit's `partition_lomuto_
+branchless_cyclic` the per-element closure is a real `call`, and the iterator
+state is spilled to `0x30(%rsp)` / `0x38(%rsp)` and reloaded each iteration.
+
+Closing that needs cross-crate inlining (the bodies are not in the same CGU, and
+`-C codegen-units=1` does not change it: 533 vs 531 ms, same 41 calls), or a
+MIR-level inliner in rakit itself. Neither is a `rakit-codegen` change, so
+no amount of ISA work fixes p2_mem.
+
+Lesson: before touching codegen, profile. Both gaps that looked like codegen
+(block layout, saturation branch) were in fact missing inlining and missing loop
+invariance, i.e. MIR/RAKIT-level pass gaps.
+
+## Session 2026-11-17 (later) — the frame pointer trap, and what p3 really measures
+
+Toolchain was reinstalled from scratch (rustup, `nightly-2026-11-17`, components
+`rust-src,rustc-dev,llvm-tools,rustfmt`). The prebuilt `dist/` still worked
+against the fresh toolchain, so all measurements below were done before any
+rebuild.
+
+### `opt_level` is inert on x86_64
+
+`RAKIT_OPT_LEVEL=speed` produces a **byte-identical** binary to the default
+`speed_and_size` on all nine programs (same sizes to the byte, run time within
+noise). So the `speed_and_size`-vs-`speed` distinction that the comment in
+`build_isa` worries about does not actually reach the x64 backend. Do not spend
+time on it again.
+
+### `-Z min-function-alignment=16` is a regression
+
+Totals over p1/p2/p3/p7/p8: 340.2 ms at the default vs 353.3 ms at 16-byte
+alignment, and the binaries get slightly larger (20429784 → 20430776). Padding
+costs I-cache and buys nothing here. Rejected.
+
+### `p3_calls` is a tail-call problem, not an inlining problem
+
+Profiling p3 (60 Hz sampler) shows `fib` at **84% of samples** in the rakit
+build. Time spent inside `fib` itself is 80 ms vs 28 ms for LLVM — 2.85x on a
+function with no callees to inline into it. The disassembly explains it:
+
+- LLVM rewrites `fib` into a **loop** with a single recursive call per
+  iteration (tail-recursion elimination with an accumulator), 13 instructions
+  of body.
+- rakit emits the naive shape: **two** recursive calls per activation, plus
+  `push %rbp; mov %rsp,%rbp; sub $0x10,%rsp`, two spill/reload pairs of
+  `r12`/`r13` around the calls, and the matching epilogue.
+
+The single biggest lever here is turning the second recursive call into a loop
+iteration. That is a MIR-level transformation (LLVM does it in the middle end),
+not something the Rakit backend can do at the RAKIT level, and it is
+therefore out of scope for a backend-only patch.
+
+### The frame pointer is a trap: Rakit x64 ignores `preserve_frame_pointers`
+
+This cost the most time this session, so record it precisely.
+
+`rakit` computes `preserve_frame_pointer` from
+`sess.target.options.frame_pointer.ratchet(sess.opts.cg.force_frame_pointers)`.
+For the default target spec `frame-pointer` is **None**, i.e. `MayOmit`, so
+rakit sets `preserve_frame_pointers=false`. Nevertheless every function gets
+`push %rbp; mov %rsp,%rbp`, including leaf functions.
+
+Cause: in `rakit-codegen-0.137.0`,
+`Callee::gen_prologue` (`machinst/abi.rs:2288`) calls
+`M::gen_prologue_frame_setup` **unconditionally**, and the x64 implementation
+(`isa/x64/abi.rs:538`) emits `push %rbp; mov %rsp,%rbp` with no check of the
+flag at all. Likewise `compute_frame_layout` hardcodes
+`setup_area_size = 16; // RBP, return address`. The flag is consulted only for
+unwind info and for the aarch64/riscv/s390x backends. So on x64 the flag is
+dead code.
+
+Two patches were tried and **both must be reverted if re-attempted**:
+
+1. Guard the prologue on the flag only. Result: `rbp` disappears from the
+   prologue but the epilogue still does `mov %rbp,%rsp; pop %rbp`, so the
+   stack is unbalanced → **segfault** on p2_mem (exit 139).
+2. Guard prologue *and* epilogue and shrink `setup_area_size` 16 → 8.
+   Result: prologue/epilogue look right and small programs print correct
+   output, but p2_mem aborts with
+   `memory allocation of 435733609449752 bytes failed` → a **miscompile**.
+   `setup_area_size` is not only prologue bookkeeping: it is the
+   caller-SP-relative offset used by `gen_clobber_save`/`gen_clobber_restore`
+   and by the unwinder. Changing it without auditing those paths silently
+   corrupts callee-save slots.
+
+Conclusion: making omit-frame-pointer work on x64 means auditing every use of
+`setup_area_size` and the `offset_upward_to_caller_sp` computations, not
+flipping a boolean. Both attempts are reverted; the tree is clean. If this is
+picked up again, the honest first step is a Rakit-side test that checks
+`rsp` is balanced across a function with callee-saves and a `return_call`.
+
+Important sanity check learned here: after any ABI-level patch, verify output
+of **p2_mem** specifically. It is the program that surfaced both failures,
+while p1/p3/p4 still printed plausible-looking numbers.
+
+### Correctness baseline (clean build, 2026-11-17)
+
+All nine benchmark programs produce byte-identical stdout for
+LLVM (`L`), cg_clif upstream (`U`) and modified Rakit (`M`). Any mismatch is
+a bug in a patch, not a pre-existing backend defect — the clean tree is sound.
+
+### p2_mem: the remaining 3.3x
+
+Run time 54.8 ms (M) vs 16.8 ms (L). Samples are spread thin: 31%
+`partition_lomuto_branchless_cyclic`, 14% `hashbrown::find_inner`, 10%
+`HashMap::raw_entry`, 9% SipHash `write`, 8% `swap_if_less`. Unlike p3 there is
+no single hot function to fix; the cost is diffuse across hash and sort code,
+which is consistent with the already-documented conclusion that the remaining
+gap is broad code-quality (no loop rotation, weak regalloc on the partition
+loop, no autovectorizer) rather than one missing optimization.
+
+### `regalloc_algorithm=single_pass` is not a compile-time win
+
+Regalloc is a plausible place to look for compile-time savings, so both
+algorithms were measured on all nine programs (correctness verified on p2_mem
+first; both produce identical output).
+
+| metric (sum of 9) | backtracking | single_pass |
+| --- | --- | --- |
+| compile wall | 843.8 ms | 839.6 ms |
+| compile cpu | 1088.0 ms | 1089.6 ms |
+| compile peak RSS | 1009 MB | 1006 MB |
+| run wall | 478.9 ms | 629.5 ms |
+| artifact size | 36803872 | 36853216 |
+
+Compile time is unchanged (the difference is inside run-to-run noise), because
+for these small single-crate programs regalloc is not the dominant cost — the
+frontend and the rest of the pipeline are. Runtime regresses by 31% and the
+binaries get larger. Rejected; the experimental `RAKIT_REGALLOC` tunable was
+removed again rather than left in as dead code.
+
+This also closes out the "compile-time" axis of the investigation: the knobs
+that are actually available (`opt_level`, `regalloc_algorithm`, CGU count,
+inliner budget) all move compile time by at most a few percent. Compile time is
+dominated by work shared with LLVM (parsing, type checking, MIR), which is why
+rakit's advantage there is structural rather than tunable.
+
+## Next step (NOT done): LCG lane transform for p8 — exact math
+
+Goal: p8 (`a = a*C + (i|1)`, min) 29 ms → ~20 ms, matching LLVM's 4-lane loop.
+Current `apply_partial` builds each `pre[k]` from the header → O(factor²)
+`imul`s (factor 3 = 6 imuls / 3 iters = 2/iter). LLVM does ~1 imul/iter.
+
+**Why LLVM wins: even factor ⇒ fixed parity per lane.** With `f` lanes, lane `L`
+visits `i = L, L+f, L+2f, …`. For **even** `f`, `i` has the *same parity* as `L`,
+so `(i|1) = i + (L even ? 1 : 0)` is **linear in the lane step** `k`. Hence each
+lane's forcing term is affine in `k` and advances by a **constant add** (no
+`imul`). Lane recurrence:
+  `a_L(k+1) = C^f · a_L(k) + F_L(k)`,   `F_L(k+1) = F_L(k) + slope`,
+  `slope = f · (C^{f-1} + C^{f-2} + … + C + 1)  (mod 2^64)`, same for all lanes;
+  `F_L(0) = Σ_{j=0}^{f-1} C^{f-1-j} · ((L+j)|1)`  — a **compile-time constant**;
+  `a_L(0) = C^L · a_0 + Σ_{j<L} C^{L-1-j}·(j|1)` — one `imul` (C^L·a_0) + const.
+Loop body = f × (1 imul + 1 add + 1 forcing add + 1 min) per f iters ⇒ 1 imul/iter.
+The min over all lane values covers every inner iteration (lanes partition `i`).
+
+**Why factor 3 can't use it:** odd `f` ⇒ `i`'s parity alternates per lane ⇒
+`(i|1)` is not linear. So the lane transform must use an **even** factor (4).
+
+**Hard part = the tail/epilogue.** The lane loop's carried state is f separate
+accs, not "the current acc". When `BOUND % f != 0`, the remainder must fall back
+to a scalar loop, and the scalar loop needs the true `a` at iteration
+`f·⌊BOUND/f⌋` — i.e. one specific lane's last value. Options: (a) run the scalar
+tail from that lane's value (pick lane = `(f·n_last) mod f`); (b) keep the
+existing guard+narrow single-step but only enter the lane path when
+`iv + f <= BOUND`, and after the lane body recompute the scalar acc from the
+lane that is `f-1` steps ahead. Getting this wrong is a silent miscompile, so it
+needs the full differential suite (2^32 f32-style sweeps are overkill here; a
+range of BOUND mod f values × small BOUNDs, compared byte-for-byte to LLVM, is
+the minimum).
+
+**Scope:** only fires for a single LCG state + a single associative reduction
+(min/max/add) with atom `iv | const` and even factor. Everything else keeps the
+current (correct) clone path. This is a *new* emission path in `apply_partial`,
+~200–300 lines, higher risk than the guard/factor tweaks. Deferred because the
+sandbox reset twice this session; land it only with incremental commits + the
+full `./y.sh test` green gate.

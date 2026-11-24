@@ -1,0 +1,29 @@
+[package]
+name = "rakit-native"
+version = "0.137.0"
+authors = ["The Rakit Project Developers"]
+description = "Support for targeting the host with Rakit"
+documentation = "https://docs.rs/rakit-native"
+repository = "https://github.com/bytecodealliance/wasmtime"
+categories = ["no-std"]
+license = "Apache-2.0 WITH LLVM-exception"
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rakit-codegen = { workspace = true }
+target-lexicon = { workspace = true }
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(all(target_arch = "aarch64", target_os = "macos"))'.dependencies]
+mach2 = { workspace = true }
+
+[features]
+default = ["std"]
+std = ["rakit-codegen/std"]
+core = ["rakit-codegen/core"]

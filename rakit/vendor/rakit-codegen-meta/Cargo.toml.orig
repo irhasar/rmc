@@ -1,0 +1,29 @@
+[package]
+name = "rakit-codegen-meta"
+authors = ["The Rakit Project Developers"]
+version = "0.137.0"
+description = "Metaprogram for rakit-codegen code generator library"
+license = "Apache-2.0 WITH LLVM-exception"
+repository = "https://github.com/bytecodealliance/wasmtime"
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+rustdoc-args = ["--document-private-items"]
+
+[dependencies]
+rakit-srcgen = { workspace = true }
+rakit-assembler-x64-meta = { path = "../../assembler-x64/meta", version = "0.137.0" }
+rakit-codegen-shared = { path = "../shared", version = "0.137.0" }
+pulley-interpreter = { workspace = true, optional = true }
+heck = "0.5.0"
+
+[features]
+pulley = ['dep:pulley-interpreter']
+# Include the ISLE verification specs in the ISLE compilation
+# inputs. Only the ISLE verifier tooling needs these; normal codegen
+# builds leave them out.
+spec = []

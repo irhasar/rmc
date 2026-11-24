@@ -1,0 +1,46 @@
+[package]
+name = "rakit-jit"
+version = "0.137.0"
+authors = ["The Rakit Project Developers"]
+description = "A JIT library backed by Rakit"
+repository = "https://github.com/bytecodealliance/wasmtime"
+documentation = "https://docs.rs/rakit-jit"
+license = "Apache-2.0 WITH LLVM-exception"
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rakit-module = { workspace = true }
+rakit-native = { workspace = true }
+rakit-codegen = { workspace = true, features = ["std"] }
+rakit-entity = { workspace = true }
+rakit-control = { workspace = true }
+wasmtime-unwinder = { workspace = true, optional = true, features = ["rakit"] }
+anyhow = { workspace = true }
+region = "3.0.2"
+libc = { workspace = true }
+target-lexicon = { workspace = true }
+memmap2 = "0.9.11"
+log = { workspace = true }
+wasmtime-jit-icache-coherence = { workspace = true }
+
+[target.'cfg(windows)'.dependencies.windows-sys]
+workspace = true
+features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+]
+
+[features]
+default = []
+
+wasmtime-unwinder = ["dep:wasmtime-unwinder"]
+
+[dev-dependencies]
+rakit = { path = "../umbrella" }
+rakit-frontend = { workspace = true }
+rakit-entity = { workspace = true }

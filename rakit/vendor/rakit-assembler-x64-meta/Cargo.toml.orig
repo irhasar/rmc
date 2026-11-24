@@ -1,0 +1,13 @@
+[package]
+name = "rakit-assembler-x64-meta"
+description = "Generate a Rakit-specific assembler for x64 instructions"
+version = "0.137.0"
+license = "Apache-2.0 WITH LLVM-exception"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rakit-srcgen = { workspace = true }
+
+[lints]
+workspace = true
