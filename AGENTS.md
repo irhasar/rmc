@@ -1,3 +1,68 @@
+## Session (2026-11-24, branch `rakit-exp4`) — runtime probe: p1 pass-insensitive, x64 omit-FP blocker map
+
+- **Branch:** from `replace-main-with-cgclif-experiments` after PR #14 merged
+  (`7ffa4b6`).
+- **`p1_arith` is pass-insensitive** (run wall/cpu ms, same build, knob only):
+  default 103/101, `RAKIT_NO_IFCONV` 101/101, `RAKIT_NO_DIVTEST` 105/105,
+  `RAKIT_NO_STORE_FWD` 103/103, `RAKIT_NO_LANES` 102/101, `RAKIT_NO_SINCOS`
+  101/101. The gap to LLVM (82 ms) is **pure codegen**: Rakit keeps the integer
+  and float constants as memory operands (`imul 0xf2(%rip)`, `cmp 0xe6(%rip)`,
+  `mulsd 0xd7(%rip)`, `movabs $0x43e0…` reloaded each iteration) while LLVM
+  hoists them to registers (`movabs`/`movsd` once before the loop); plus the
+  saturating `f as u64` lowers to a **branchy** multi-`jmp` sequence vs LLVM's
+  two-`cvttsd2si` branchless form. Both are ISel/regalloc, not a pass — matches
+  the earlier negative result (branchless regressed because the constants are
+  materialised in `emit`, after LICM).
+- **`p2_mem` cross-block budget is not the limiter:** `RAKIT_SF_CBE_MAX=1e9`
+  gives the same 49/48 ms as the default (16384); forwarding the big functions
+  cross-block does not help. `cross_block_entry` is already an RPO single sweep
+  with early-meet bail.
+- **No RSS axis to win:** run peak RSS is a tie (M ≈ L ≈ U, e.g. p2 11.0/10.8/
+  10.8 MB); compile RSS is M ≈ U, slightly above L.
+- **x64 omit-frame-pointer blocker map (for a future backend session — NOT
+  attempted; each item must be fixed together or it miscompiles):**
+  - `vendor/rakit-codegen/src/isa/x64/abi.rs:955` —
+    `let setup_area_size = 16; // RBP, return address` is **hardcoded**; with no
+    frame pointer it must be 8 (return address only).
+  - `isa/x64/abi.rs:538-568` `gen_prologue_frame_setup` unconditionally emits
+    `push %rbp; mov %rsp,%rbp` (+ an `Unwind::PushFrameRegs`).
+  - `isa/x64/abi.rs:571-588` `gen_epilogue_frame_restore` unconditionally emits
+    `mov %rbp,%rsp; pop %rbp`.
+  - `isa/x64/abi.rs:673` `gen_clobber_save` does `rbp`-relative surgery when a
+    `return_call` needs a larger incoming-arg area — assumes rbp is set up.
+  - `isa/x64/inst/emit.rs:1893` `emit_return_call_common_sequence` **asserts**
+    `preserve_frame_pointers()` ("the current implementation relies on them"),
+    so `return_call` needs FP; `return_call` arrives from unstable tail calls
+    only, so the test suite may not hit it (a latent ICE if default-on).
+  - `verifier/mod.rs:660` rejects `get_frame_pointer`/`get_return_address`
+    without FP (used by backtrace machinery) — a fatal verifier error if such
+    CLIF is produced.
+  - Stack slots are **`StackAMode::SPOffset` (rsp-relative)** — good: omitting
+    FP does not break slot addressing. `rbp` is callee-save
+    (`is_callee_save_systemv`) and its *only* save today is the prologue push,
+    so omit-FP must guarantee regalloc never allocates `rbp` (or save it via
+    `gen_clobber_save`).
+  - s390x and riscv64 already gate `setup_area_size`/prologue on
+    `flags.preserve_frame_pointers()` (e.g. `isa/s390x/abi.rs:761,789,973`,
+    `isa/riscv64/abi.rs:664`) — x64 simply never implemented it. This is the
+    mirror to follow, but the `return_call`/`get_frame_pointer`/`rbp`-save
+    interplay makes it a dedicated, correctness-critical backend task.
+- **Landed (safe, byte-identical):** the unroller's remaining per-function
+  environment reads (`RAKIT_UNROLL_DEBUG`, `RAKIT_LANE_DEBUG`,
+  `RAKIT_NO_NARROW_FCVT`, `RAKIT_NO_LANES`) now go through cached
+  `OnceLock` tunables, completing the "cache every knob in `tunables.rs`"
+  discipline and removing global `std::env` map locks from the hottest
+  per-function pass. **Neutral** on measurement (p2 compile 164/228 vs 172/236
+  within noise; synthetic 800-function file 157/210 vs 157/213); landed for
+  consistency, not speed.
+- **Conclusion:** every remaining runtime gap (p1 codegen constants + branchy
+  cast, p2 hash/sort codegen, p3 frame-pointer/call overhead, p4 vectorizer,
+  p8 regalloc parallel-copy cycle, p9 libcall GOT reload) needs vendored
+  backend work. Safe pass-level micro-optimisation is exhausted.
+- **Verification:** `./y.sh build` exit 0; all 15 bench binaries md5-identical
+  to the PR #14 build; `./y.sh test --sysroot rakit` → 65 suites / 25,368
+  passed / 0 failed.
+
 ## Session (2026-11-24, branch `rakit-exp3`) — instrumentation + per-function guards (marginal), runtime walls re-confirmed
 
 - **Branch:** from `replace-main-with-cgclif-experiments` after PR #13 merged

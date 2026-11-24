@@ -134,6 +134,30 @@ pub fn partial_factor() -> u64 {
     })
 }
 
+/// Per-function IR dump in the unroller (`RAKIT_UNROLL_DEBUG`).
+pub fn unroll_debug() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| flag("RAKIT_UNROLL_DEBUG"))
+}
+
+/// Lane-transform debug output (`RAKIT_LANE_DEBUG`).
+pub fn lane_debug() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| flag("RAKIT_LANE_DEBUG"))
+}
+
+/// Disable the u64->f64 narrowing rewrite (`RAKIT_NO_NARROW_FCVT`).
+pub fn no_narrow_fcvt() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| flag("RAKIT_NO_NARROW_FCVT"))
+}
+
+/// Whether the LCG lane transform runs (`RAKIT_NO_LANES` off).
+pub fn lanes_enabled() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| !flag("RAKIT_NO_LANES"))
+}
+
 /// Whether the unroller may model a bitwise op (`i | k`) as a recomputable atom
 /// (`RAKIT_NO_ATOM` disables it for bisecting).
 pub fn atom_enabled() -> bool {
