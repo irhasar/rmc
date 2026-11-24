@@ -195,7 +195,10 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
       contain `pmuludq`, proving *that* loop vectorized; `t_vectorize_guard`
       (only an n=3 sub-vector loop) must contain `pmuludq`, proving the SIMD
       guard/body is **generated** while it runs **zero** vector iterations (the
-      n=0 case is the unmatched scalar path, so it cannot cover the guard).
+      n=0 case is the unmatched scalar path, so it cannot cover the guard). The
+      guard fixture pads buffers to 4 and seeds `c[3]` with a sentinel, asserting
+      `tail4=true`, so a buggy four-lane store for n=3 is caught (checking only
+      the three written elements would miss it).
       Output equality alone is insufficient: with `RAKIT_NO_VECTORIZE=1` the
       output still matches but `pmuludq` is absent. Removed the committed
       `rustc-ice-*.txt` dumps and gitignored them.

@@ -66,7 +66,7 @@ inplace 12776226417588255163
 tail 6121779849389533154
 u8 2907005038580616411'
 check t_vectorize_unit 'unit 12776226417588255163'
-check t_vectorize_guard 'guard 17715399688492003866'
+check t_vectorize_guard 'guard 17715399688492003866 tail4=true'
 
 # Output equality alone cannot prove the vectorizer ran. Each fixture below
 # contains exactly one xor+imul loop, so a packed multiply (SSE2 lowering of
