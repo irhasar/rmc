@@ -94,17 +94,17 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
   `pmulld` when SSE4.1, else a `pmuludq` sequence (`lower.isle:1166-1182`).
 - **LLVM vectorizes it** (binary: 14 `pmuludq`, 15 `paddd`, 54 `pxor`, 98
   `pshufd`); Rakit does not (0 `pmuludq`, 8 `pxor`).
-  **Correction:** the earlier "L3 isolation M 66.7 vs L 28.3" **conflated the
-  array-construction loops** with the kernel. Proper isolation (repeat the kernel
-  20x on fixed data, 80M iters): **L 49.9 ms vs M 110.3 ms (~2.2x)**, and L is
-  **consistent with a memory-bandwidth limit (circumstantial, not proven):** a
-  trivial tri-stream `c=a+b` (`paddd`) with identical ~960 MB *nominal* traffic
-  and negligible compute runs **L 49.8 ms**, matching L3's **L 49.9 ms**. But this
-  is two *process times* coinciding, **not** a measured memory-traffic/bandwidth
-  (no PMU counters here); `nominal bytes / process time` (~19 GB/s) is an
-  estimate, and the runner times allocation+init along with the kernel. Treat
-  "memory-bound" as strong circumstantial evidence, not proof. A 4-wide vectorized
-  M can reach ~L; the vectorizer is justified by the *kernel*.
+  **Measurement (current `bench/l3/` fixtures; position-dependent inputs +
+  hash-all; full process incl. init+hash; this machine):** `l3_iso` **L 54.0 ms
+  vs M 138.8 ms (~2.57x)**; `l3_bw` (trivial tri-stream, identical ~960 MB
+  *nominal* traffic) **L 56.0 ms vs M 141.4 ms**. L's trivial kernel (56.0) ≈ L's
+  L3 (54.0), **consistent with a memory-bandwidth limit** — but that is two
+  *process times* coinciding, **not** a measured traffic/bandwidth (no PMU
+  counters; `nominal bytes / time` is an estimate; the runner also times
+  init+hash). The older "L3 isolation 66.7 vs 28.3" (conflated with init) and the
+  later "49.9 vs 110.3" (last-element fixture) are **historical** and superseded
+  by the numbers above. A 4-wide vectorized M can approach ~L; the vectorizer is
+  justified by the *kernel*.
 - **Blocker is CFG shape:** p4 L3 is **multi-block** — `block29` (bounds check
   `brif`) → `block30` (compute+store) → back-edge. Address `base + i*4`, induction
   `i`, `i'=i+1`.
