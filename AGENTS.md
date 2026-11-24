@@ -1,33 +1,50 @@
-## Session (2026-11-24, branch `rakit-exp6`) — M1 redefined: the gap is alias info, not a CSE pass
+## Session (2026-11-24, branch `rakit-exp6`) — M1 premise re-checked: reload cause is UNVERIFIED (diagnose first)
 
-Investigated the next documented step (M1: cross-block load CSE) before
-implementing it, and it is **the wrong lever**:
+A review corrected several overclaims about *why* residual loads survive.
+Corrected facts, recorded so the next step is a **diagnosis**, not a big
+alias-region build:
 
-- `enable_alias_analysis = true` (`settings.rs:501`) — the egraph's
-  **alias-analysis path** (`OptResult::AliasedLoad`, `egraph/mod.rs:549-565`) is
-  ON and performs **global** cross-block load elimination wherever it can prove
-  safety. That is why the block-local CSE pass in `rakit-exp5` produced
-  byte-identical binaries: same-address loads are already eliminated (via the
-  flags-gated GVN for `readonly` loads, or via this alias analysis).
-- The residual cross-block reloads survive because the alias analysis has **no
-  alias-region information**: `alias_region` / `with_alias_region` are **never
-  used** anywhere in `src/` or `rakit-opt/src/`, and ordinary loads are only
-  `notrap` (`value_and_place.rs:139/161/604`) — no `readonly`/`can_move`, no
-  region. So a new CSE pass would be **redundant** where the analysis already
-  proves safety, and **unsound** where it cannot (the surviving reloads are
-  exactly the ones a pass cannot safely merge).
-- Therefore **M1 = supply alias information** (alias regions / `noalias`
-  evidence in `MemFlags`), not write a CSE pass. This is also the prerequisite
-  for any loop vectorization: the distinct `Vec` buffers in p4 need non-aliasing
-  facts before L3 can be widened without a miscompile.
-- Separately, p9's per-iteration `a.ptr`/`a.len` reloads are **regalloc spills of
-  loop invariants** (§9.9), not redundant loads — no load pass removes them.
+- **The alias-analysis switch is dead code.** `enable_alias_analysis = true`
+  (`settings.rs:501`) is **never read**. The egraph — and the `AliasAnalysis` it
+  builds (`context.rs:389`) — runs whenever `opt_level != OptLevel::None`
+  (`context.rs:192-195`). So "the flag makes it ON" was wrong; it runs because we
+  optimize at all.
+- **A standalone CSE pass is still the wrong approach (measured).** The
+  block-local CSE pass in `rakit-exp5` produced **byte-identical** binaries
+  (PR #16): same-address loads within a block are already handled. A standalone
+  CSE pass is a no-op where it is safe and unsound where it is not.
+- **But the cause of the *surviving* reloads is UNVERIFIED.** `process_inst`
+  (`alias_analysis.rs:1353-1389`) aliases a load only when a known value matches
+  the same `MemoryLoc` — same SSA `address`, `last_store`/memory state, extent —
+  *and* the def dominates; and `has_memory_fence_semantics`
+  (`alias_analysis.rs:93-105`) treats **Call/CallIndirect/TryCall** as fences
+  that block movement. Region tags are therefore **neither necessary nor
+  sufficient**; the blocker could be a differing SSA address, a memory-state
+  mismatch, dominance, or a call fence. The earlier bounds-check investigation
+  (REPORT.md:2790-2802) does **not** establish which requirement blocks the
+  length loads.
+- **The p9 reload attribution is UNVERIFIED.** The cited conclusion
+  (REPORT.md:1187-1196) does not analyze p9, and the hoisting experiment
+  (REPORT.md:2812-2827) concerns frontend-emitted header loads. Calling p9's
+  per-iteration reloads "regalloc spills of loop invariants" needs before/after
+  register-allocation evidence, which we do not have.
+- **A frontend-only alias-region change would not even cover stack accesses.**
+  `Pointer::load` / `Pointer::store` (`src/pointer.rs:109-131`) **discard the
+  caller's `flags`** for the `PointerBase::Stack` arm (they call
+  `stack_load`/`stack_store`), and those builders
+  (`vendor/rakit-codegen-meta/src/gen_inst.rs:1489-1528`) emit **fresh
+  `set_notrap()` flags**. Tagging load/store callers in `src/` leaves stack
+  accesses untagged; any flag-based plan must also thread flags through
+  `pointer.rs` (and the stack builders).
 
-**Revised near-term order:** (1) frontend → `MemFlags.alias_region` propagation
-so the existing egraph alias analysis can disambiguate distinct stack slots and
-`noalias`-proven buffers (largest safe win available; correctness-critical — a
-wrong region is a miscompile, so land in small gated steps); (2) only then a
-vectorizer. Do **not** implement a standalone load-CSE pass.
+**Revised next step — DIAGNOSE before building.** Instrument
+`process_inst`/`MemoryState` to log *why* a specific known reload is not
+eliminated (different SSA address? `last_store` mismatch? call fence?
+dominance?), e.g. the `Range::end` vs `v.len()` loads in p4 and the p9 header
+loads, and gather pre/post-regalloc evidence for p9. Only after isolating the
+actual blocker should we choose among alias-region propagation, an address-based
+CSE, or regalloc work. Do **not** implement a standalone load-CSE pass or a
+frontend-only alias-region change on the current evidence.
 
 ## Project kickoff (2026-11-24, branch `rakit-exp5`) — p4 loop autovectorizer (milestone plan)
 
