@@ -41,6 +41,11 @@
   65 suites / 25,368 passed / 0 failed (needs `./y.sh prepare` for
   rand/regex/graviola first); `bench/allaxes.sh` 45/45 rows `ok` (output
   validated vs LLVM). `p3` output byte-identical; `fib` disasm has no back-`jmp`.
+- **Negative result (do not re-try):** widening the gate to also rotate loops
+  with a conditional body but no call (`RAKIT_NO_ROTATE_BRIF`-style) is neutral
+  under interleaved A/B (p4 −0.7%, h_branch −2.1%, everything else ≤±0.4%, i.e.
+  drift). The earlier apparent p4 −5.2% was measurement drift between runs, not
+  the gate. Call-only stays the default; the `rotate_brif` knob was removed.
 
 ## Session (2026-11-23) — `rakit-ir` removed, `rakit-opt` kept
 - **Decision:** delete the separate RIR crate and its CLIF↔RIR bridge. Keep
