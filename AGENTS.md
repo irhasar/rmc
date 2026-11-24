@@ -1,61 +1,27 @@
-## Session (2026-11-23, audit iteration 3) — five audit fixes
-- **`pmulhu.w` landed** in `src/intrinsics/llvm_x86.rs` (SSE2 + AVX2):
-  per-lane `uextend i32 -> imul -> ushr 16 -> ireduce i16`. `serde_json` f64
-  now runs after a `cargo clean` (old rlibs cache the old lowering). Regression:
-  `bench/tests/t_pmulhu.rs`.
-- **RIR `MemFlags` preserved.** `rakit_ir::MemFlags(u16)` is carried on
-  `Inst::Load/Store`; `MemFlagsData::bits/from_bits` and
-  `MachMemFlags::bits/from_bits` expose the raw bits. Alias regions are dropped
-  (conservative). Test: `memory_flags_roundtrip`.
-- **Custom backend opt-in.** `custom_backend_enabled()` now requires
-  `RAKIT_CUSTOM_BACKEND`; `RAKIT_NO_CUSTOM_BACKEND` still wins.
-- **Duplicate RIR passes off by default.** rec_loop, inliner, div_test,
-  if_convert, sincos RIR versions require `RAKIT_RIR_DUPLICATE` or the specific
-  `RAKIT_RIR_*` flag. CLIF owns them (has the cost model); this removes the
-  `forloops` if_convert regression. RIR-only passes (simplify, opt,
-  mem_forward, SROA, GVN, LICM) still run.
-- **Held-out harness.** `bench/heldout.sh` and `bench/heldout/h_*.rs` use
-  runtime `n:seed`; full compile/run axes and LLVM output comparison.
-- Verification: full `./y.sh test --sysroot rakit` 65 suites / 0 failed;
-  `rakit-codegen` 202; `rakit-opt` 26; regressions and heldout pass.
-
-## Session (2026-11-23, audit iteration 2) — RIR production path
-- **RIR now covers std crates.** `tunables::rir_enabled` returns true for all
-  crates, not only user executables. Forcing a core rebuild with
-  `RAKIT_RIR_DEBUG=1` logged 5,266 `[rir] optimized` functions and 8,761 skips
-  (unsupported instruction subsets), proving std actually goes through RIR.
-- **Bridge is no longer partial for globals/dynamic/exception.** `rakit-opt/src/rir.rs`
-  imports/exports `GlobalValueData` (VMContext, Load, IAddImm, Symbol,
-  DynScaleTargetConst), `dynamic_types`, `dynamic_stack_slots`, `stack_limit`,
-  `UnaryGlobalValue`, `FuncAddr`, `DynamicStackAddr`, `TryCall`, and
-  `TryCallIndirect` including exception tables and `TryArg::{Value,Ret,Exn}`.
-  `try_call` has no direct SSA results (normal values are `TryArg::Ret`), which
-  the verifier now enforces. Round-trip tests: `global_value_roundtrip`,
-  `dynamic_stack_roundtrip`, `try_call_roundtrip` in `rakit-opt/src/rir.rs`.
-- **SROA soundness fix + opt-in.** `sroa` now rejects a promoted load
-  replacement when the replacement value does not dominate the load, and
-  dynamic-address promotion is disabled. The pass is opt-in
-  (`RAKIT_RIR_SROA=1`); default off until the alias proof is stronger, because
-  a std slice-pattern test (`slice::subslice_patterns`) exposed a remaining
-  cross-block issue.
-- **Custom backend is now an emitter, not validation-only.**
-  `rakit-ir/src/backend/mach.rs::to_rir` lowers virtual-register machine IR back
-  to RIR. `RirPass` runs `RirSelector` + `LinearScan`, then emits RIR from the
-  pre-allocation machine IR and uses that as the CLIF export input. Scalar
-  subset; unsupported functions stay on the direct RIR path.
-- **New RIR pass:** `rakit-ir/src/sincos.rs` fuses same-block `sin`/`cos` libcalls
-  into `sincos`/`sincosf`, wired into the RIR pipeline. Tests:
-  `rakit-ir/tests/sincos.rs`.
-- **Verification:** `cargo test` in `rakit-ir` and `rakit-opt` green;
-  `./y.sh build` exit 0; h20–h26 byte-identical under default RIR,
-  `RAKIT_NO_RIR=1`, and `RAKIT_CUSTOM_BACKEND=1`; h27 (`sin`/`cos`) matches
-  LLVM output. `./y.sh test` reaches the long-running std IO tests without the
-  former `slice::subslice_patterns` failure once RIR SROA is opt-in.
-- **Still open:** `rec_loop`, `unroll`, and `inliner` remain CLIF-only;
-  RIR coverage is intentionally conservative (unsupported functions skip).
-  Push to `irhasar/rmc:rakit-middle-end` remains blocked by token permissions.
+## Session (2026-11-23) — `rakit-ir` removed, `rakit-opt` kept
+- **Decision:** delete the separate RIR crate and its CLIF↔RIR bridge. Keep
+  `rakit-opt` as the production pass layer; it owns the passes that produce the
+  real wins (rec_loop, store_forward, div_test, if_convert, unroll, sincos,
+  inliner).
+- **Evidence:** `RAKIT_NO_RIR=1` made `p3_calls` 93.8 → 56.8 ms. Isolating the
+  RIR passes showed `simplify` was the trigger: `RAKIT_NO_RIR_SIMPLIFY=1` gave
+  59.6 ms. p1/p2/p4–p9 were neutral. RIR changed `fib` so CLIF `rec_loop` no
+  longer matched.
+- **Removed:** `rakit-ir/` (IR, verifier, interpreter, tests, toy ISel/regalloc),
+  `rakit-opt/src/rir.rs`, `RirPass`, RIR inliner bodies, RIR tunables, custom
+  backend path, and the `rakit-ir` dependency.
+- **Kept:** `rakit-opt` pass manager, shared analyses, `passtime`, and all
+  first-party CLIF passes. `rakit-codegen` remains the generic optimizer/backend.
+- **Docs:** README architecture section rewritten; RIR knobs removed.
+- **Verification:** `./y.sh build` exit 0; `./y.sh test --sysroot rakit` 65
+  suites / 25,368 passed / 0 failed; `rakit-codegen` 202, `rakit-opt` 2;
+  regressions pass; heldout outputs match LLVM; allaxes p3 93.8 → 59 ms.
 
 # AGENTS.md
+
+> Historical notes below predate the RIR removal. Entries mentioning `rakit-ir`,
+> `RIR`, `RirPass`, or `RAKIT_RIR_*` are archival and no longer describe the tree.
+
 
 ## Session (2026-11-23, Fase 2 step 19) — calls
 - `Inst::Call(Option<Value>, u32, Vec<Value>)` plus `Function.externals`

@@ -3141,6 +3141,8 @@ sebelumnya. Yang bisa diperbaiki tanpa mengubah arah proyek sudah mendarat:
 
 ### 29.4 Implementasi lanjutan audit (2026-11-23)
 
+> **Superseded:** seluruh jalur RIR di bawah ini sudah dihapus di §30.
+
 Lima item audit dikerjakan dan diverifikasi:
 
 1. **`pmulhu.w`.** Lowering SSE2/AVX2 ditambahkan. `t_pmulhu` menghasilkan
@@ -3161,3 +3163,89 @@ Lima item audit dikerjakan dan diverifikasi:
 Verifikasi: `./y.sh test --sysroot rakit` → 65 suite `ok`, 0 failed;
 `rakit-codegen` 202 unit test lulus; `bench/regressions.sh` lulus;
 `bench/heldout.sh` lulus untuk enam program. Test `rakit-opt --lib` 26 lulus.
+
+## 30. Penghapusan `rakit-ir` dan jalur RIR (2026-11-23)
+
+`rakit-ir` dan jembatan `rakit-opt/src/rir.rs` dihapus dari jalur produksi.
+`rakit-opt` **tidak** dihapus: crate itu tetap memiliki pass manager, analysis
+cache, dan pass first-party yang menghasilkan kemenangan performa.
+
+### 30.1 Bukti sebelum penghapusan
+
+Perbandingan pada build yang sama, `opt-level=3`, median 7–9 run:
+
+| Program | RIR aktif | `RAKIT_NO_RIR=1` | `RAKIT_NO_RIR_SIMPLIFY=1` |
+|---|---:|---:|---:|
+| `p3_calls` | 93,8 ms | **56,8 ms** | 59,6 ms |
+| `p4_simd` | 85,3 ms | 86,0 ms | 85,0 ms |
+| `p7_branchy` | 34,9 ms | 35,0 ms | 35,1 ms |
+
+`RAKIT_NO_RIR_OPT`, `NO_RIR_MEM`, `NO_RIR_SROA`, `NO_RIR_GVN`, dan `NO_RIR_LICM`
+tidak mengubah p3; hanya `NO_RIR_SIMPLIFY` yang memulihkan performa. Artinya
+`simplify` RIR mengubah bentuk `fib` sampai pass CLIF `rec_loop` tidak lagi
+mengenali pola rekursi→loop. Pass RIR lain netral, sehingga seluruh round-trip
+hanya menambah biaya dan permukaan bug.
+
+### 30.2 Yang dihapus
+
+- crate `rakit-ir/`: IR SSA, builder, verifier, interpreter, seluruh pass RIR,
+  backend mainan (`isel`, `regalloc`, `mach`, `exec`), dan test-nya;
+- `rakit-opt/src/rir.rs` (bridge import/export);
+- `RirPass`, `rir_bodies`, `rir_eligible`, `set_rir_eligible`;
+- seluruh tunable `RAKIT_RIR_*`, `RAKIT_NO_RIR*`, dan `RAKIT_CUSTOM_BACKEND`;
+- field `crate_name`/`user_crate` yang hanya dipakai RIR;
+- dependency `rakit-ir` dari `rakit-opt/Cargo.toml` dan `Cargo.lock`.
+
+### 30.3 Yang dipertahankan
+
+`rakit-opt` tetap berisi `rec_loop`, `store_forward`, `div_test`, `if_convert`,
+`unroll`, `sincos`, `inliner`, `pass.rs`, `analyses.rs`, dan `passtime.rs`.
+Pass generik (egraph, constant propagation, LICM, ISel, regalloc) tetap dimiliki
+`rakit-codegen`. Tidak ada pass first-party yang diduplikasi.
+
+### 30.4 Verifikasi
+
+- `./y.sh build` → exit 0 (backend + sysroot).
+- Full suite `./y.sh test --sysroot rakit` → **65 suite, 25.368 test lulus,
+  0 gagal**.
+- `rakit-codegen` 202 unit test lulus; `rakit-opt` 2 unit test lulus; root
+  backend 0 test.
+- `bench/regressions.sh` → `all fixtures passed`.
+- `bench/heldout.sh` (`CREPS=1 RREPS=3`, input `10000:7 50000:11`) → semua
+  output identik dengan LLVM.
+- `p3_calls` tanpa RIR: 59,3 ms (median 9 run), output identik dengan LLVM.
+- `bench/allaxes.sh` (`CREPS=1 RREPS=5`) setelah penghapusan:
+
+| prog | bk | Cwall | Ccpu | Crss | size | Rwall | Rcpu | Rrss |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| p1_arith | L | 86 | 106 | 105,7 | 4.635.232 | 82 | 82 | 10,8 |
+| p1_arith | U | 80 | 104 | 109,0 | 5.877.944 | 109 | 108 | 10,8 |
+| p1_arith | M | 81 | 104 | 109,3 | 4.146.112 | 101 | 101 | 10,8 |
+| p2_mem | L | 247 | 374 | 133,6 | 4.639.888 | 16 | 16 | 10,7 |
+| p2_mem | U | 146 | 193 | 131,9 | 5.936.144 | 156 | 155 | 10,7 |
+| p2_mem | M | 153 | 211 | 132,9 | 4.143.368 | 49 | 50 | 10,5 |
+| p3_calls | L | 100 | 122 | 115,9 | 4.612.368 | 38 | 37 | 10,5 |
+| p3_calls | U | 87 | 113 | 117,5 | 5.820.136 | 117 | 117 | 10,8 |
+| p3_calls | M | 91 | 118 | 118,0 | 4.067.032 | 59 | 58 | 10,7 |
+| p4_simd | L | 113 | 134 | 116,7 | 4.636.096 | 57 | 57 | 48,2 |
+| p4_simd | U | 96 | 120 | 118,3 | 5.892.376 | 161 | 160 | 49,5 |
+| p4_simd | M | 102 | 126 | 118,7 | 4.152.736 | 86 | 84 | 48,8 |
+| p5_inline | L | 138 | 108 | 105,3 | 4.609.368 | 58 | 58 | 10,5 |
+| p5_inline | U | 78 | 101 | 107,5 | 5.813.704 | 898 | 898 | 10,7 |
+| p5_inline | M | 77 | 102 | 108,0 | 4.059.960 | 7 | 6 | 10,8 |
+| p6_scalar | L | 85 | 103 | 101,2 | 4.609.368 | 58 | 58 | 10,7 |
+| p6_scalar | U | 78 | 99 | 103,5 | 5.813.688 | 906 | 906 | 10,7 |
+| p6_scalar | M | 77 | 99 | 104,3 | 4.059.960 | 6 | 6 | 10,7 |
+| p7_branchy | L | 85 | 104 | 104,9 | 4.609.520 | 43 | 42 | 10,5 |
+| p7_branchy | U | 78 | 100 | 107,5 | 5.813.800 | 101 | 100 | 10,8 |
+| p7_branchy | M | 79 | 102 | 107,8 | 4.060.120 | 35 | 35 | 10,5 |
+| p8_minmax | L | 86 | 105 | 104,9 | 4.609.544 | 18 | 17 | 10,5 |
+| p8_minmax | U | 79 | 100 | 107,3 | 5.813.752 | 38 | 39 | 10,7 |
+| p8_minmax | M | 80 | 103 | 107,9 | 4.060.088 | 24 | 22 | 10,7 |
+| p9_u64f32 | L | 96 | 115 | 110,6 | 4.635.448 | 31 | 30 | 17,8 |
+| p9_u64f32 | U | 85 | 108 | 114,0 | 5.886.872 | 76 | 76 | 18,9 |
+| p9_u64f32 | M | 89 | 113 | 114,3 | 4.149.744 | 34 | 33 | 18,2 |
+
+Waktu dalam ms, RSS dalam MB, size dalam byte. p8 diukur ulang 15 run: M
+20,4 ms (min 20,0), LLVM 17,9 ms; angka 24 ms di tabel adalah satu run
+`allaxes` yang lebih berisik. Semua output program identik dengan LLVM.

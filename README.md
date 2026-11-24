@@ -53,170 +53,52 @@ urutan pipeline terpusat di satu tempat (bukan rangkaian pemanggilan ad-hoc di
 `base.rs`). Inliner tetap dijalankan lebih dulu karena memakai
 `Context::inline`, di luar pipeline `rakit-opt`.
 
-`rakit-ir` (`rakit/rakit-ir/`) adalah fondasi IR mid-level milik Rakit: IR SSA
-mandiri (tanpa dependensi ke backend), verifier (definisi tunggal, dominasi,
-tipe), optimizer pertama (constant folding, branch folding, DCE), dan
-interpreter referensi untuk tes.
+### Tidak ada IR mid-level terpisah
 
-Jembatan CLIF↔RIR ada di `rakit-opt/src/rir.rs`. Jembatan ini menerima
-konstanta, aritmetika int/float (termasuk `I128`), `icmp`/`fcmp`, `select`,
-parameter blok, `jump`/`brif`, `return`, stack slot tetap dengan load/store
-skalar, direct call, indirect call, libcall/known-symbol, serta call dengan
-nol, satu, atau banyak hasil. Target dan signature call dipertahankan saat
-import/export; call convention indirect ikut disimpan. Fungsi yang memakai
-fitur global value (`GlobalValueData`), dynamic stack slot/type, dan exception
-edge (`try_call`, `try_call_indirect`, `ExceptionTable`) sekarang ikut
-di-import/export. Fungsi yang memakai instruksi di luar subset tetap ditolak
-dan dibiarkan apa adanya; tidak ada round-trip parsial.
+Rakit **tidak** memakai crate IR mid-level terpisah. `rakit-ir` dan jembatan
+CLIF↔RIR sudah dihapus. Alasannya terukur: round-trip RIR tidak memberi
+keuntungan pada benchmark mana pun, dan `simplify` RIR mengubah bentuk `fib`
+sampai pass CLIF `rec_loop` tidak lagi mengenali pola rekursi→loop. Pada
+`p3_calls`, RIR aktif menghasilkan **93,8 ms**, sedangkan tanpa RIR **56,8 ms**;
+dengan `RAKIT_NO_RIR_SIMPLIFY=1` waktunya kembali ke **59,6 ms**. p1/p2/p4–p9
+netral. Bridge RIR juga menambah ~2.600 LOC, membuang debug location, dan
+menduplikasi pass yang sudah dimiliki `rakit-opt` serta `rakit-codegen`.
 
-Pass `RirPass` berjalan default untuk **semua crate**, termasuk `core`, `std`,
-`alloc`, `compiler_builtins`, `unwind`, dan `rustc_*`. Rebuild std dengan
-`RAKIT_RIR_DEBUG=1` menunjukkan ribuan fungsi std benar-benar melewati RIR
-(bukan hanya user crate). `RAKIT_RIR=1` memaksa aktif, `RAKIT_NO_RIR=1`
-memaksa nonaktif.
-`RAKIT_RIR_FORCE=1` memaksa export ulang tanpa perubahan (untuk validasi),
-`RAKIT_RIR_DEBUG=1` mencetak keputusan per fungsi.
+Arsitektur produksi sekarang:
 
-Optimizer RIR memakai identitas yang belum tentu ada di egraph backend upstream:
-`x - x`, `x ^ x`, `x & x`, `x | x`, `icmp x, x`, `select(c, x, x)`, dan
-`brif` ke target yang sama. Dengan `RAKIT_RIR=1` ini benar-benar mengubah kode
-(mis. `x & x` → `x`) dan output tetap sama dengan build normal.
+```
+rustc MIR
+  └─ rakit/src          frontend MIR → CLIF
+        └─ rakit-opt    pass manager + analisis bersama + pass first-party
+              rec_loop → store_forward → div_test → if_convert
+              → unroll (reassoc/LCG) → sincos
+        └─ rakit-codegen  CLIF → ISel (ISLE) → regalloc2 → machine code
+        └─ rakit-object   emisi objek
+```
 
-Pass RIR `div_test` (`rakit-ir/src/div_test.rs`) memindahkan fold `x % C == 0`
-ke RIR untuk `I8/I16/I32/I64`: `C` ganjil > 1 memakai `imul x, C^-1` +
-`icmp ule`; `C = 2^s * odd` memakai mask `x & (2^s - 1)` lalu uji `odd`;
-`C` pangkat dua hanya memakai mask. `eq`/`ne` dan kombinasi Bool memakai
-`select`. Pass ini opt-in: `RAKIT_RIR_DIVTEST=1 RAKIT_NO_DIVTEST=1` membuat RIR
-mengerjakan rewrite dan output tetap sama. `brif` langsung pada remainder masih
-ditangani pass CLIF.
+`rakit-opt` tetap menjadi lapisan optimisasi produksi. Pass yang dimilikinya
+tidak diduplikasi di tempat lain:
 
-Semantik integer RIR (`rakit-ir/src/int_sem.rs`) memakai representasi bit
-zero-extended per lebar tipe: operasi unsigned langsung benar, operasi signed
-melakukan sign-extend, dan shift memakai `width-1`. Interpreter dan constant
-folder memakai modul yang sama, sehingga `I8/I16/I32` konsisten.
+- `rec_loop`: rekursi linear → loop.
+- `store_forward`: forwarding store→load dan dead-store elimination untuk stack
+  slot privat, termasuk lintas blok.
+- `div_test`: `x % C == 0` → multiply/compare.
+- `if_convert`: diamond dua arah → `select`/`cmove` dengan cost model.
+- `unroll`: affine reassociation dan lane transform untuk loop konstan.
+- `sincos`: fusi `sin`/`cos` dengan argumen sama.
+- `inliner`: heuristik inline per-CGU di atas mekanisme `Context::inline`.
+- `pass.rs` / `analyses.rs` / `passtime.rs`: pass manager, cache CFG/dominator/
+  loop, dan timing opsional.
 
-Pass RIR `if_convert` (`rakit-ir/src/if_convert.rs`) mengubah diamond `brif` →
-dua arm pendek → join/return menjadi `select` di blok head, lalu menghapus arm
-dan nilai yang menjadi mati. Join/return boleh membawa banyak nilai (termasuk
-nol), jadi dua `if` identik yang menghasilkan dua nilai ikut dikonversi.
-Batasannya konservatif: arm tanpa parameter, satu predecessor, maksimal 8
-instruksi, tanpa div/rem, dan nilai arm tidak dipakai di luar arm. Pass ini
-opt-in: `RAKIT_RIR_IFCONV=1 RAKIT_NO_IFCONV=1` mengonversi `if c { x + 1 } else
-{ x + 2 }` di RIR. Default-nya pass CLIF yang berjalan karena ia memiliki cost
-model prediktabilitas; menjalankan versi RIR secara default sempat memperlambat
-loop bercabang.
+Pass generik seperti egraph, constant propagation, LICM, dan pemilihan instruksi
+tetap dimiliki `rakit-codegen`; `rakit-opt` hanya menambahkan transformasi yang
+tidak ada di sana. Inliner dijalankan lebih dulu karena memakai
+`Context::inline`, di luar pipeline `rakit-opt`.
 
-Pass `gvn` (`rakit-ir/src/gvn.rs`) melakukan value numbering global: tabel
-ekspresi diwarisi sepanjang dominator tree, jadi instruksi murni duplikat
-diganti `Copy` ke hasil pertama hanya jika hasil itu mendominasi penggunaan.
-Key-nya adalah opcode + tipe + operand, sehingga tipe atau operand berbeda
-tidak pernah digabung; dua cabang yang tidak saling mendominasi juga tidak
-digabung.
-
-Pass `simplify` (`rakit-ir/src/simplify.rs`) membuang blok yang tidak
-terjangkau dari entry dan menggabungkan blok forwarder kosong
-(`nop*; jump target` tanpa parameter), dengan mengarahkan ulang edge `jump`
-maupun `brif`; blok dan nilai di-renumber. Forwarder yang hasil `nop`-nya
-dipakai di luar blok dibiarkan, dan blok entry tidak pernah dihapus.
-
-Selain itu, blok tanpa parameter dengan tepat satu predecessor digabung ke
-predecessor tersebut bila predecessor berakhir `jump` tanpa arg; isi blok
-dipindahkan dan bloknya dihapus. Penggabungan tidak dilakukan melewati edge
-`brif`, blok berparameter, atau blok dengan banyak predecessor.
-
-Pass `licm` (`rakit-ir/src/licm.rs`) memindahkan instruksi murni yang
-operandnya didefinisikan di luar loop ke preheader loop, sehingga komputasi
-loop-invariant hanya dihitung sekali. Loop dengan lebih dari satu predecessor
-luar atau tanpa preheader dilewati; instruksi yang bergantung pada nilai loop
-tidak dipindahkan. Pass berjalan sampai fixpoint agar rantai invariant ikut
-terangkat.
-
-Bridge RIR kini juga mengimpor stack slot tetap dan akses memori skalar:
-`stack_addr`, `load`, dan `store` (termasuk varian tanpa offset). Alamat
-direpresentasikan sebagai `I64`. Pass yang ada tetap konservatif: `gvn` dan
-`licm` tidak memindahkan akses memori, `if_convert` menolak lengan yang berisi
-load/store, dan DCE tidak membuang load/store. Interpreter memakai arena stack
-sederhana dengan pemeriksaan batas untuk menguji round-trip memori.
-
-Pass `mem_forward` (`rakit-ir/src/mem_forward.rs`) meneruskan `store` ke `load`
-berikutnya untuk stack slot privat yang alamatnya tidak escape, baik di dalam
-blok maupun lintas blok lewat must-analysis predecessor. Setelah itu pass
-menghapus store mati memakai liveness byte-range lintas blok: `live-in` dan
-`live-out` dihitung sampai fixpoint, lalu store yang byte-nya tidak live setelah
-store tersebut dihapus, termasuk store yang tertimpa store lain di blok yang
-sama atau di successor. Alamat dilacak lewat `Copy`, `Add` dengan konstanta,
-`Select`, dan indeks dinamis (`StackAddr + i*size`). Store/load dinamis
-diperlakukan sebagai seluruh slot, sehingga `a[i]` hanya di-forward saat
-ekspresi alamatnya identik. Pass dilewati seluruhnya bila ada alamat yang
-escape, store ke alamat tak dikenal, atau akses konstanta di luar batas slot.
-
-Pass `sroa` (`rakit-ir/src/sroa.rs`) mempromosikan stack slot skalar menjadi
-nilai SSA. Slot hanya dipromosikan bila alamatnya tidak escape dan semua akses
-berupa load/store skalar dengan offset konstan; akses dinamis sengaja
-dibiarkan ke `mem_forward` karena satu slot dapat ditulis lewat satu alamat
-dinamis dan dibaca lewat alamat lain. Phi dibuat sebagai block parameter di
-dominance-frontier join, lalu rename pada dominator tree mengganti load dengan
-nilai SSA saat ini dan membuang store; nilai pengganti wajib mendominasi load.
-Pass ini sekarang **opt-in** dengan `RAKIT_RIR_SROA=1`; default mati sampai
-bukti alias untuk kode std diperkuat. Slot yang tidak lagi punya `StackAddr`
-dihapus dan slot lain dinomori ulang.
-
-RIR juga mendukung memori 16 byte lewat `Type::I128` (load/store 16 byte,
-forwarding, DSE, dan SROA opt-in). Aritmetika `I128` memakai semantik wrapping 128-bit
-di `int_sem::eval_bin_i128`, dan perbandingan memakai `eval_icmp_i128`; baik
-interpreter maupun folder konstan memakai jalur yang sama.
-
-RIR mendukung direct external call lewat `Inst::Call`, indirect call lewat
-`Inst::CallIndirect`, dan tabel `externals` dengan target user, libcall, atau
-known-symbol plus signature (termasuk multi-return). Bridge mempertahankan
-target, call convention, jumlah parameter, dan jumlah hasil saat import/export.
-Call adalah barrier untuk DCE; slot yang alamatnya dikirim ke call dianggap
-escape sehingga tidak di-forward atau dipromosikan. Karena setiap `StackAddr`
-hanya menunjuk satu slot, slot-slot RIR selalu disjoint dan tidak ada alias
-antarslot. Interpreter menyediakan callback `run_with` untuk call langsung dan
-`run_with_indirect` untuk call tidak langsung, sehingga semantik call bisa diuji
-tanpa menjalankan kode native.
-
-Pipeline RIR default:
-`simplify → optimize → mem_forward → optimize → sroa → optimize → gvn → licm → optimize`.
-
-Pass `rec_loop`, inliner, `div_test`, `if_convert`, dan `sincos` versi RIR
-adalah duplikat dari pass CLIF dan **opt-in** (`RAKIT_RIR_DUPLICATE=1` untuk
-semuanya, atau `RAKIT_RIR_{REC_LOOP,INLINE,DIVTEST,IFCONV,SINCOS}=1`). Implementasi
-CLIF menjadi pemilik default karena memiliki cost model yang sudah dituning.
-RIR tetap menjadi jalur produksi untuk simplify/opt/mem_forward/SROA/GVN/LICM.
-
-Pass `sincos` (`rakit-ir/src/sincos.rs`) adalah port RIR dari fusi
-`sin`/`cos` → `sincos`/`sincosf`; ia menangani pasangan call dengan argumen
-identik di blok yang sama, mengganti dua hasil call dengan satu call dua hasil,
-lalu menghapus nilai lama.
-
-## Backend instruction selection dan register allocation
-
-`rakit-ir/src/backend/` berisi jalur backend alternatif di atas RIR:
-
-- `mach.rs`: machine IR sederhana (`MachFunction`, `MachInst`, `Operand`,
-  `VReg`) dengan mov, binop, compare, setcc, select, branch, jump, dan return.
-- `mod.rs`: trait `InstructionSelector` dan `RegisterAllocator`, plus
-  `BackendError`. Keduanya object-safe, sehingga implementasi lain bisa
-  ditukar tanpa mengubah pemanggil.
-- `isel.rs`: `RirSelector` menurunkan subset integer RIR ke machine IR.
-- `regalloc.rs`: `LinearScan` melakukan liveness, graph-coloring, dan spill ke
-  slot; hasilnya memetakan setiap `VReg` ke register fisik atau spill slot.
-- `exec.rs`: interpreter machine IR untuk membuktikan semantik hasil seleksi
-  dan alokasi, termasuk jalur spill.
-- `mach::to_rir`: emitter machine IR → RIR. Setelah selector dan register
-  allocator berhasil, `RirPass` memakai emitter ini untuk mengganti RIR asal
-  dengan RIR hasil backend sebelum di-export ke CLIF.
-
-Aktifkan jalur ini dengan `RAKIT_CUSTOM_BACKEND=1`; `RirPass` menjalankan
-selector dan register allocator untuk setiap fungsi RIR yang didukung, lalu
-meng-emit RIR dari machine IR (bukan sekadar validasi). `RAKIT_RIR_DEBUG=1`
-mencetak statistik vreg/register/spill. Subset emitter saat ini adalah integer
-skalar; fungsi dengan memori, call, atau parameter blok non-entry tetap
-memakai jalur RIR langsung. Tes ada di `rakit-ir/tests/backend.rs`
-(aritmetika, branch, select, spill, penolakan memori/`I128`, object-safety
-trait, dan round-trip emitter).
+Knob debugging yang tersisa: `RAKIT_NO_STORE_FWD`, `RAKIT_NO_DIVTEST`,
+`RAKIT_NO_IFCONV`, `RAKIT_NO_REC_LOOP`, `RAKIT_NO_SINCOS`,
+`RAKIT_NO_COLLAPSE`, `RAKIT_UNROLL`, `RAKIT_PARTIAL`, `RAKIT_INLINE_*`, dan
+`RAKIT_PASS_TIME=1`.
 
 ## Build
 
@@ -279,11 +161,12 @@ modifikasi justru **≈8× lebih cepat dari LLVM** (7 ms vs 58 ms).
 - **Compile.** Biaya tambahan fork berasal dari pass, **bukan** dari patch
   vendor: dengan semua pass dimatikan, fork 3212 ms vs upstream 3208 ms.
 
-Modifikasi utama ada di `rakit/src/`: `inliner.rs` (inlining bertingkat
-dengan tier leaf), `if_convert.rs` (diamond → `select`/`cmove`),
+Modifikasi utama ada di `rakit/rakit-opt/src/passes/`: `inliner.rs` (inlining
+bertingkat dengan tier leaf), `if_convert.rs` (diamond → `select`/`cmove`),
 `store_forward.rs` (store-to-load forwarding + dead-store elimination),
-`unroll.rs` (pelebaran loop counted), dan `driver/aot.rs`. Rincian lengkap,
-termasuk lever yang diuji dan terbukti netral, ada di `REPORT.md`.
+`unroll.rs` (pelebaran loop counted), dan `rec_loop.rs` (rekursi → loop).
+Rincian lengkap, termasuk lever yang diuji dan terbukti netral, ada di
+`REPORT.md`.
 
 ## Reproduksi
 
