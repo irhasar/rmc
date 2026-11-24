@@ -509,4 +509,51 @@ mod tests {
              entry path (regalloc reports `EntryLivein`)"
         );
     }
+
+    /// `addr_base` must classify the store's **destination** (`args[1]`), not
+    /// the stored value (`args[0]`). Each case pins one side: a static value
+    /// stored through a dynamic pointer must be `None`, and a dynamic value
+    /// stored into a static stack slot must be `Some(StackSlot)`. Reading the
+    /// value operand inverts both and fails.
+    #[test]
+    fn addr_base_uses_store_destination() {
+        use crate::ir::immediates::Offset32;
+        use crate::ir::{MemFlagsData, StackSlotData, StackSlotKind};
+
+        let mut func = Function::new();
+        let entry = func.dfg.make_block();
+        let slot = func.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            8u32,
+            0,
+        ));
+        let flags = MemFlagsData::trusted();
+        let mut cur = FuncCursor::new(&mut func);
+        cur.insert_block(entry);
+        // A statically-known address (the stack slot) and a dynamic pointer (a
+        // constant address value, i.e. not a `StackAddr`/`GlobalValue`).
+        let static_addr = cur.ins().stack_addr(I64, slot, 0);
+        let dyn_addr = cur.ins().iconst(I64, 0x1000);
+        let dyn_val = cur.ins().iconst(I64, 42);
+        // Static value, dynamic destination.
+        let st_static_value_dynamic_dest =
+            cur.ins().store(flags, static_addr, dyn_addr, Offset32::new(0));
+        // Dynamic value, static destination.
+        let st_dynamic_value_static_dest =
+            cur.ins().store(flags, dyn_val, static_addr, Offset32::new(0));
+        cur.ins().return_(&[]);
+        drop(cur);
+
+        assert!(
+            addr_base(&func, &func.dfg.insts[st_static_value_dynamic_dest]).is_none(),
+            "addr_base classified the stored value, not the dynamic destination"
+        );
+        assert!(
+            matches!(
+                addr_base(&func, &func.dfg.insts[st_dynamic_value_static_dest]),
+                Some(AddrBase::StackSlot(s)) if s == slot
+            ),
+            "addr_base missed the static stack-slot destination"
+        );
+    }
 }

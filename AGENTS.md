@@ -62,9 +62,15 @@ own base still blocks (`store_bases.contains(base)`). I did **not** mark the p9
   the `catch_unwind` path; LICM-independent) and `t_tls` (only thread print order
   differs; same values). **Full suite `./y.sh test --sysroot rakit`: 65 suites /
   25,368 passed / 0 failed.** Codegen unit tests `cargo test -p rakit-codegen
-  --lib`: **202 passed / 0 failed** (incl.
-  `licm::tests::licm_does_not_split_a_multi_entry_loop_header`); the LICM
-  differential `bench/tests/t_licm.rs` matches LLVM.
+  --lib`: **203 passed / 0 failed** (incl.
+  `licm::tests::licm_does_not_split_a_multi_entry_loop_header` and the new
+  `licm::tests::addr_base_uses_store_destination`); the LICM differential
+  `bench/tests/t_licm.rs` matches LLVM. The new test is the direct regression
+  for the operand fix: a **static value stored through a dynamic pointer** must
+  classify as `None`, and a **dynamic value stored into a static stack slot**
+  must classify as `Some(StackSlot)`. It **fails** with the old `args[0]`
+  (verified) and passes with `args[1]`, so the operand choice is covered even
+  though p9 itself does not exercise it.
 - **Benchmark p9 (before → after):** `main.opt` `load` lines **9 → 9**, disasm
   `(%rsp)` refs in `main` **13 → 13**, run CPU **34.5 → 33.6 ms** (within noise),
   output identical. The fix is **NEUTRAL on p9** — expected: p9's loop store
