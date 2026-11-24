@@ -249,6 +249,16 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
     `fn ops2`) asserts `paddd` and `psubd` **inside `ops2`**; wired into
     `regressions.sh` (and kept out of the `pmuludq`-presence loop, which only
     applies to multiply shapes). Gate: suite **65 / 25,368 / 0**; allaxes ok.
+  - **M3.4 LANDED: f32 and i64 lanes.** The matcher is generic over element type
+    via `enum Lanes { U32, I64, F32 }` (`vec()`/`shift()`/`size()`/`per_vec()`):
+    u32 xor/add/sub [*K] → `I32X4`; i64 xor/add/sub → `I64X2`; f32
+    add/sub/mul/div → `F32X4`. `per_vec` is 4 for 32-bit lanes and **2 for i64**,
+    so the step and the `i + per_vec <= n` gate adapt; the overflow guard uses
+    `n < u64::MAX/size`. `* K` stays u32-only (only `pmuludq` exists). New
+    `t_vectorize_f32` (add+mul; n=1000/999/5/2/0) and `t_vectorize_i64` (add;
+    n=1000/999/3/1/0) in address-taken fns; `regressions.sh` asserts
+    `addps`/`mulps` in `f32ops` and `paddq` in `i64ops`. Probes: f32 add/mul and
+    i64 add all match LLVM; `l3_*` checksums unchanged; ktime ~25.5 ms.
 
 ## Session (2026-11-24, branch `rakit-exp7`) — p9 reloads are real, but NOT soundly hoistable with the existing flags (alias tags don't move loads)
 

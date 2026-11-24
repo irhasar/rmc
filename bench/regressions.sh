@@ -74,6 +74,8 @@ rem 6121779849389533154
 overlap 12968996556249723189'
 check t_vectorize_multi 'm1 12776226417588255163 m2 15151514424346961891'
 check t_vectorize_ops 'add 17194792273410237731 sub 10846146650447627395'
+check t_vectorize_f32 $'n=1000 add=7083501190089957475 mul=16326997319991784275\nn=999 add=10593356097432088209 mul=10796855508119876121\nn=5 add=14995117245246052777 mul=3891769157468395945\nn=2 add=15738008312299960571 mul=18044256215840110843\nn=0 add=1469598103934665603 mul=1469598103934665603'
+check t_vectorize_i64 $'n=1000 add=17194792273410237731\nn=999 add=7573983905390497110\nn=3 add=5881159685710253342\nn=1 add=4957045732212500362\nn=0 add=1469598103934665603'
 
 # Output equality alone cannot prove the vectorizer ran. Each fixture below
 # contains exactly one xor+imul loop, so a packed multiply (SSE2 lowering of
@@ -110,6 +112,16 @@ if command -v objdump >/dev/null 2>&1; then
     fi
     if ! printf '%s\n' "$od" | grep -q psubd; then
         echo "[regression] t_vectorize_ops: no psubd (sub loop not vectorized)" >&2
+        fail=1
+    fi
+    f32d=$(objdump -d --disassemble=f32ops "$TMP/t_vectorize_f32_M" --no-show-raw-insn 2>/dev/null)
+    if ! printf '%s\n' "$f32d" | grep -q addps || ! printf '%s\n' "$f32d" | grep -q mulps; then
+        echo "[regression] t_vectorize_f32: missing addps/mulps in f32ops" >&2
+        fail=1
+    fi
+    qd=$(objdump -d --disassemble=i64ops "$TMP/t_vectorize_i64_M" --no-show-raw-insn 2>/dev/null)
+    if ! printf '%s\n' "$qd" | grep -q paddq; then
+        echo "[regression] t_vectorize_i64: missing paddq in i64ops" >&2
         fail=1
     fi
 fi
