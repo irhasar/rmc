@@ -97,14 +97,14 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
   **Correction:** the earlier "L3 isolation M 66.7 vs L 28.3" **conflated the
   array-construction loops** with the kernel. Proper isolation (repeat the kernel
   20x on fixed data, 80M iters): **L 49.9 ms vs M 110.3 ms (~2.2x)**, and L is
-  **memory-bound at ~19 GB/s (verified, not inferred):** a trivial vectorized
-  tri-stream `c=a+b` (`paddd`) with identical ~960 MB traffic and negligible
-  compute also runs **L 49.8 ms**, matching L3's **L 49.9 ms** — so L3 under LLVM
-  is bandwidth-bound, not compute-bound. Harness committed for reproducibility:
-  `bench/progs/h_l3iso.rs` (20-pass L3 kernel) and `bench/progs/h_l3bw.rs`
-  (reference tri-stream). `p4_simd.rs` itself includes init and does **not**
-  reproduce the 20-pass run. A 4-wide vectorized M can reach ~L; the vectorizer
-  is justified by the *kernel*.
+  **consistent with a memory-bandwidth limit (circumstantial, not proven):** a
+  trivial tri-stream `c=a+b` (`paddd`) with identical ~960 MB *nominal* traffic
+  and negligible compute runs **L 49.8 ms**, matching L3's **L 49.9 ms**. But this
+  is two *process times* coinciding, **not** a measured memory-traffic/bandwidth
+  (no PMU counters here); `nominal bytes / process time` (~19 GB/s) is an
+  estimate, and the runner times allocation+init along with the kernel. Treat
+  "memory-bound" as strong circumstantial evidence, not proof. A 4-wide vectorized
+  M can reach ~L; the vectorizer is justified by the *kernel*.
 - **Blocker is CFG shape:** p4 L3 is **multi-block** — `block29` (bounds check
   `brif`) → `block30` (compute+store) → back-edge. Address `base + i*4`, induction
   `i`, `i'=i+1`.
@@ -126,8 +126,12 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
      disjointness guard** routes either to a new `I32X4` vector loop
      (`imul.i32x4` + `splat`; 4 elems/iter, `i+=4`) or to the **original scalar
      loop**; the original loop is **reused as the scalar tail** (re-enter its
-     header at `i` for `n % 4`), so the scalar loop is not duplicated. Validated
-     on `bench/progs/h_l3iso.rs` (universal disjointness gate; distinct buffers).
+     header at `i` for `n % 4`), so the scalar loop is not duplicated. Fixtures
+     live in `bench/l3/` (excluded from the held-out `progs/h*.rs` argv sweep; run
+     via `bench/allaxes.sh "$PWD/bench/l3/*.rs"`): `l3_iso` (disjoint fast path),
+     `l3_tail` (trip not divisible by 4 -> remainder), `l3_overlap` (dst overlaps
+     sources -> must fall back to scalar), `l3_bw` (reference). Each hashes **all**
+     output elements so every store is checked, not just the last.
   2. **M3.2** handle the bounds-check multi-block shape (hoist `i+3 < n` or require
      bound = slice length so checks are redundant); the disjointness proof is the
      universal gate above. Only then is p4 unlocked safely.
