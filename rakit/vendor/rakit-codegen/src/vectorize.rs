@@ -30,8 +30,8 @@ use crate::cursor::{Cursor, FuncCursor};
 use crate::ir::condcodes::IntCC;
 use crate::ir::immediates::{Ieee32, Ieee64, Offset32};
 use crate::ir::{
-    self, Block, DataFlowGraph, Function, InstBuilder, Layout, MemFlagsData, Opcode, Value,
-    ValueDef, types,
+    self, Block, DataFlowGraph, Function, InstBuilder, Layout, MemFlagsData, Opcode, StackSlotData,
+    StackSlotKind, Value, ValueDef, types,
 };
 
 /// Whether the pass is enabled at runtime (`RAKIT_NO_VECTORIZE` disables it).
@@ -65,6 +65,9 @@ pub fn do_vectorize(func: &mut Function) -> bool {
         }
         if let Some(plan) = match_header(func, h) {
             apply(func, plan);
+            changed = true;
+        } else if let Some(rp) = match_reduction(func, h) {
+            apply_reduction(func, rp);
             changed = true;
         }
     }
@@ -445,6 +448,260 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
         k,
         rhs: rhs_val,
     })
+}
+
+struct RPlan {
+    h: Block,
+    preheader: Block,
+    n: Bound,
+    base: Value,
+    init: Value,
+    lanes: Lanes,
+    op: Opcode,
+}
+
+/// Matches `acc = init; for i in 0..n { acc = acc + a[i] }` for integer lanes
+/// (u32/i64). Float sums are excluded: the vector order would change rounding.
+fn match_reduction(func: &Function, h: Block) -> Option<RPlan> {
+    let dfg = &func.dfg;
+    let hparams = dfg.block_params(h);
+    if hparams.len() != 2 {
+        return None;
+    }
+    let i = hparams[0];
+    let acc = hparams[1];
+    if dfg.value_type(i) != types::I64 {
+        return None;
+    }
+    let elem_ty = dfg.value_type(acc);
+    let lanes = Lanes::from_scalar(elem_ty)?;
+    if !matches!(lanes, Lanes::U32 | Lanes::I64) {
+        return None;
+    }
+    let (shift, size) = (lanes.shift(), lanes.size() as i64);
+
+    let hterm = func.layout.last_inst(h)?;
+    let ir::InstructionData::Brif { arg, blocks, .. } = dfg.insts[hterm] else {
+        return None;
+    };
+    let cond = arg;
+    let s0 = blocks[0].block(&dfg.value_lists);
+    let s1 = blocks[1].block(&dfg.value_lists);
+    if s0 == s1 {
+        return None;
+    }
+    let b = s0;
+    let (cc, cx, cy) = icmp_parts(dfg, cond)?;
+    let n_side = match cc {
+        IntCC::UnsignedLessThan if dfg.resolve_aliases(cx) == i => cy,
+        IntCC::UnsignedGreaterThan if dfg.resolve_aliases(cy) == i => cx,
+        _ => return None,
+    };
+    if dfg.value_type(n_side) != types::I64 {
+        return None;
+    }
+
+    if !dfg.block_params(b).is_empty() {
+        return None;
+    }
+    let pb = preds(func, b);
+    if pb.len() != 1 || pb[0] != h {
+        return None;
+    }
+    let ph = preds(func, h);
+    if ph.len() != 2 || !ph.contains(&b) {
+        return None;
+    }
+    let preheader = *ph.iter().find(|x| **x != b)?;
+
+    let pterm = func.layout.last_inst(preheader)?;
+    let ir::InstructionData::Jump { destination, .. } = dfg.insts[pterm] else {
+        return None;
+    };
+    if destination.block(&dfg.value_lists) != h {
+        return None;
+    }
+    let pargs: Vec<_> = destination.args(&dfg.value_lists).collect();
+    if pargs.len() != 2 || iconst_i64(dfg, pargs[0].as_value()?)? != 0 {
+        return None;
+    }
+    let init = pargs[1].as_value()?;
+
+    let bterm = func.layout.last_inst(b)?;
+    let ir::InstructionData::Jump { destination: bnext, .. } = dfg.insts[bterm] else {
+        return None;
+    };
+    if bnext.block(&dfg.value_lists) != h {
+        return None;
+    }
+    let bargs: Vec<_> = bnext.args(&dfg.value_lists).collect();
+    if bargs.len() != 2 {
+        return None;
+    }
+    let i2 = bargs[0].as_value()?;
+    let acc2 = bargs[1].as_value()?;
+    let (nop, na, nb) = binary(dfg, i2)?;
+    if nop != Opcode::Iadd
+        || !((dfg.resolve_aliases(na) == i && iconst_i64(dfg, nb) == Some(1))
+            || (dfg.resolve_aliases(nb) == i && iconst_i64(dfg, na) == Some(1)))
+    {
+        return None;
+    }
+    let (aop, ax, ay) = binary(dfg, acc2)?;
+    if aop != Opcode::Iadd {
+        return None;
+    }
+
+    let mut loads = Vec::new();
+    for inst in func.layout.block_insts(b) {
+        if inst == bterm {
+            continue;
+        }
+        let op = dfg.insts[inst].opcode();
+        if op.is_call() || op.other_side_effects() || op.can_store() {
+            return None;
+        }
+        if op.can_load() {
+            loads.push(inst);
+            continue;
+        }
+        if op.can_trap() {
+            return None;
+        }
+    }
+    if loads.len() != 1 {
+        return None;
+    }
+    let l = loads[0];
+    let ir::InstructionData::Load { offset, flags, .. } = dfg.insts[l] else {
+        return None;
+    };
+    if dfg.insts[l].opcode() != Opcode::Load {
+        return None;
+    }
+    let fl = &func.dfg.mem_flags[flags];
+    if !fl.notrap() || fl.explicit_endianness().is_some() {
+        return None;
+    }
+    if i32::from(offset) != 0 || dfg.value_type(dfg.first_result(l)) != elem_ty {
+        return None;
+    }
+    let lres = dfg.resolve_aliases(dfg.first_result(l));
+    let accr = dfg.resolve_aliases(acc);
+    let (oa, ob) = (dfg.resolve_aliases(ax), dfg.resolve_aliases(ay));
+    if !((oa == accr && ob == lres) || (oa == lres && ob == accr)) {
+        return None;
+    }
+
+    let addr = dfg.insts[l].arguments(&dfg.value_lists).first().copied()?;
+    let (base, _hoff) = base_and_off(dfg, addr, i, shift, size)?;
+    if !defined_outside(dfg, &func.layout, base, h, b)
+        || !defined_outside(dfg, &func.layout, n_side, h, b)
+    {
+        return None;
+    }
+
+    // `acc` and the load result must be used only by `acc2`, and `acc2` only as
+    // the back-edge argument, so the vector body reproduces exactly this update.
+    let acc2r = dfg.resolve_aliases(acc2);
+    let (mut acc_uses, mut l_uses, mut acc2_uses) = (0, 0, 0);
+    for inst in func.layout.block_insts(b) {
+        if inst == bterm {
+            continue;
+        }
+        for &a in dfg.insts[inst].arguments(&dfg.value_lists) {
+            let r = dfg.resolve_aliases(a);
+            if r == accr {
+                acc_uses += 1;
+            }
+            if r == lres {
+                l_uses += 1;
+            }
+            if r == acc2r {
+                acc2_uses += 1;
+            }
+        }
+    }
+    if acc_uses != 1 || l_uses != 1 || acc2_uses != 0 {
+        return None;
+    }
+
+    let n = match iconst_i64(dfg, n_side) {
+        Some(c) if c > 0 && (c as u64) < u64::MAX / lanes.size() => Bound::Const(c),
+        Some(_) => return None,
+        None => Bound::Runtime(n_side),
+    };
+
+    Some(RPlan { h, preheader, n, base: dfg.resolve_aliases(base), init, lanes, op: Opcode::Iadd })
+}
+
+fn apply_reduction(func: &mut Function, p: RPlan) {
+    let h = p.h;
+    let vh = func.dfg.make_block();
+    let vb = func.dfg.make_block();
+    let red = func.dfg.make_block();
+    func.layout.append_block(vh);
+    func.layout.append_block(vb);
+    func.layout.append_block(red);
+    let vt = p.lanes.vec();
+    let vh_i = func.dfg.append_block_param(vh, types::I64);
+    let vh_a = func.dfg.append_block_param(vh, vt);
+    let vb_i = func.dfg.append_block_param(vb, types::I64);
+    let vb_a = func.dfg.append_block_param(vb, vt);
+    let red_i = func.dfg.append_block_param(red, types::I64);
+    let red_a = func.dfg.append_block_param(red, vt);
+
+    let pterm = func.layout.last_inst(p.preheader).unwrap();
+    func.layout.remove_inst(pterm);
+    {
+        let mut cur = FuncCursor::new(func).at_bottom(p.preheader);
+        let zero = cur.ins().iconst(p.lanes.scalar(), 0);
+        let zv = cur.ins().splat(vt, zero);
+        let iz = cur.ins().iconst(types::I64, 0);
+        cur.ins().jump(vh, &[iz.into(), zv.into()]);
+    }
+    {
+        let mut cur = FuncCursor::new(func).at_bottom(vh);
+        let step = cur.ins().iconst(types::I64, p.lanes.per_vec());
+        let nxt = cur.ins().iadd(vh_i, step);
+        let n = match p.n {
+            Bound::Const(c) => cur.ins().iconst(types::I64, c),
+            Bound::Runtime(v) => v,
+        };
+        let cond = cur.ins().icmp(IntCC::UnsignedLessThanOrEqual, nxt, n);
+        cur.ins().brif(cond, vb, &[vh_i.into(), vh_a.into()], red, &[vh_i.into(), vh_a.into()]);
+    }
+    {
+        let mut cur = FuncCursor::new(func).at_bottom(vb);
+        let shift = cur.ins().iconst(types::I64, p.lanes.shift());
+        let off = cur.ins().ishl(vb_i, shift);
+        let flags = MemFlagsData::new().with_notrap();
+        let addr = cur.ins().iadd(p.base, off);
+        let v = cur.ins().load(vt, flags, addr, Offset32::new(0));
+        let acc2 = cur.ins().iadd(vb_a, v);
+        let step = cur.ins().iconst(types::I64, p.lanes.per_vec());
+        let nxt = cur.ins().iadd(vb_i, step);
+        cur.ins().jump(vh, &[nxt.into(), acc2.into()]);
+    }
+    {
+        let slot =
+            func.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 16, 4));
+        let mut cur = FuncCursor::new(func).at_bottom(red);
+        let flags = MemFlagsData::new().with_notrap();
+        let addr = cur.ins().stack_addr(types::I64, slot, 0);
+        cur.ins().store(flags, red_a, addr, Offset32::new(0));
+        let scalar = p.lanes.scalar();
+        let size = p.lanes.size() as i32;
+        let mut sum = cur.ins().load(scalar, flags, addr, Offset32::new(0));
+        for k in 1..p.lanes.per_vec() as i32 {
+            let v = cur.ins().load(scalar, flags, addr, Offset32::new(k * size));
+            sum = cur.ins().iadd(sum, v);
+        }
+        // Vector accumulator started at 0; add `init` once here so `n < per_vec`
+        // (no vector iterations) yields exactly `init`.
+        let total = cur.ins().iadd(p.init, sum);
+        cur.ins().jump(h, &[red_i.into(), total.into()]);
+    }
 }
 
 fn apply(func: &mut Function, p: Plan) {

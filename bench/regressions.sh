@@ -78,6 +78,7 @@ check t_vectorize_f32 $'n=1000 add=7083501190089957475 mul=16326997319991784275\
 check t_vectorize_i64 $'n=1000 add=17194792273410237731\nn=999 add=7573983905390497110\nn=3 add=5881159685710253342\nn=1 add=4957045732212500362\nn=0 add=1469598103934665603'
 check t_vectorize_f64 $'n=1000 add=12605502316359290979 mul=15193480026440175715\nn=999 add=16431287870010424977 mul=15840584383383207569\nn=5 add=4555731617307007401 mul=573423646804646313\nn=1 add=11364037426215188377 mul=671366010930788249\nn=0 add=1469598103934665603 mul=1469598103934665603'
 check t_vectorize_const 'u32mul=7406505972513382635 i64add=16879444138376719115 f32mul=10425260595837503587 f32sub=16288212200764297315'
+check t_vectorize_sum $'n=1000 u32=4213332 u64=6494044\nn=999 u32=4210927 u64=6481210\nn=5 u32=23274 u64=795\nn=3 u32=13985 u64=432\nn=1 u32=4660 u64=153\nn=0 u32=0 u64=0'
 
 # Output equality alone cannot prove the vectorizer ran. Each fixture below
 # contains exactly one xor+imul loop, so a packed multiply (SSE2 lowering of
@@ -138,6 +139,16 @@ if command -v objdump >/dev/null 2>&1; then
             fail=1
         fi
     done
+    sd=$(objdump -d --disassemble=usum "$TMP/t_vectorize_sum_M" --no-show-raw-insn 2>/dev/null)
+    if ! printf '%s\n' "$sd" | grep -q paddd; then
+        echo "[regression] t_vectorize_sum: missing paddd in usum" >&2
+        fail=1
+    fi
+    qsd=$(objdump -d --disassemble=qsum "$TMP/t_vectorize_sum_M" --no-show-raw-insn 2>/dev/null)
+    if ! printf '%s\n' "$qsd" | grep -q paddq; then
+        echo "[regression] t_vectorize_sum: missing paddq in qsum" >&2
+        fail=1
+    fi
 fi
 
 # A constant trip bound must still vectorize when the egraph rematerializes the

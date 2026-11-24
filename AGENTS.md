@@ -272,6 +272,18 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
     `regressions.sh` asserts `addpd`/`mulpd` in `f64ops` and
     `pmuludq`/`paddq`/`mulps`/`subps` in `constops`. Probes: f64 add, u32*K,
     f32*K, f32-K, i64+K all L==M; `l3_*` unchanged; ktime ~25 ms.
+  - **M3.6 LANDED: integer sum reductions.** New `match_reduction` /
+    `apply_reduction` in `vectorize.rs` handle `acc = init; for i in 0..n
+    { acc += a[i] }` for **u32/i64** (float sums excluded — vector order would
+    change rounding and break bit-exactness). The vector accumulator starts at
+    identity 0 (`splat(0)`); a `RED` block horizontally sums it via a 16-byte
+    stack slot and adds `init` **once**, so `n < per_vec` yields exactly `init`,
+    then jumps the original header `H(i, acc)`, which runs the scalar tail and
+    exit unchanged. Strict shape: 2 header params, 1 load, 0 stores, no
+    calls/traps, and `acc`/load each used exactly once by `acc2` with `acc2` only
+    as the back-edge arg. `bwsum` (4M×20 u32): **98.4 → 44.0 ms** (LLVM 12.9;
+    7.6× → 3.4×). New `t_vectorize_sum` (u32 `paddd` / u64 `paddq`,
+    n=1000/999/5/3/1/0); `regressions.sh` asserts both.
 
 ## Session (2026-11-24, branch `rakit-exp7`) — p9 reloads are real, but NOT soundly hoistable with the existing flags (alias tags don't move loads)
 
