@@ -102,24 +102,27 @@ fi
 
 # A constant trip bound must still vectorize when the egraph rematerializes the
 # literal in the loop header (RAKIT_NO_LICM=1): the literal is rematerialized in
-# the guard, so it needs no dominating definition.
-if command -v objdump >/dev/null 2>&1; then
-    if ! env -u RAKIT_HOST_LLVM RAKIT_NO_LICM=1 "$ROOT/rakit/dist/bin/rustc-rakit" --target "$TARGET" -C opt-level=3 "$BENCH/tests/t_vectorize_unit.rs" -o "$TMP/u_nolicm" --edition 2021 >"$TMP/u_nolicm.compile" 2>&1; then
-        echo "[regression] t_vectorize_unit NO_LICM=1: compile failed" >&2
-        cat "$TMP/u_nolicm.compile" >&2
-        fail=1
-    elif ! "$TMP/u_nolicm" >"$TMP/u_nolicm.out" 2>&1; then
-        echo "[regression] t_vectorize_unit NO_LICM=1: run failed" >&2
-        cat "$TMP/u_nolicm.out" >&2
-        fail=1
-    elif [ "$(cat "$TMP/u_nolicm.out")" != "unit 12776226417588255163" ]; then
-        echo "[regression] t_vectorize_unit NO_LICM=1: wrong output" >&2
-        printf 'expected:\nunit 12776226417588255163\nactual:\n%s\n' "$(cat "$TMP/u_nolicm.out")" >&2
-        fail=1
-    elif ! objdump -d "$TMP/u_nolicm" --no-show-raw-insn 2>/dev/null | grep -q pmuludq; then
+# the guard, so it needs no dominating definition. Compile/run/output always run
+# (no disassembler needed); only the SIMD check is gated on objdump.
+if ! env -u RAKIT_HOST_LLVM RAKIT_NO_LICM=1 "$ROOT/rakit/dist/bin/rustc-rakit" --target "$TARGET" -C opt-level=3 "$BENCH/tests/t_vectorize_unit.rs" -o "$TMP/u_nolicm" --edition 2021 >"$TMP/u_nolicm.compile" 2>&1; then
+    echo "[regression] t_vectorize_unit NO_LICM=1: compile failed" >&2
+    cat "$TMP/u_nolicm.compile" >&2
+    fail=1
+elif ! "$TMP/u_nolicm" >"$TMP/u_nolicm.out" 2>&1; then
+    echo "[regression] t_vectorize_unit NO_LICM=1: run failed" >&2
+    cat "$TMP/u_nolicm.out" >&2
+    fail=1
+elif [ "$(cat "$TMP/u_nolicm.out")" != "unit 12776226417588255163" ]; then
+    echo "[regression] t_vectorize_unit NO_LICM=1: wrong output" >&2
+    printf 'expected:\nunit 12776226417588255163\nactual:\n%s\n' "$(cat "$TMP/u_nolicm.out")" >&2
+    fail=1
+elif command -v objdump >/dev/null 2>&1; then
+    if ! objdump -d "$TMP/u_nolicm" --no-show-raw-insn 2>/dev/null | grep -q pmuludq; then
         echo "[regression] t_vectorize_unit NO_LICM=1: no pmuludq (constant bound lost vectorization)" >&2
         fail=1
     fi
+else
+    echo "[regression] t_vectorize_unit NO_LICM=1: objdump unavailable, skipping SIMD assertion" >&2
 fi
 
 if [ "$fail" -eq 0 ]; then

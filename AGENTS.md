@@ -236,7 +236,9 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
     `regressions.sh` counts `pmuludq` **inside `two_loops`** (>=4) rather than
     binary-wide (a vector multiply elsewhere could mask a scalar loop); the
     `RAKIT_NO_LICM=1` check now also **runs** the binary and compares its output,
-    not just the disassembly. Known miss (correct, scalar): a bound that the
+    not just the disassembly — and that compile/run/output check is
+    **unconditional** (only the `pmuludq` disassembly is gated on `objdump`), so
+    runtime coverage is not skipped when no disassembler is present. Known miss (correct, scalar): a bound that the
     egraph rematerializes into the header (e.g. `n & mask`) is not hoisted, so
     that loop is not vectorized.
 
