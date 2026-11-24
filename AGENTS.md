@@ -99,19 +99,22 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
   `brif`) → `block30` (compute+store) → back-edge. Address `base + i*4`, induction
   `i`, `i'=i+1`.
 - **Universal gate (every stage, M3.1 included):** the vectorizer must prove the
-  stored buffer does not overlap the loaded buffers across the widened window; if
-  `dst` may alias `s1`/`s2`, widening reorders loads before stores and changes
-  results. CLIF carries no provenance, so require distinct base pointers or a
-  no-overlap proof, else skip. This is **not** specific to M3.2 — it applies to
-  *all* stages, including the `bounds-free` M3.1 shape.
+  stored buffer is **disjoint** from the loaded buffers over the whole accessed
+  range — *not* merely that the base pointers differ. Counterexample: `dst =
+  s1 + 1` (same buffer, one element later) has distinct bases but overlapping
+  ranges; the widened read-ahead of `s1[i+1..i+5]` happens before the scalar loop
+  would have overwritten those elements via `dst[i..i+4]`, so results change.
+  Where disjointness cannot be proven from CLIF (no alias provenance), require a
+  runtime distance/overlap check with a scalar fallback, else skip. This applies
+  to *all* stages, including the `bounds-free` M3.1 shape.
 - **Staged plan** (each stage gated by output validation vs LLVM + full suite,
-  **and** by the universal no-overlap gate above):
+  **and** by the universal disjointness gate above):
   1. **M3.1** single-block, bounds-free map loop `dst[i]=(s1[i]^s2[i])*K` (u32),
      multiple-of-4 fast path + scalar tail; emit `I32X4` (`imul.i32x4` + `splat`).
      Validated on a synthetic `get_unchecked` microbench (still subject to the
-     no-overlap gate — the microbench uses distinct buffers).
+     disjointness gate — the microbench uses distinct, non-overlapping buffers).
   2. **M3.2** handle the bounds-check multi-block shape (hoist `i+3 < n` or require
-     bound = slice length so checks are redundant); the no-overlap proof is the
+     bound = slice length so checks are redundant); the disjointness proof is the
      universal gate above. Only then is p4 unlocked safely.
   3. **M3.3** generalize ops (xor/add first), then integrate `addr_base`/private-slot.
 - Not implemented in code yet; recorded so the multi-session effort is grounded.
