@@ -3307,9 +3307,13 @@ setelah setiap pass, sehingga tidak ada analisis basi.
 `allaxes.sh` dan `heldout.sh`. Untuk setiap program, `L` dijalankan dengan
 argumen yang sama seperti saat pengukuran dan outputnya disimpan; `U` dan `M`
 wajib keluar dengan status 0 dan stdout+stderr identik dengan referensi `L`.
-Baris timing runtime hanya dicetak setelah validasi lulus. Kegagalan
-compile/run/mismatch menghasilkan `COMPILE_FAIL`, `RUN_FAIL`, `OUTPUT_MISMATCH`,
-atau `INVALID` tanpa angka runtime, dan harness keluar dengan status tidak nol.
+Saat pengukuran, `measure.py --expect REF` juga menangkap output setiap warmup
+dan repetisi, sehingga run yang berubah di tengah pengukuran tidak menghasilkan
+baris timing. Baris runtime hanya dicetak setelah semua validasi lulus.
+Kegagalan compile/run/mismatch menghasilkan `COMPILE_FAIL`, `RUN_FAIL`,
+`OUTPUT_MISMATCH`, atau `INVALID`; baris `COMPILE_FAIL` tetap menampilkan
+compile wall/CPU/RSS dengan ukuran `-`, sedangkan baris runtime gagal tidak
+menampilkan angka runtime. Harness keluar dengan status tidak nol.
 
 Contoh yang diuji: program sementara yang mencetak nama executable menghasilkan
 `OUTPUT_MISMATCH` untuk U/M dan `rc=1`; program yang `exit 7` menghasilkan
@@ -3329,9 +3333,9 @@ validasi; sebelumnya diam-diam memakai seed 7.
 Untuk input default 7/11/13, kedua lengan bergantian (≈5.000/21.000/60.000
 transisi pada 10.000/50.000/200.000 iterasi), bukan hanya sekali.
 
-`bench/measure.py` kini memanggil `sys.exit(0 jika semua run/warmup sukses,
-selain itu 1)`, sehingga status kegagalan terlihat oleh shell maupun harness,
-bukan hanya sebagai field `exit` di JSON.
+`bench/measure.py` kini memanggil `sys.exit(1)` bila ada warmup/repetisi yang
+gagal atau outputnya tidak cocok dengan `--expect`, sehingga status kegagalan
+terlihat oleh shell maupun harness, bukan hanya sebagai field JSON.
 
 ### 32.4 Verifikasi
 
@@ -3341,5 +3345,6 @@ bukan hanya sebagai field `exit` di JSON.
 - `bench/regressions.sh` → `all fixtures passed`.
 - `bench/allaxes.sh` dengan `h_branch`/`h_simd` → validasi lulus, semua output
   identik dengan LLVM.
-- Kasus negatif allaxes (mismatch output, `exit 7`) dan heldout
-  (`INPUTS=100:65536`) semuanya keluar `rc=1` tanpa baris timing palsu.
+- Kasus negatif allaxes (mismatch output, drift output antar-run, `exit 7`,
+  compile error) dan heldout (`INPUTS=100:65536`) semuanya keluar `rc=1` tanpa
+  baris timing palsu. Baris `COMPILE_FAIL` tetap memuat compile wall/CPU/RSS.

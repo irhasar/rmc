@@ -23,9 +23,11 @@
 - **Bug fixed:** `allaxes.sh` timed discovered held-out programs without
   checking stdout. `bench/validate.sh` now holds the shared step: `--capture`
   runs L, `--compare` requires exit 0 and byte-identical stdout+stderr for U/M;
-  validation uses the same args as the timed runs. Only validated rows print
-  runtime timings. `COMPILE_FAIL`/`RUN_FAIL`/`OUTPUT_MISMATCH`/`INVALID` rows
-  print compile axes but no runtime numbers, and the harness exits nonzero.
+  validation uses the same args as the timed runs. `measure.py --expect REF`
+  additionally checks stdout+stderr on every warmup and repetition, so a run
+  that changes mid-measurement is rejected. Only fully validated rows print
+  runtime timings. Runtime failure rows carry no runtime numbers; compile
+  failure rows keep compile wall/CPU/RSS (size `-`). Harnesses exit nonzero.
 - **Strict inputs:** all `bench/progs/h_*.rs` use `arg<T>(index, fallback)`;
   a present-but-unparsable argument prints `invalid argument ...` and exits 2.
   `INPUTS=100:65536` now fails `h_simd` validation instead of silently using 7.
