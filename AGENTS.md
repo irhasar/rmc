@@ -1,3 +1,48 @@
+## Project kickoff (2026-11-24, branch `rakit-exp5`) — p4 loop autovectorizer (milestone plan)
+
+Started "opsi 2" (the big backend project) targeting `p4_simd` (M ~83 ms vs LLVM
+~57 ms). p4 has three loops; only two are vectorizable:
+- L1 `a[i]=sin(i as f32); b[i]=cos(i as f32)` — **libcall-bound, not
+  vectorizable**; sincos fusion already helps. Ignore.
+- L2 `s += a[i]*b[i] + abs(a[i]-b[i])` — elementwise + horizontal reduction.
+- L3 `c[i] = (a[i].to_bits() ^ b[i].to_bits()).wrapping_mul(2654435761)` —
+  elementwise map, `u32`. Read Rakit CLIF now: the loops **are unrolled 128x**
+  (huge single-block bodies) but remain **scalar** — LLVM's win is real SIMD
+  (`mulps/addps/andps/pmulld`), not unrolling.
+
+**Why this is a project, not a pass:** a correct loop vectorizer needs, in
+order:
+1. **Alias/no-aliasing proof** for the three distinct `Vec` data pointers
+   (`a`,`b`,`c` in L2/L3). Without `noalias` the loads/stores of different Vecs
+   may alias; a vectorized read-ahead or reordered store would be wrong. Rust
+   does mark `&mut` `noalias`, but these are raw `Vec` derefs through bounds
+   checks — the evidence isn't in the CLIF today. (This is the same wall as
+   §25 bounds-check elimination.)
+2. **Bounds-check elimination** for `for i in 0..n { v[i] }` with `v.len()==n`:
+   §25 showed the guard compares the `Range::end` block param against a
+   *separately reloaded* `v.len()`, so the two must first be CSE'd (needs a
+   load-value-numbering that proves no store to the Vec header between them).
+3. **Loop legality + widening**: single induction var (step 1), pure elementwise
+   body, no calls/traps, contiguous access, then build `i32x4`/`f32x4`
+   loads/stores, splat the constant, vector `bxor`/`imulx`/`fmulx`/`fabsx`, and
+   a horizontal reduce for L2; scalar tail for `n % lanes`.
+4. **Codegen support check**: `pmulld` is SSE4.1 — must be feature-gated;
+   verify `bzhi`/vector `imul` lower in `rakit-codegen`.
+
+**Milestones (each its own commit, each validated by the full gate: build,
+15/15 stdout identical to LLVM, suite 65/25,368/0, allaxes 45/45):**
+- M1: load-value-numbering / redundant-load CSE + `v.len()==n` proof (enables
+  bounds-check elimination) — also helps p2.
+- M2: bounds-check elimination for `0..v.len()` loops (retire §25's blocker).
+- M3: legality analysis + a **dilated / read-only** vectorizer for L3
+  (`u32` xor-mul map) as the first real target (simplest body, no reduction).
+- M4: L2 reduction (horizontal), tails, `f32x4`.
+- M5: tune; measure vs LLVM.
+
+Each milestone is independently landable and correctness-gated; none is
+attempted blindly. Do **not** land a vectorizer without the alias proof (M1) —
+reordering loads/stores of possibly-aliasing Vecs silently corrupts results.
+
 ## Session (2026-11-24, branch `rakit-exp5`) — x64 omit-FP: implemented, correct, RUNTIME-NEUTRAL (reverted)
 
 - **Outcome:** implemented full omit-frame-pointer for x64 (mirroring RISC-V),
