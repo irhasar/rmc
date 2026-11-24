@@ -79,7 +79,7 @@ rustc MIR
 `rakit-opt` tetap menjadi lapisan optimisasi produksi. Pass yang dimilikinya
 tidak diduplikasi di tempat lain:
 
-- `rec_loop`: rekursi linear → loop.
+- `rec_loop`: rekursi linear → loop, hanya jika blok yang dihapus bebas efek.
 - `store_forward`: forwarding store→load dan dead-store elimination untuk stack
   slot privat, termasuk lintas blok.
 - `div_test`: `x % C == 0` → multiply/compare.
@@ -88,7 +88,8 @@ tidak diduplikasi di tempat lain:
 - `sincos`: fusi `sin`/`cos` dengan argumen sama.
 - `inliner`: heuristik inline per-CGU di atas mekanisme `Context::inline`.
 - `pass.rs` / `analyses.rs` / `passtime.rs`: pass manager, cache CFG/dominator/
-  loop, dan timing opsional.
+  loop yang dipakai `if_convert`/`sincos`/`unroll`/`store_forward`, dan timing
+  opsional.
 
 Pass generik seperti egraph, constant propagation, LICM, dan pemilihan instruksi
 tetap dimiliki `rakit-codegen`; `rakit-opt` hanya menambahkan transformasi yang

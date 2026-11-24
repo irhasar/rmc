@@ -1,6 +1,7 @@
 # Held-out benchmarks
 
-These programs are not used for tuning. Each one reads its trip count and seed
+The held-out programs live in `bench/progs/h_*.rs` (so `bench/allaxes.sh`
+discovers them automatically) and are not used for tuning. Each one reads its trip count and seed
 from `argv`, so compile-time folding cannot hide a codegen gap.
 
 Run the full 3-way matrix with:

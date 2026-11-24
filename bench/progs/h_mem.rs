@@ -2,8 +2,8 @@
 use std::collections::HashMap;
 
 fn main() {
-    let n: usize = std::env::args().nth(1).unwrap().parse().unwrap();
-    let seed: u64 = std::env::args().nth(2).unwrap().parse().unwrap();
+    let n: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(10000);
+    let seed: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(7);
     let mut map: HashMap<u64, Vec<u64>> = HashMap::new();
     for i in 0..n {
         let key = (i as u64).wrapping_mul(seed) % 4096;

@@ -192,18 +192,20 @@ fn arm_values_are_dead_outside(
     true
 }
 
-pub fn run(func: &mut ir::Function) {
+pub fn run(func: &mut ir::Function, analyses: &mut crate::analyses::Analyses) {
     if !crate::tunables::if_convert_enabled() {
         return;
     }
     // Convert to a fixed point: one rewrite can expose another.
-    while convert_one(func) {}
+    while convert_one(func, analyses) {
+        analyses.invalidate();
+    }
 }
 
 /// Find and rewrite a single convertible diamond, returning whether it changed
 /// the function.
-fn convert_one(func: &mut ir::Function) -> bool {
-    let cfg = rakit_codegen::flowgraph::ControlFlowGraph::with_function(func);
+fn convert_one(func: &mut ir::Function, analyses: &mut crate::analyses::Analyses) -> bool {
+    let cfg = analyses.cfg(func);
     let blocks: Vec<Block> = func.layout.blocks().collect();
 
     for &head in &blocks {

@@ -375,15 +375,16 @@ fn thread_forwarder(func: &mut ir::Function, pred: Block, latch: Block) -> bool 
     true
 }
 
-pub fn run(func: &mut ir::Function) {
+pub fn run(func: &mut ir::Function, analyses: &mut crate::analyses::Analyses) {
     let factor = unroll_factor();
     if factor < 2 {
         return;
     }
     if crate::tunables::collapse_forwarders_enabled() {
         collapse_forwarders(func);
+        analyses.invalidate();
     }
-    narrow_uint_fcvt(func);
+    narrow_uint_fcvt(func, analyses);
     if std::env::var_os("RAKIT_UNROLL_DEBUG").is_some() {
         eprintln!("[unroll] func {:?} blocks={}", func.name, func.layout.blocks().count());
         for b in func.layout.blocks() {
@@ -429,7 +430,7 @@ pub fn run(func: &mut ir::Function) {
 /// upper-bound compare that guards the conversion's block on the dominator path
 /// (e.g. the `i < N` test of a `for i in 0..N` loop). Dynamic or huge bounds are
 /// left untouched.
-fn narrow_uint_fcvt(func: &mut ir::Function) {
+fn narrow_uint_fcvt(func: &mut ir::Function, analyses: &mut crate::analyses::Analyses) {
     if std::env::var_os("RAKIT_NO_NARROW_FCVT").is_some() {
         return;
     }
@@ -449,9 +450,7 @@ fn narrow_uint_fcvt(func: &mut ir::Function) {
     if targets.is_empty() {
         return;
     }
-    let cfg = rakit_codegen::flowgraph::ControlFlowGraph::with_function(func);
-    let mut dom = rakit_codegen::dominator_tree::DominatorTree::new();
-    dom.compute(func, &cfg);
+    let dom = analyses.domtree(func);
     let dbg = std::env::var_os("RAKIT_UNROLL_DEBUG").is_some();
     let mut changed = 0;
     for (inst, x) in targets {

@@ -2,8 +2,8 @@
 use std::arch::x86_64::*;
 
 fn main() {
-    let n: usize = std::env::args().nth(1).unwrap().parse().unwrap();
-    let seed: u16 = std::env::args().nth(2).unwrap().parse().unwrap();
+    let n: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(10000);
+    let seed: u16 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(7);
     let mut sum = 0u64;
     unsafe {
         let mut acc = _mm_set1_epi16(seed as i16);

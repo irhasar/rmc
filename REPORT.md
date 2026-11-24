@@ -3130,8 +3130,8 @@ sebelumnya. Yang bisa diperbaiki tanpa mengubah arah proyek sudah mendarat:
   regalloc sekarang hanya berjalan dengan `RAKIT_CUSTOM_BACKEND=1`; default
   tidak mengalokasikan atau membuang hasilnya. `RAKIT_NO_CUSTOM_BACKEND` tetap
   menang.
-- **Benchmark tune tanpa input runtime (DIPERBAIKI).** `bench/heldout/` berisi
-  enam program yang membaca trip count/seed dari argv, dan `bench/heldout.sh`
+- **Benchmark tune tanpa input runtime (DIPERBAIKI).** `bench/progs/h_*.rs` berisi
+  enam program held-out yang membaca trip count/seed dari argv, dan `bench/heldout.sh`
   melaporkan matriks compile/run lengkap serta membandingkan output dengan LLVM.
 - **Atribusi backend asal.** Audit meminta nama dan NOTICE backend asal
   dikembalikan. Itu bertentangan dengan permintaan rebrand sebelumnya
@@ -3157,7 +3157,7 @@ Lima item audit dikerjakan dan diverifikasi:
 4. **Pass ganda.** Lima pass RIR duplikat dinonaktifkan secara default; RIR
    tetap menjalankan simplify/opt/mem_forward/SROA/GVN/LICM yang tidak punya
    padanan CLIF langsung. `forloops` tidak lagi melewati if_convert RIR.
-5. **Held-out.** `bench/heldout.sh` + `bench/heldout/h_*.rs`; input runtime
+5. **Held-out.** `bench/heldout.sh` + `bench/progs/h_*.rs`; input runtime
    `n:seed`, output harus sama dengan LLVM, dan semua sumbu compile/run dicatat.
 
 Verifikasi: `./y.sh test --sysroot rakit` → 65 suite `ok`, 0 failed;
@@ -3249,3 +3249,52 @@ Pass generik (egraph, constant propagation, LICM, ISel, regalloc) tetap dimiliki
 Waktu dalam ms, RSS dalam MB, size dalam byte. p8 diukur ulang 15 run: M
 20,4 ms (min 20,0), LLVM 17,9 ms; angka 24 ms di tabel adalah satu run
 `allaxes` yang lebih berisik. Semua output program identik dengan LLVM.
+
+## 31. Audit lanjutan: keamanan rec_loop, cache analisis, dan harness (2026-11-23)
+
+### 31.1 `rec_loop` tidak boleh menghapus efek di blok basis
+
+Laporan "Recursion lowering drops base-case writes" terbukti: `try_match`
+hanya memeriksa nilai `return` blok basis, bukan instruksi yang dijalankan.
+`rewrite` menghapus lima blok lama, jadi store ke static di blok basis ikut
+hilang. Matcher sekarang memanggil `deleted_blocks_are_safe`: selain dua call
+rekursif yang diganti, blok yang dihapus tidak boleh berisi call lain, load,
+store, instruksi yang bisa trap, atau efek samping lain; nilai yang dipakai di
+luar region juga menolak transformasi. Fixture
+`bench/tests/t_rec_loop_effects.rs` (`fib` dengan dua tulis static) menghasilkan
+`55 false false` saat guard dimatikan dan `55 true true` setelah guard aktif.
+
+### 31.2 Cache analisis benar-benar dipakai
+
+Sebelumnya `Analyses` tidak pernah dibaca pass produksi; `if_convert` bahkan
+membangun CFG baru pada setiap percobaan rewrite. Sekarang `if_convert`,
+`sincos`, `unroll` (untuk `narrow_uint_fcvt`), dan `store_forward` memakai
+`PassCtx::analyses` untuk CFG/dominator tree. Cache diinvalidasi setelah setiap
+rewrite `if_convert`, setelah `collapse_forwarders`, dan oleh pass manager
+setelah setiap pass, sehingga tidak ada analisis basi.
+
+### 31.3 Harness held-out
+
+- Program held-out dipindah ke `bench/progs/h_*.rs` agar `allaxes.sh` otomatis
+  menemukannya; tanpa argv mereka memakai input default kecil.
+- Backend `M` dijalankan dengan `env -u RAKIT_HOST_LLVM`, dan ketiga backend
+  mendapat `--target <host>` eksplisit. Tanpa ini, variabel lingkungan bisa
+  membuat kolom "Rakit" sebenarnya LLVM.
+- Status validasi dicatat per backend per input. Output mismatch atau run
+  validasi gagal tidak lagi diberi baris timing `ok`; barisnya menjadi
+  `INVALID`. Kegagalan run saat pengukuran juga men-set exit code harness.
+- `measure.py` mengembalikan exit tidak nol bila **salah satu** repetisi atau
+  warmup gagal, bukan hanya repetisi terakhir.
+- `h_branch` sekarang membandingkan sebelum update dan mulai di bawah
+  `threshold`, jadi lengan `else`/minimal ikut dieksekusi; output default
+  `10000 3 18444184258005128603` identik untuk L/U/M.
+
+### 31.4 Verifikasi
+
+- `./y.sh build` → exit 0.
+- `./y.sh test --sysroot rakit` → **65 suite, 25.368 test lulus, 0 gagal**.
+- `bench/regressions.sh` → `all fixtures passed` (termasuk fixture baru).
+- `bench/heldout.sh` dengan `10000:7 50000:11 200000:13` → semua output
+  identik dengan LLVM untuk enam program.
+- `bench/allaxes.sh` (`CREPS=1 RREPS=2`) → 15 program (9 p + 6 h), semua
+  compile/run berhasil; tidak ada output mismatch.

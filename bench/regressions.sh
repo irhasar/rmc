@@ -56,6 +56,7 @@ check() {
 check t_loop_call_args $'1\n3\n10\n32\n99\n301\n908\n2730\nacc=8197'
 check t_loop_side_effect '2016 64'
 check t_pmulhu '0 0 0 0 65534 32767 0 1'
+check t_rec_loop_effects '55 true true'
 
 if [ "$fail" -eq 0 ]; then
     echo "[regression] all fixtures passed"

@@ -10,8 +10,8 @@ fn mix(x: u64) -> u64 {
 }
 
 fn main() {
-    let n: u64 = std::env::args().nth(1).unwrap().parse().unwrap();
-    let seed: u64 = std::env::args().nth(2).unwrap().parse().unwrap();
+    let n: u64 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(10000);
+    let seed: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(7);
     let mut acc = seed;
     for i in 0..n {
         acc ^= mix(i ^ acc);

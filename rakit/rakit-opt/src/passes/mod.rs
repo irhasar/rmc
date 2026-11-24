@@ -36,7 +36,7 @@ impl Pass for StoreForwardPass {
     fn run(&mut self, pctx: &mut PassCtx<'_>) -> bool {
         let endianness = pctx.module.isa().endianness();
         passtime::time(passtime::STORE_FORWARD, || {
-            store_forward::run(&mut pctx.ctx.func, endianness)
+            store_forward::run(&mut pctx.ctx.func, endianness, pctx.analyses)
         });
         true
     }
@@ -63,7 +63,7 @@ impl Pass for IfConvertPass {
     }
 
     fn run(&mut self, pctx: &mut PassCtx<'_>) -> bool {
-        passtime::time(passtime::IF_CONVERT, || if_convert::run(&mut pctx.ctx.func));
+        passtime::time(passtime::IF_CONVERT, || if_convert::run(&mut pctx.ctx.func, pctx.analyses));
         true
     }
 }
@@ -76,7 +76,7 @@ impl Pass for UnrollPass {
     }
 
     fn run(&mut self, pctx: &mut PassCtx<'_>) -> bool {
-        passtime::time(passtime::UNROLL, || unroll::run(&mut pctx.ctx.func));
+        passtime::time(passtime::UNROLL, || unroll::run(&mut pctx.ctx.func, pctx.analyses));
         true
     }
 }
@@ -90,7 +90,7 @@ impl Pass for SincosPass {
 
     fn run(&mut self, pctx: &mut PassCtx<'_>) -> bool {
         if std::env::var_os("RAKIT_NO_SINCOS").is_none() {
-            sincos::run(&mut *pctx.module, &mut pctx.ctx.func);
+            sincos::run(&mut *pctx.module, &mut pctx.ctx.func, pctx.analyses);
         }
         true
     }

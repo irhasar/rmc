@@ -10,7 +10,11 @@ use rakit_codegen::ir::{
 };
 use rakit_module::{Linkage, Module};
 
-pub fn run(module: &mut dyn Module, func: &mut ir::Function) {
+pub fn run(
+    module: &mut dyn Module,
+    func: &mut ir::Function,
+    analyses: &mut crate::analyses::Analyses,
+) {
     if std::env::var_os("RAKIT_NO_SINCOS").is_some() {
         return;
     }
@@ -54,9 +58,7 @@ pub fn run(module: &mut dyn Module, func: &mut ir::Function) {
         return;
     }
 
-    let cfg = rakit_codegen::flowgraph::ControlFlowGraph::with_function(func);
-    let mut dom = rakit_codegen::dominator_tree::DominatorTree::new();
-    dom.compute(func, &cfg);
+    let dom = analyses.domtree(func);
 
     // Pair each sin with a cos of the same argument whose block is dominated by
     // the sin's block. Collect pairs first so the DOM tree stays valid.

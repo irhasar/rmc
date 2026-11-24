@@ -9,12 +9,13 @@
 set -u
 BENCH=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(dirname "$BENCH")
-PROGS=${1:-"$BENCH/progs/p*.rs"}
+PROGS=${1:-"$BENCH/progs/*.rs"}
 OUT="$BENCH/out/allaxes"; mkdir -p "$OUT"
 N=nightly-2026-11-17
+TARGET=$(rustc +$N -vV | sed -n 's/^host: //p')
 RUSTC_LLVM="rustc +$N"
 CG_UP="$ROOT/cg_clif_upstream/dist/bin/rustc-clif"
-CG_MOD="$ROOT/rakit/dist/bin/rustc-rakit"
+CG_MOD="env -u RAKIT_HOST_LLVM $ROOT/rakit/dist/bin/rustc-rakit"
 CREPS=${CREPS:-3}
 RREPS=${RREPS:-5}
 
@@ -36,7 +37,7 @@ for src in $PROGS; do
   b=$(basename "$src" .rs)
   for bk in L U M; do
     bin="$OUT/${b}_$bk"
-    cres=$("${MEASURE[@]}" --reps "$CREPS" --warmup 1 -- ${CMD[$bk]} -C opt-level=3 "$src" -o "$bin" --edition 2021 | jf)
+    cres=$("${MEASURE[@]}" --reps "$CREPS" --warmup 1 -- ${CMD[$bk]} --target "$TARGET" -C opt-level=3 "$src" -o "$bin" --edition 2021 | jf)
     read -r cw cc cr ce <<<"$cres"
     if [ "$ce" != "0" ] || [ ! -f "$bin" ]; then
       printf '%-10s %-2s | COMPILE_FAIL exit=%s\n' "$b" "$bk" "$ce"; continue

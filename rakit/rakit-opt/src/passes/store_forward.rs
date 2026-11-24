@@ -35,7 +35,11 @@ type Key = (Base, i64);
 /// For each byte range, the SSA value last stored to it.
 type Avail = FxHashMap<Key, (Value, types::Type)>;
 
-pub fn run(func: &mut ir::Function, endianness: ir::Endianness) {
+pub fn run(
+    func: &mut ir::Function,
+    endianness: ir::Endianness,
+    analyses: &mut crate::analyses::Analyses,
+) {
     if !crate::tunables::store_forward_enabled() {
         return;
     }
@@ -69,7 +73,7 @@ pub fn run(func: &mut ir::Function, endianness: ir::Endianness) {
         && crate::tunables::store_forward_cross_block()
         && cbe_within_budget(func)
     {
-        cross_block_entry(func, &private, &ptr_bases, &loaded)
+        cross_block_entry(func, &private, &ptr_bases, &loaded, analyses)
     } else {
         FxHashMap::default()
     };
@@ -438,6 +442,7 @@ fn cross_block_entry(
     private: &FxHashSet<StackSlot>,
     ptr_bases: &FxHashSet<Value>,
     loaded: &FxHashSet<Key>,
+    analyses: &mut crate::analyses::Analyses,
 ) -> FxHashMap<Block, Avail> {
     // Timing is only collected when explicitly requested: `Instant::now()` in a
     // per-block loop is measurable compile time on its own.
@@ -446,7 +451,7 @@ fn cross_block_entry(
     let elapsed_ns = |t: Option<std::time::Instant>| t.map_or(0, |t| t.elapsed().as_nanos());
 
     let t_cfg = now(timed);
-    let cfg = rakit_codegen::flowgraph::ControlFlowGraph::with_function(func);
+    let cfg = analyses.cfg(func);
     let blocks: Vec<Block> = func.layout.blocks().collect();
     let cfg_ns = elapsed_ns(t_cfg);
     // Decode each block's store events once; the dataflow below revisits blocks.

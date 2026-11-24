@@ -19,6 +19,26 @@
 
 # AGENTS.md
 
+## Session (2026-11-23) — rec_loop effect guard, analysis cache, held-out harness
+- **Bug fixed:** `RecLoopPass` deleted base-case side effects. `try_match` only
+  checked the base block's return value; `rewrite` removes five blocks, so a
+  static store in the base block disappeared. `deleted_blocks_are_safe` now
+  rejects any non-matched call/load/store/trapping op or escaping value in the
+  removed blocks. Regression `bench/tests/t_rec_loop_effects.rs`: old guard
+  prints `55 false false`, fixed prints `55 true true`.
+- **Analysis cache is live:** `if_convert`, `sincos`, `unroll` (fcvt narrowing)
+  and `store_forward` now read `PassCtx::analyses` instead of rebuilding CFG/dom.
+  `if_convert` invalidates after each rewrite; `unroll` after forwarder collapse;
+  the pass manager invalidates after every pass.
+- **Held-out harness:** programs moved to `bench/progs/h_*.rs` (auto-discovered
+  by `allaxes.sh`), with small argv fallbacks. Rakit column uses
+  `env -u RAKIT_HOST_LLVM`; all backends get `--target <host>`. Mismatch/failed
+  validation rows are `INVALID`, never `ok`; timed-run failures set exit 1.
+  `measure.py` now reports failure if *any* rep/warmup fails. `h_branch` starts
+  below threshold and compares before updating, so both arms run.
+- **Verification:** build 0; 65 suites / 25,368 passed / 0 failed; regressions
+  pass; heldout all inputs match LLVM; allaxes 15 programs compile/run.
+
 > Historical notes below predate the RIR removal. Entries mentioning `rakit-ir`,
 > `RIR`, `RirPass`, or `RAKIT_RIR_*` are archival and no longer describe the tree.
 

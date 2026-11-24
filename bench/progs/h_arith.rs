@@ -1,7 +1,7 @@
 // Held-out arithmetic: runtime trip count, no constant folding.
 fn main() {
-    let n: u64 = std::env::args().nth(1).unwrap().parse().unwrap();
-    let seed: u64 = std::env::args().nth(2).unwrap().parse().unwrap();
+    let n: u64 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(10000);
+    let seed: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(7);
     let mut acc = seed | 1;
     let mut z = 0u64;
     for i in 0..n {

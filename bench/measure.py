@@ -25,16 +25,21 @@ def run_once(cmd, env=None, stdin_devnull=True, cwd=None):
             "maxrss_kb": ru.ru_maxrss, "exit": code}
 
 def bench(name, cmd, reps=5, warmup=1, env=None, cwd=None):
+    first_bad = None
     for _ in range(warmup):
         r = run_once(cmd, env=env, cwd=cwd)
         if r["exit"] != 0:
             print(f"WARMUP FAIL {name}: exit={r['exit']}", file=sys.stderr)
+            if first_bad is None:
+                first_bad = r["exit"]
     runs = []
     for _ in range(reps):
         r = run_once(cmd, env=env, cwd=cwd)
         runs.append(r)
         if r["exit"] != 0:
             print(f"RUN FAIL {name}: {r}", file=sys.stderr)
+            if first_bad is None:
+                first_bad = r["exit"]
     def med(k): return statistics.median(x[k] for x in runs)
     def mn(k): return min(x[k] for x in runs)
     return {"name": name, "reps": reps,
@@ -42,7 +47,7 @@ def bench(name, cmd, reps=5, warmup=1, env=None, cwd=None):
             "user_med": med("user"), "sys_med": med("sys"),
             "cpu_med": med("user") + med("sys"),
             "maxrss_med_kb": med("maxrss_kb"), "maxrss_min_kb": mn("maxrss_kb"),
-            "exit": runs[-1]["exit"]}
+            "exit": first_bad if first_bad is not None else 0}
 
 if __name__ == "__main__":
     import argparse
