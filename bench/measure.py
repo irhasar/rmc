@@ -38,49 +38,54 @@ def same_output(path, expect):
 def bench(name, cmd, reps=5, warmup=1, env=None, cwd=None, expect=None):
     first_bad = None
     output_ok = True
+    capture_path = None
+    if expect is not None:
+        fd, capture_path = tempfile.mkstemp()
+        os.close(fd)
 
     def captured(kind):
         nonlocal output_ok
-        fd, path = tempfile.mkstemp()
-        os.close(fd)
-        try:
-            r = run_once(cmd, env=env, cwd=cwd, out_path=path)
-            if not same_output(path, expect):
-                print(f"OUTPUT MISMATCH {name}: {kind}", file=sys.stderr)
+        r = run_once(cmd, env=env, cwd=cwd, out_path=capture_path)
+        if not same_output(capture_path, expect):
+            print(f"OUTPUT MISMATCH {name}: {kind}", file=sys.stderr)
+            output_ok = False
+        return r
+
+    try:
+        for _ in range(warmup):
+            r = captured("warmup") if expect is not None else run_once(cmd, env=env, cwd=cwd, out_path=None)
+            if r["exit"] != 0:
+                print(f"WARMUP FAIL {name}: exit={r['exit']}", file=sys.stderr)
                 output_ok = False
-            return r
-        finally:
-            os.unlink(path)
+                if first_bad is None:
+                    first_bad = r["exit"]
 
-    for _ in range(warmup):
-        r = captured("warmup") if expect is not None else run_once(cmd, env=env, cwd=cwd, out_path=None)
-        if r["exit"] != 0:
-            print(f"WARMUP FAIL {name}: exit={r['exit']}", file=sys.stderr)
-            output_ok = False
-            if first_bad is None:
-                first_bad = r["exit"]
+        # Timed repetitions capture output too: discarding it to /dev/null would
+        # make a zero-exit mismatch in a timed run impossible to detect. The
+        # comparison runs in the parent after wait4; only the child's normal
+        # output write is part of the timed run.
+        runs = []
+        for _ in range(reps):
+            r = captured("run") if expect is not None else run_once(cmd, env=env, cwd=cwd, out_path=None)
+            runs.append(r)
+            if r["exit"] != 0:
+                print(f"RUN FAIL {name}: {r}", file=sys.stderr)
+                output_ok = False
+                if first_bad is None:
+                    first_bad = r["exit"]
 
-    # Timed repetitions never pay for output capture: they write to /dev/null
-    # and are checked for exit status only.
-    runs = []
-    for _ in range(reps):
-        r = run_once(cmd, env=env, cwd=cwd, out_path=None)
-        runs.append(r)
-        if r["exit"] != 0:
-            print(f"RUN FAIL {name}: {r}", file=sys.stderr)
-            output_ok = False
-            if first_bad is None:
-                first_bad = r["exit"]
-
-    # One untimed verification run catches output that changed after the warmup.
-    # Its timing and rusage are not added to `runs`, medians, or peak RSS.
-    if expect is not None:
-        r = captured("verify")
-        if r["exit"] != 0:
-            print(f"RUN FAIL {name}: verify exit={r['exit']}", file=sys.stderr)
-            output_ok = False
-            if first_bad is None:
-                first_bad = r["exit"]
+        # One untimed verification run catches output that changes only after
+        # the timed repetitions. It is not added to runs, medians, or peak RSS.
+        if expect is not None:
+            r = captured("verify")
+            if r["exit"] != 0:
+                print(f"RUN FAIL {name}: verify exit={r['exit']}", file=sys.stderr)
+                output_ok = False
+                if first_bad is None:
+                    first_bad = r["exit"]
+    finally:
+        if capture_path is not None:
+            os.unlink(capture_path)
 
     def med(k): return statistics.median(x[k] for x in runs)
     def mn(k): return min(x[k] for x in runs)

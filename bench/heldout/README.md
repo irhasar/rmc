@@ -24,7 +24,7 @@ The harness compiles with LLVM (`L`), upstream cg_clif (`U`), and Rakit (`M`),
 checks that every output matches LLVM, and prints compile wall/CPU/RSS/size
 plus run wall/CPU/RSS. `bench/allaxes.sh` uses the same `bench/validate.sh`
 step, so discovered held-out programs are gated the same way. During timing,
-`measure.py --expect` checks output on each warmup and on one post-measurement
-verification run, not on every repetition. Timed repetitions write to
-`/dev/null` and are checked only for exit status, so a workload whose output
-changes during measurement still produces no timing row.
+`measure.py --expect` checks output on each warmup, on every timed repetition,
+and on one post-measurement verification run. A zero-exit output change in any
+timed repetition sets `valid=false`, so a workload whose output changes during
+measurement produces no timing row.

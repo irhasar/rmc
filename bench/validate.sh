@@ -7,8 +7,8 @@
 # stdout and stderr are both captured, so a program that prints a diagnostic and
 # exits zero still fails when its output changes. Every harness must validate a
 # backend with the same arguments it later measures. During timing, measure.py
-# writes every timed repetition to /dev/null and checks output on each warmup
-# plus one post-measurement verification run, not on every repetition.
+# checks output on each warmup, every timed repetition, and one post-measurement
+# verification run; a zero-exit mismatch in any timed repetition is rejected.
 set -u
 mode=${1:?missing mode}
 ref=${2:?missing reference file}
