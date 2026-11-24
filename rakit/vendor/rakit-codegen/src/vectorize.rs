@@ -515,6 +515,9 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
         };
         match rhs_val {
             Rhs::IntConst(c) if c >= 0 && c < width => {}
+            // Uniform runtime amount: a loop-invariant scalar splatted to all
+            // lanes; the x64 lowering masks it like the scalar path.
+            Rhs::Scalar(_) => {}
             _ => return None,
         }
     }
