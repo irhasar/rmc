@@ -39,10 +39,8 @@ def bench(name, cmd, reps=5, warmup=1, env=None, cwd=None, expect=None):
     first_bad = None
     output_ok = True
 
-    def checked(kind):
+    def captured(kind):
         nonlocal output_ok
-        if expect is None:
-            return run_once(cmd, env=env, cwd=cwd)
         fd, path = tempfile.mkstemp()
         os.close(fd)
         try:
@@ -55,19 +53,35 @@ def bench(name, cmd, reps=5, warmup=1, env=None, cwd=None, expect=None):
             os.unlink(path)
 
     for _ in range(warmup):
-        r = checked("warmup")
+        r = captured("warmup") if expect is not None else run_once(cmd, env=env, cwd=cwd, out_path=None)
         if r["exit"] != 0:
             print(f"WARMUP FAIL {name}: exit={r['exit']}", file=sys.stderr)
+            output_ok = False
             if first_bad is None:
                 first_bad = r["exit"]
+
+    # Timed repetitions never pay for output capture: they write to /dev/null
+    # and are checked for exit status only.
     runs = []
     for _ in range(reps):
-        r = checked("run")
+        r = run_once(cmd, env=env, cwd=cwd, out_path=None)
         runs.append(r)
         if r["exit"] != 0:
             print(f"RUN FAIL {name}: {r}", file=sys.stderr)
+            output_ok = False
             if first_bad is None:
                 first_bad = r["exit"]
+
+    # One untimed verification run catches output that changed after the warmup.
+    # Its timing and rusage are not added to `runs`, medians, or peak RSS.
+    if expect is not None:
+        r = captured("verify")
+        if r["exit"] != 0:
+            print(f"RUN FAIL {name}: verify exit={r['exit']}", file=sys.stderr)
+            output_ok = False
+            if first_bad is None:
+                first_bad = r["exit"]
+
     def med(k): return statistics.median(x[k] for x in runs)
     def mn(k): return min(x[k] for x in runs)
     return {"name": name, "reps": reps,

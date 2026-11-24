@@ -3307,9 +3307,12 @@ setelah setiap pass, sehingga tidak ada analisis basi.
 `allaxes.sh` dan `heldout.sh`. Untuk setiap program, `L` dijalankan dengan
 argumen yang sama seperti saat pengukuran dan outputnya disimpan; `U` dan `M`
 wajib keluar dengan status 0 dan stdout+stderr identik dengan referensi `L`.
-Saat pengukuran, `measure.py --expect REF` juga menangkap output setiap warmup
-dan repetisi, sehingga run yang berubah di tengah pengukuran tidak menghasilkan
-baris timing. Baris runtime hanya dicetak setelah semua validasi lulus.
+Saat pengukuran, setiap repetisi yang diukur waktunya menulis stdout/stderr ke
+`/dev/null`. `measure.py --expect REF` memeriksa output setiap warmup dan satu
+run verifikasi pasca-pengukuran, bukan setiap repetisi; run verifikasi tidak
+masuk ke `runs`, median, maupun RSS. Dengan begitu run yang outputnya berubah
+di tengah pengukuran tetap ditolak tanpa menambah biaya capture pada repetisi
+yang diukur. Baris runtime hanya dicetak setelah semua validasi lulus.
 Kegagalan compile/run/mismatch menghasilkan `COMPILE_FAIL`, `RUN_FAIL`,
 `OUTPUT_MISMATCH`, atau `INVALID`; baris `COMPILE_FAIL` tetap menampilkan
 compile wall/CPU/RSS dengan ukuran `-`, sedangkan baris runtime gagal tidak
