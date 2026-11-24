@@ -76,6 +76,8 @@ check t_vectorize_multi 'm1 12776226417588255163 m2 15151514424346961891'
 check t_vectorize_ops 'add 17194792273410237731 sub 10846146650447627395'
 check t_vectorize_f32 $'n=1000 add=7083501190089957475 mul=16326997319991784275\nn=999 add=10593356097432088209 mul=10796855508119876121\nn=5 add=14995117245246052777 mul=3891769157468395945\nn=2 add=15738008312299960571 mul=18044256215840110843\nn=0 add=1469598103934665603 mul=1469598103934665603'
 check t_vectorize_i64 $'n=1000 add=17194792273410237731\nn=999 add=7573983905390497110\nn=3 add=5881159685710253342\nn=1 add=4957045732212500362\nn=0 add=1469598103934665603'
+check t_vectorize_f64 $'n=1000 add=12605502316359290979 mul=15193480026440175715\nn=999 add=16431287870010424977 mul=15840584383383207569\nn=5 add=4555731617307007401 mul=573423646804646313\nn=1 add=11364037426215188377 mul=671366010930788249\nn=0 add=1469598103934665603 mul=1469598103934665603'
+check t_vectorize_const 'u32mul=7406505972513382635 i64add=16879444138376719115 f32mul=10425260595837503587 f32sub=16288212200764297315'
 
 # Output equality alone cannot prove the vectorizer ran. Each fixture below
 # contains exactly one xor+imul loop, so a packed multiply (SSE2 lowering of
@@ -124,6 +126,18 @@ if command -v objdump >/dev/null 2>&1; then
         echo "[regression] t_vectorize_i64: missing paddq in i64ops" >&2
         fail=1
     fi
+    f64d=$(objdump -d --disassemble=f64ops "$TMP/t_vectorize_f64_M" --no-show-raw-insn 2>/dev/null)
+    if ! printf '%s\n' "$f64d" | grep -q addpd || ! printf '%s\n' "$f64d" | grep -q mulpd; then
+        echo "[regression] t_vectorize_f64: missing addpd/mulpd in f64ops" >&2
+        fail=1
+    fi
+    cd_=$(objdump -d --disassemble=constops "$TMP/t_vectorize_const_M" --no-show-raw-insn 2>/dev/null)
+    for ins in pmuludq paddq mulps subps; do
+        if ! printf '%s\n' "$cd_" | grep -q "$ins"; then
+            echo "[regression] t_vectorize_const: missing $ins in constops" >&2
+            fail=1
+        fi
+    done
 fi
 
 # A constant trip bound must still vectorize when the egraph rematerializes the

@@ -7,8 +7,8 @@
 //!
 //! Target: header `H(i: i64)` brifs on a trip `i < n` (constant or a
 //! loop-invariant runtime bound); single-block
-//! body `B` computes `c[i] = (a[i] {^,+,-} b[i]) [* K]` (u32), `{^,+,-}` (i64)
-//! or `{+,-,*,/}` (f32) for loop-invariant base
+//! body `B` computes `c[i] = (a[i] OP b[i]) [* K]` or `c[i] = a[i] OP K` for
+//! loop-invariant base
 //! pointers, `addr = base + (i << 2)` (u32 lanes), then `i += 1` and jumps `H`.
 //!
 //! The transform never edits `H`/`B`. It inserts a runtime disjointness guard
@@ -28,7 +28,7 @@ use alloc::vec::Vec;
 
 use crate::cursor::{Cursor, FuncCursor};
 use crate::ir::condcodes::IntCC;
-use crate::ir::immediates::Offset32;
+use crate::ir::immediates::{Ieee32, Ieee64, Offset32};
 use crate::ir::{
     self, Block, DataFlowGraph, Function, InstBuilder, Layout, MemFlagsData, Opcode, Value,
     ValueDef, types,
@@ -86,6 +86,7 @@ enum Lanes {
     U32,
     I64,
     F32,
+    F64,
 }
 
 impl Lanes {
@@ -96,6 +97,8 @@ impl Lanes {
             Some(Lanes::I64)
         } else if t == types::F32 {
             Some(Lanes::F32)
+        } else if t == types::F64 {
+            Some(Lanes::F64)
         } else {
             None
         }
@@ -105,26 +108,44 @@ impl Lanes {
             Lanes::U32 => types::I32X4,
             Lanes::I64 => types::I64X2,
             Lanes::F32 => types::F32X4,
+            Lanes::F64 => types::F64X2,
+        }
+    }
+    fn scalar(self) -> ir::Type {
+        match self {
+            Lanes::U32 => types::I32,
+            Lanes::I64 => types::I64,
+            Lanes::F32 => types::F32,
+            Lanes::F64 => types::F64,
         }
     }
     fn shift(self) -> i64 {
         match self {
             Lanes::U32 | Lanes::F32 => 2,
-            Lanes::I64 => 3,
+            Lanes::I64 | Lanes::F64 => 3,
         }
     }
     fn size(self) -> u64 {
         match self {
             Lanes::U32 | Lanes::F32 => 4,
-            Lanes::I64 => 8,
+            Lanes::I64 | Lanes::F64 => 8,
         }
     }
     fn per_vec(self) -> i64 {
         match self {
             Lanes::U32 | Lanes::F32 => 4,
-            Lanes::I64 => 2,
+            Lanes::I64 | Lanes::F64 => 2,
         }
     }
+}
+
+/// Second operand of the vector body: a second stream (two-source) or a
+/// broadcast constant (single-source).
+#[derive(Clone, Copy)]
+enum Rhs {
+    Mem(Value),
+    IntConst(i64),
+    FConst { bits: u64, is_f32: bool },
 }
 
 struct Plan {
@@ -132,11 +153,11 @@ struct Plan {
     preheader: Block,
     n: Bound,
     base_a: Value,
-    base_b: Value,
     base_c: Value,
     lanes: Lanes,
     op: Opcode,
     k: Option<i64>,
+    rhs: Rhs,
 }
 
 fn match_header(func: &Function, h: Block) -> Option<Plan> {
@@ -275,7 +296,7 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
             return None; // e.g. trapnz / division: the vector body would skip it
         }
     }
-    if loads.len() != 2 || stores.len() != 1 {
+    if loads.is_empty() || loads.len() > 2 || stores.len() != 1 {
         return None;
     }
     // Element type comes from the loads (both must agree) and fixes the lane
@@ -331,12 +352,12 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
         return None;
     }
 
-    // Store value: `combine(loadA, loadB)`, optionally `* K` (integer lanes only).
+    // Two shapes:
+    //   two sources: `combine(loadA, loadB)` [* K]   (K: u32 lanes only)
+    //   one source : `combine(loadA, const)` (commutative ops accept `const` on
+    //                either side; `-`/`/` require the load on the left).
     let (top, tx, ty) = binary(dfg, sargs[0])?;
-    let (op, lhs, rhs, k) = if top == Opcode::Imul {
-        if lanes != Lanes::U32 {
-            return None; // only u32 lanes have a packed multiply (pmuludq)
-        }
+    let (op, lhs, rhs, k) = if loads.len() == 2 && top == Opcode::Imul && lanes == Lanes::U32 {
         let (bx, kv) = if iconst_i64(dfg, ty).is_some() {
             (tx, ty)
         } else if iconst_i64(dfg, tx).is_some() {
@@ -351,26 +372,64 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
         (top, tx, ty, None)
     };
     let ok = match lanes {
-        Lanes::U32 | Lanes::I64 => matches!(op, Opcode::Bxor | Opcode::Iadd | Opcode::Isub),
-        Lanes::F32 => matches!(op, Opcode::Fadd | Opcode::Fsub | Opcode::Fmul | Opcode::Fdiv),
+        Lanes::U32 => matches!(op, Opcode::Bxor | Opcode::Iadd | Opcode::Isub | Opcode::Imul),
+        Lanes::I64 => matches!(op, Opcode::Bxor | Opcode::Iadd | Opcode::Isub),
+        Lanes::F32 | Lanes::F64 => {
+            matches!(op, Opcode::Fadd | Opcode::Fsub | Opcode::Fmul | Opcode::Fdiv)
+        }
     };
     if !ok {
         return None;
     }
-    let (la, lb) = (dfg.resolve_aliases(lhs), dfg.resolve_aliases(rhs));
-    let r0 = dfg.resolve_aliases(dfg.first_result(loads[0]));
-    let r1 = dfg.resolve_aliases(dfg.first_result(loads[1]));
-    // Keep operand order so `sub` (non-commutative) stays `lhs - rhs`.
-    let (base_lhs, base_rhs) = if la == r0 && lb == r1 {
-        (load_bases[0], load_bases[1])
-    } else if la == r1 && lb == r0 {
-        (load_bases[1], load_bases[0])
+
+    let (base_a, rhs_val) = if loads.len() == 2 {
+        let (la, lb) = (dfg.resolve_aliases(lhs), dfg.resolve_aliases(rhs));
+        let r0 = dfg.resolve_aliases(dfg.first_result(loads[0]));
+        let r1 = dfg.resolve_aliases(dfg.first_result(loads[1]));
+        // Keep operand order so `sub` (non-commutative) stays `lhs - rhs`.
+        let (base_lhs, base_rhs) = if la == r0 && lb == r1 {
+            (load_bases[0], load_bases[1])
+        } else if la == r1 && lb == r0 {
+            (load_bases[1], load_bases[0])
+        } else {
+            return None;
+        };
+        (base_lhs, Rhs::Mem(base_rhs))
     } else {
-        return None;
+        let r0 = dfg.resolve_aliases(dfg.first_result(loads[0]));
+        let (load_on_left, c) = if dfg.resolve_aliases(lhs) == r0 {
+            (true, rhs)
+        } else if dfg.resolve_aliases(rhs) == r0 {
+            (false, lhs)
+        } else {
+            return None;
+        };
+        if !load_on_left && !is_commutative(op) {
+            return None; // reject `K - a` / `K / a`
+        }
+        let cval = if let Some(ci) = iconst_i64(dfg, c) {
+            Rhs::IntConst(ci)
+        } else if let Some((bits, is_f32)) = fconst_bits(dfg, c) {
+            Rhs::FConst { bits, is_f32 }
+        } else {
+            return None;
+        };
+        match (&cval, lanes) {
+            (Rhs::IntConst(_), Lanes::U32 | Lanes::I64) => {}
+            (Rhs::FConst { is_f32, .. }, Lanes::F32) if *is_f32 => {}
+            (Rhs::FConst { is_f32, .. }, Lanes::F64) if !*is_f32 => {}
+            _ => return None,
+        }
+        (load_bases[0], cval)
     };
 
-    for &base in &[base_lhs, base_rhs, store_base] {
+    for &base in &[base_a, store_base] {
         if !defined_outside(dfg, &func.layout, base, h, b) {
+            return None;
+        }
+    }
+    if let Rhs::Mem(bb) = rhs_val {
+        if !defined_outside(dfg, &func.layout, bb, h, b) {
             return None;
         }
     }
@@ -379,12 +438,12 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
         h,
         preheader,
         n,
-        base_a: dfg.resolve_aliases(base_lhs),
-        base_b: dfg.resolve_aliases(base_rhs),
+        base_a: dfg.resolve_aliases(base_a),
         base_c: dfg.resolve_aliases(store_base),
         lanes,
         op,
         k,
+        rhs: rhs_val,
     })
 }
 
@@ -415,9 +474,14 @@ fn apply(func: &mut Function, p: Plan) {
             Bound::Runtime(v) => v,
         };
         let lbytes = cur.ins().imul(n, size);
-        let (pa, pb, pc) = (p.base_a, p.base_b, p.base_c);
+        let pc = p.base_c;
+        let mut srcs: Vec<Value> = Vec::new();
+        srcs.push(p.base_a);
+        if let Rhs::Mem(bb) = p.rhs {
+            srcs.push(bb);
+        }
         let mut ov = None;
-        for src in [pa, pb] {
+        for src in srcs {
             let d1 = cur.ins().isub(pc, src);
             let o1 = cur.ins().icmp(IntCC::UnsignedLessThan, d1, lbytes);
             let d2 = cur.ins().isub(src, pc);
@@ -429,8 +493,8 @@ fn apply(func: &mut Function, p: Plan) {
             });
         }
         let ov = ov.unwrap();
-        // `n*4` is only a faithful span when n < 2^62; for a larger runtime n the
-        // multiply wraps, so fall back to the scalar loop (treat as overlapping).
+        // `n*size` is only a faithful span when n < u64::MAX/size; for a larger
+        // runtime n the multiply wraps, so fall back to scalar (treat as overlap).
         let lim = cur.ins().iconst(types::I64, (u64::MAX / p.lanes.size()) as i64);
         let big = cur.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, n, lim);
         let ov = cur.ins().bor(ov, big);
@@ -457,16 +521,33 @@ fn apply(func: &mut Function, p: Plan) {
         let flags = MemFlagsData::new().with_notrap();
         let addr_a = cur.ins().iadd(p.base_a, off);
         let va = cur.ins().load(vt, flags, addr_a, Offset32::new(0));
-        let addr_b = cur.ins().iadd(p.base_b, off);
-        let vx = cur.ins().load(vt, flags, addr_b, Offset32::new(0));
+        let other = match p.rhs {
+            Rhs::Mem(bb) => {
+                let addr_b = cur.ins().iadd(bb, off);
+                cur.ins().load(vt, flags, addr_b, Offset32::new(0))
+            }
+            Rhs::IntConst(c) => {
+                let kc = cur.ins().iconst(p.lanes.scalar(), c);
+                cur.ins().splat(vt, kc)
+            }
+            Rhs::FConst { bits, is_f32 } => {
+                let fc = if is_f32 {
+                    cur.ins().f32const(Ieee32::with_bits(bits as u32))
+                } else {
+                    cur.ins().f64const(Ieee64::with_bits(bits))
+                };
+                cur.ins().splat(vt, fc)
+            }
+        };
         let combined = match p.op {
-            Opcode::Bxor => cur.ins().bxor(va, vx),
-            Opcode::Iadd => cur.ins().iadd(va, vx),
-            Opcode::Isub => cur.ins().isub(va, vx),
-            Opcode::Fadd => cur.ins().fadd(va, vx),
-            Opcode::Fsub => cur.ins().fsub(va, vx),
-            Opcode::Fmul => cur.ins().fmul(va, vx),
-            Opcode::Fdiv => cur.ins().fdiv(va, vx),
+            Opcode::Bxor => cur.ins().bxor(va, other),
+            Opcode::Iadd => cur.ins().iadd(va, other),
+            Opcode::Isub => cur.ins().isub(va, other),
+            Opcode::Imul => cur.ins().imul(va, other),
+            Opcode::Fadd => cur.ins().fadd(va, other),
+            Opcode::Fsub => cur.ins().fsub(va, other),
+            Opcode::Fmul => cur.ins().fmul(va, other),
+            Opcode::Fdiv => cur.ins().fdiv(va, other),
             _ => unreachable!(),
         };
         let val = match p.k {
@@ -509,6 +590,20 @@ fn iconst_i64(dfg: &DataFlowGraph, v: Value) -> Option<i64> {
         return None;
     };
     Some(imm.bits())
+}
+
+fn fconst_bits(dfg: &DataFlowGraph, v: Value) -> Option<(u64, bool)> {
+    let v = dfg.resolve_aliases(v);
+    let ValueDef::Result(inst, _) = dfg.value_def(v) else { return None };
+    match dfg.insts[inst] {
+        ir::InstructionData::UnaryIeee32 { imm, .. } => Some((imm.bits() as u64, true)),
+        ir::InstructionData::UnaryIeee64 { imm, .. } => Some((imm.bits(), false)),
+        _ => None,
+    }
+}
+
+fn is_commutative(op: Opcode) -> bool {
+    matches!(op, Opcode::Bxor | Opcode::Iadd | Opcode::Imul | Opcode::Fadd | Opcode::Fmul)
 }
 
 fn base_and_off(

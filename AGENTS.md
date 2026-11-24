@@ -259,6 +259,19 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
     n=1000/999/3/1/0) in address-taken fns; `regressions.sh` asserts
     `addps`/`mulps` in `f32ops` and `paddq` in `i64ops`. Probes: f32 add/mul and
     i64 add all match LLVM; `l3_*` checksums unchanged; ktime ~25.5 ms.
+  - **M3.5 LANDED: f64 lanes + single-source constant patterns.** A `Rhs` enum
+    (`Mem` / `IntConst` / `FConst`) lets the store value be
+    `combine(loadA, const)` as well as two-source. f64 lanes (`F64X2`, per_vec 2,
+    add/sub/mul/div). Integer single-source: u32 `a*K` (`pmuludq`), and
+    u32/i64 add/sub/xor with K; float single-source: f32/f64 `*K`, `+K`, `-K`,
+    `/K` (const on the right; commutative ops accept either side). Float
+    constants are read via `InstructionData::UnaryIeee32/64` bits
+    (`fconst_bits`). The disjointness guard now checks C against **every** `Mem`
+    source. New `t_vectorize_f64` (add+mul; n=1000/999/5/1/0) and
+    `t_vectorize_const` (u32*K, i64+K, f32*K, f32-K in one address-taken fn);
+    `regressions.sh` asserts `addpd`/`mulpd` in `f64ops` and
+    `pmuludq`/`paddq`/`mulps`/`subps` in `constops`. Probes: f64 add, u32*K,
+    f32*K, f32-K, i64+K all L==M; `l3_*` unchanged; ktime ~25 ms.
 
 ## Session (2026-11-24, branch `rakit-exp7`) — p9 reloads are real, but NOT soundly hoistable with the existing flags (alias tags don't move loads)
 
