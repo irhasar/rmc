@@ -30,10 +30,13 @@ pub fn run(
         result: Value,
         ty: Type,
     }
+    // Collect sin/cos call sites. Discovery only reads the layout, so iterate it
+    // directly rather than snapshotting the block/instruction lists into `Vec`s
+    // (which would allocate for every function, call-free ones included).
     let mut sins: Vec<Site> = vec![];
     let mut coss: Vec<Site> = vec![];
-    for block in func.layout.blocks().collect::<Vec<_>>() {
-        for inst in func.layout.block_insts(block).collect::<Vec<_>>() {
+    for block in func.layout.blocks() {
+        for inst in func.layout.block_insts(block) {
             let ir::InstructionData::Call { func_ref, args, .. } = func.dfg.insts[inst] else {
                 continue;
             };
