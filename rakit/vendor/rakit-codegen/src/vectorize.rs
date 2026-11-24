@@ -70,10 +70,19 @@ pub fn do_vectorize(func: &mut Function) -> bool {
     changed
 }
 
+/// Trip bound: a literal is rematerialized in the generated blocks (so it need
+/// not be defined outside the loop — the egraph may rematerialize constants in
+/// the header); a runtime value must be loop-invariant.
+#[derive(Clone, Copy)]
+enum Bound {
+    Const(i64),
+    Runtime(Value),
+}
+
 struct Plan {
     h: Block,
     preheader: Block,
-    n: Value,
+    n: Bound,
     base_a: Value,
     base_b: Value,
     base_c: Value,
@@ -104,20 +113,27 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
         return None;
     }
     let b = s0;
-    // Trip bound: accept a loop-invariant runtime value (dynamic length) as well
-    // as a constant. The vector gate `i+4 <= n` and the disjointness guard
-    // `|dst-src| >= n*4` both work for any runtime n; a runtime n == 0 simply
-    // falls through to the scalar tail (H), which does nothing. Only a constant
-    // zero/negative bound is rejected as pointless.
-    let n = dfg.resolve_aliases(cy);
-    if n == i || dfg.value_type(n) != types::I64 || !defined_outside(dfg, &func.layout, n, h, b) {
-        return None;
-    }
-    if let Some(c) = iconst_i64(dfg, n) {
-        if c <= 0 {
+    // Trip bound: a literal is rematerialized in the guard, so it does not need
+    // a dominating definition (the egraph rematerializes cheap constants at use
+    // sites, which can put the constant inside the loop header — e.g. with
+    // RAKIT_NO_LICM=1). A runtime bound must be loop-invariant (defined outside
+    // H/B) and of type i64. The `i+4 <= n` gate and `|dst-src| >= n*4` guard
+    // work for any runtime n; n == 0 falls through to the scalar tail.
+    let nv = dfg.resolve_aliases(cy);
+    let n = if let Some(c) = iconst_i64(dfg, nv) {
+        // n*4 must not overflow the span computation (see the guard's n<2^62 check).
+        if c <= 0 || c >= (1i64 << 62) {
             return None;
         }
-    }
+        Bound::Const(c)
+    } else {
+        if nv == i || dfg.value_type(nv) != types::I64
+            || !defined_outside(dfg, &func.layout, nv, h, b)
+        {
+            return None;
+        }
+        Bound::Runtime(nv)
+    };
     // The scalar header runs once per iteration; the vector loop bypasses it for
     // the vectorized prefix, so it must be effect-free (pure arithmetic + the
     // comparison only).
@@ -317,7 +333,11 @@ fn apply(func: &mut Function, p: Plan) {
         let mut cur = FuncCursor::new(func).at_bottom(g);
         let zero = cur.ins().iconst(types::I64, 0);
         let four = cur.ins().iconst(types::I64, 4);
-        let lbytes = cur.ins().imul(p.n, four);
+        let n = match p.n {
+            Bound::Const(c) => cur.ins().iconst(types::I64, c),
+            Bound::Runtime(v) => v,
+        };
+        let lbytes = cur.ins().imul(n, four);
         let (pa, pb, pc) = (p.base_a, p.base_b, p.base_c);
         let mut ov = None;
         for src in [pa, pb] {
@@ -332,6 +352,11 @@ fn apply(func: &mut Function, p: Plan) {
             });
         }
         let ov = ov.unwrap();
+        // `n*4` is only a faithful span when n < 2^62; for a larger runtime n the
+        // multiply wraps, so fall back to the scalar loop (treat as overlapping).
+        let lim = cur.ins().iconst(types::I64, 1i64 << 62);
+        let big = cur.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, n, lim);
+        let ov = cur.ins().bor(ov, big);
         cur.ins().brif(ov, h, &[zero.into()], vh, &[zero.into()]);
     }
 
@@ -339,7 +364,11 @@ fn apply(func: &mut Function, p: Plan) {
         let mut cur = FuncCursor::new(func).at_bottom(vh);
         let four = cur.ins().iconst(types::I64, 4);
         let nxt = cur.ins().iadd(vh_i, four);
-        let cond = cur.ins().icmp(IntCC::UnsignedLessThanOrEqual, nxt, p.n);
+        let n = match p.n {
+            Bound::Const(c) => cur.ins().iconst(types::I64, c),
+            Bound::Runtime(v) => v,
+        };
+        let cond = cur.ins().icmp(IntCC::UnsignedLessThanOrEqual, nxt, n);
         cur.ins().brif(cond, vb, &[vh_i.into()], h, &[vh_i.into()]);
     }
 

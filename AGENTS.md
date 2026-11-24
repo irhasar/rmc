@@ -216,6 +216,18 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
     unchanged. New `bench/tests/t_vectorize_dyn.rs` (opaque `black_box` bound →
     runtime path, `pmuludq` asserted). Gate: suite **65 / 25,368 / 0**;
     `allaxes` 15 progs all `ok` with **no runtime regression** (p1–p9/h_*).
+  - **M3.2 review fixes (literal vs runtime bound, overflow, tests).** A literal
+    bound is now `Bound::Const` and is **rematerialized in the guard**, so it
+    needs no dominating definition: with `RAKIT_NO_LICM=1` the egraph
+    rematerializes the constant into the loop header, which the earlier
+    `defined_outside` check wrongly rejected (constant-trip loops regressed to
+    scalar). Runtime bounds (`Bound::Runtime`) still require loop-invariance.
+    The guard also routes to scalar when `n >= 2^62`, so `n*4` cannot wrap.
+    Tests: `t_vectorize_dyn` covers runtime zero-trip / sub-vector (tail4) /
+    remainder (n=1001) / overlap (dst=src+1); `t_vectorize_multi` (two loops in
+    one function) asserts **>=4 `pmuludq`** (an early exit after the first match
+    would leave the second scalar); `regressions.sh` compiles `t_vectorize_unit`
+    with `RAKIT_NO_LICM=1` and requires `pmuludq`.
 
 ## Session (2026-11-24, branch `rakit-exp7`) — p9 reloads are real, but NOT soundly hoistable with the existing flags (alias tags don't move loads)
 
