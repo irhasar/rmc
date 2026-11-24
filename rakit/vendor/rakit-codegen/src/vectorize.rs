@@ -207,11 +207,15 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
     let s1 = blocks[1].block(&dfg.value_lists);
     // The body must be the *true* edge of `i < n` (the loop runs while i < n).
     // A body on the false edge means the loop runs while `i >= n`, which the
-    // vector gate `i+4 <= n` would invert.
-    if !(jumps_to(func, s0, h) && !jumps_to(func, s1, h)) {
-        return None;
+    // vector gate would invert. The body may span several straight-line blocks
+    // (`min`/`max` split the loads from the op+store), so follow the chain from
+    // the true edge back to `h`.
+    let chain = body_chain(func, s0, h)?;
+    if body_chain(func, s1, h).is_some() {
+        return None; // ambiguous: the false edge also returns to the header
     }
-    let b = s0;
+    let b = chain[0];
+    let last = *chain.last().unwrap();
     // Trip bound: a literal is rematerialized in the guard, so it does not need
     // a dominating definition (the egraph rematerializes cheap constants at use
     // sites, which can put the constant inside the loop header — e.g. with
@@ -227,7 +231,7 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
         Bound::Const(c)
     } else {
         if nv == i || dfg.value_type(nv) != types::I64
-            || !defined_outside(dfg, &func.layout, nv, h, b)
+            || !defined_outside_chain(dfg, &func.layout, nv, h, &chain)
         {
             return None;
         }
@@ -258,10 +262,10 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
         return None;
     }
     let ph = preds(func, h);
-    if ph.len() != 2 || !ph.contains(&b) {
+    if ph.len() != 2 || !ph.contains(&last) {
         return None;
     }
-    let preheader = *ph.iter().find(|x| **x != b)?;
+    let preheader = *ph.iter().find(|x| **x != last)?;
     let pterm = func.layout.last_inst(preheader)?;
     let ir::InstructionData::Jump { destination, .. } = dfg.insts[pterm] else {
         return None;
@@ -274,7 +278,7 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
         return None;
     }
     let init = pargs[0].as_value()?;
-    let bterm = func.layout.last_inst(b)?;
+    let bterm = func.layout.last_inst(last)?;
     let ir::InstructionData::Jump { destination: bnext, .. } = dfg.insts[bterm] else {
         return None;
     };
@@ -296,24 +300,26 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
 
     let mut loads = Vec::new();
     let mut stores = Vec::new();
-    for inst in func.layout.block_insts(b) {
-        if inst == bterm {
-            continue;
-        }
-        let op = dfg.insts[inst].opcode();
-        if op.is_call() || op.other_side_effects() {
-            return None;
-        }
-        if op.can_store() {
-            stores.push(inst);
-            continue;
-        }
-        if op.can_load() {
-            loads.push(inst);
-            continue;
-        }
-        if op.can_trap() {
-            return None; // e.g. trapnz / division: the vector body would skip it
+    for &blk in &chain {
+        for inst in func.layout.block_insts(blk) {
+            if inst == bterm {
+                continue;
+            }
+            let op = dfg.insts[inst].opcode();
+            if op.is_call() || op.other_side_effects() {
+                return None;
+            }
+            if op.can_store() {
+                stores.push(inst);
+                continue;
+            }
+            if op.can_load() {
+                loads.push(inst);
+                continue;
+            }
+            if op.can_trap() {
+                return None; // e.g. trapnz / division: the vector body would skip it
+            }
         }
     }
     if loads.is_empty() || loads.len() > 2 || stores.len() != 1 {
@@ -407,10 +413,30 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
             op,
             Opcode::Bxor | Opcode::Band | Opcode::Bor | Opcode::Iadd | Opcode::Isub
         ),
-        // u8/u16: exact bitwise/arith only (no packed multiply; no min/max on SSE2).
-        Lanes::U8 | Lanes::U16 => {
-            matches!(op, Opcode::Bxor | Opcode::Band | Opcode::Bor | Opcode::Iadd | Opcode::Isub)
-        }
+        // u8: exact arith + unsigned min/max (pminub/pmaxub are SSE2; signed
+        // byte min/max need SSE4.1, so smin/smax on I8 stay out).
+        Lanes::U8 => matches!(
+            op,
+            Opcode::Bxor
+                | Opcode::Band
+                | Opcode::Bor
+                | Opcode::Iadd
+                | Opcode::Isub
+                | Opcode::Umin
+                | Opcode::Umax
+        ),
+        // u16: exact arith + signed min/max (pminsw/pmaxsw are SSE2; unsigned
+        // word min/max need SSE4.1, so umin/umax on I16 stay out).
+        Lanes::U16 => matches!(
+            op,
+            Opcode::Bxor
+                | Opcode::Band
+                | Opcode::Bor
+                | Opcode::Iadd
+                | Opcode::Isub
+                | Opcode::Smin
+                | Opcode::Smax
+        ),
         Lanes::F32 | Lanes::F64 => {
             matches!(op, Opcode::Fadd | Opcode::Fsub | Opcode::Fmul | Opcode::Fdiv)
         }
@@ -449,7 +475,7 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
         } else if let Some((bits, is_f32)) = fconst_bits(dfg, c) {
             Rhs::FConst { bits, is_f32 }
         } else if dfg.value_type(c) == elem_ty
-            && defined_outside(dfg, &func.layout, c, h, b)
+            && defined_outside_chain(dfg, &func.layout, c, h, &chain)
         {
             Rhs::Scalar(c) // loop-invariant scalar broadcast
         } else {
@@ -466,12 +492,12 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
     };
 
     for &base in &[base_a, store_base] {
-        if !defined_outside(dfg, &func.layout, base, h, b) {
+        if !defined_outside_chain(dfg, &func.layout, base, h, &chain) {
             return None;
         }
     }
     if let Rhs::Mem(bb) = rhs_val {
-        if !defined_outside(dfg, &func.layout, bb, h, b) {
+        if !defined_outside_chain(dfg, &func.layout, bb, h, &chain) {
             return None;
         }
     }
@@ -844,6 +870,10 @@ fn apply(func: &mut Function, p: Plan) {
             Opcode::Iadd => cur.ins().iadd(va, other),
             Opcode::Isub => cur.ins().isub(va, other),
             Opcode::Imul => cur.ins().imul(va, other),
+            Opcode::Umin => cur.ins().umin(va, other),
+            Opcode::Umax => cur.ins().umax(va, other),
+            Opcode::Smin => cur.ins().smin(va, other),
+            Opcode::Smax => cur.ins().smax(va, other),
             Opcode::Fadd => cur.ins().fadd(va, other),
             Opcode::Fsub => cur.ins().fsub(va, other),
             Opcode::Fmul => cur.ins().fmul(va, other),
@@ -905,7 +935,17 @@ fn fconst_bits(dfg: &DataFlowGraph, v: Value) -> Option<(u64, bool)> {
 fn is_commutative(op: Opcode) -> bool {
     matches!(
         op,
-        Opcode::Bxor | Opcode::Band | Opcode::Bor | Opcode::Iadd | Opcode::Imul | Opcode::Fadd | Opcode::Fmul
+        Opcode::Bxor
+            | Opcode::Band
+            | Opcode::Bor
+            | Opcode::Iadd
+            | Opcode::Imul
+            | Opcode::Fadd
+            | Opcode::Fmul
+            | Opcode::Umin
+            | Opcode::Umax
+            | Opcode::Smin
+            | Opcode::Smax
     )
 }
 
@@ -979,6 +1019,62 @@ fn preds(func: &Function, target: Block) -> Vec<Block> {
         }
     }
     out
+}
+
+/// Follow a straight-line body chain from `start` back to `h`. Every block must
+/// have exactly one predecessor (the previous chain block, or `h` for the first),
+/// no block parameters, and end in an argument-less `jump`; the final block jumps
+/// to `h`. Returns the chain (`start` .. last, excluding `h`), or None.
+fn body_chain(func: &Function, start: Block, h: Block) -> Option<Vec<Block>> {
+    let dfg = &func.dfg;
+    let mut chain: Vec<Block> = Vec::new();
+    let mut cur = start;
+    let mut expect_pred = h;
+    loop {
+        if chain.len() > 16 || cur == h {
+            return None;
+        }
+        if !dfg.block_params(cur).is_empty() {
+            return None;
+        }
+        let p = preds(func, cur);
+        if p.len() != 1 || p[0] != expect_pred {
+            return None;
+        }
+        chain.push(cur);
+        let t = func.layout.last_inst(cur)?;
+        let ir::InstructionData::Jump { destination, .. } = dfg.insts[t] else {
+            return None; // brif / return / call: not a straight-line body
+        };
+        let nxt = destination.block(&dfg.value_lists);
+        if nxt == h {
+            return Some(chain);
+        }
+        if destination.args(&dfg.value_lists).count() != 0 {
+            return None;
+        }
+        expect_pred = cur;
+        cur = nxt;
+    }
+}
+
+fn defined_outside_chain(
+    dfg: &DataFlowGraph,
+    layout: &Layout,
+    v: Value,
+    h: Block,
+    chain: &[Block],
+) -> bool {
+    let v = dfg.resolve_aliases(v);
+    let inside = |blk: Block| blk == h || chain.contains(&blk);
+    match dfg.value_def(v) {
+        ValueDef::Result(inst, _) => match layout.inst_block(inst) {
+            Some(blk) => !inside(blk),
+            None => true,
+        },
+        ValueDef::Param(blk, _) => !inside(blk),
+        _ => true,
+    }
 }
 
 fn defined_outside(dfg: &DataFlowGraph, layout: &Layout, v: Value, h: Block, b: Block) -> bool {

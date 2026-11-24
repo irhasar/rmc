@@ -321,15 +321,17 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
     `/workspace/.rustup` + `/workspace/.cargo` (survives resets; export
     `RUSTUP_HOME`/`CARGO_HOME`/`PATH` accordingly) and throwaway probes live in
     `bench/out/probe` (inside the repo, not `/tmp`).
-  - **M4.1 investigated (min/max): blocked on multi-block bodies.** `u8::min` /
-    `i16::min` do lower to `Umin`/`Smin` (`pminub`/`pminsw` are SSE2-safe), but
-    the loop body is **split into two blocks**: block1 = two `Load` + address
-    `Iadd`, block2 = `Umin` + address `Iadd` + `Store` + `i+1`. `match_header`
-    only scans the single body block `b`, so it rejects (no `[vec]` elem log).
-    Supporting min/max needs a **multi-block body** matcher: walk a
-    straight-line chain `b → b2 → h`, gather loads/stores across it, and require
-    single predecessors, no block params, and no internal control flow. The
-    op-set/VB min/max additions were reverted to keep the tree at M4.0.
+  - **M4.1 LANDED: multi-block body matcher + u8/i16 min/max.** `match_header`
+    now follows a straight-line body chain `b → b2 → … → h` (`body_chain`): each
+    block has one predecessor (the previous chain block, or `h`), no block
+    params, and ends in an argument-less `jump`; loads/stores are gathered across
+    the chain and `defined_outside_chain` treats every chain block as inside. The
+    false edge must not also return to `h`. This unlocks `std` min/max, whose body
+    is split (loads in block1, op+store in block2). u8 unsigned min/max →
+    `pminub`/`pmaxub`, i16 signed min/max → `pminsw`/`pmaxsw` (SSE2-safe; signed
+    byte and unsigned word min/max need SSE4.1 and stay out). New
+    `t_vectorize_minmax` (n=1000/999/17/15/1/0); `regressions.sh` asserts the four
+    ops.
 
 ## Session (2026-11-24, branch `rakit-exp7`) — p9 reloads are real, but NOT soundly hoistable with the existing flags (alias tags don't move loads)
 
