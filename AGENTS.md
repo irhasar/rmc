@@ -3,29 +3,90 @@
 - **Goal shift:** the runtime gaps left (p2/h_mem hash+sort, p4 autovectorization,
   p1 saturating f64→u64) are the documented architectural wall, so this branch
   targets the **compile axis**, where M still loses to upstream U on `p2`/`h_mem`
-  because the custom passes run on every function.
-- **Structural pass guards** (`passes/mod.rs`): `if_convert`, `unroll` and
-  `rotate` skip functions that cannot contain their target. A two-way diamond
-  needs a head, two arms and a join (≥3 blocks); a loop needs a back edge (≥2
-  blocks). Most of the thousands of small std functions are single-block, and
-  the passes could only scan them and find nothing. Guard returns `false` (no
-  change) so the manager also skips analysis invalidation.
-  - **Zero IR change, proven:** the `p2_mem` binary md5 is byte-identical with
-    and without the guards. Compile win measured by A/B (reps=15):
-    `p2_mem` 161→159 ms wall / 223→219 cpu, `h_mem` 172→168 / 244→237,
-    `p4_simd` 104→103 / 130→127 (~1–3%).
+  because the custom passes run on every function. Runtime and size are unchanged
+  (full matrix below).
+- **Pass manager honours the change flag** (`pass.rs`): `PassManager::run` used to
+  call `analyses.invalidate()` after *every* pass regardless of the return value.
+  It now invalidates only when `run` returns `true`, so a pass that reports "no
+  change" keeps the cached CFG/dominator tree. Every other pass still returns
+  `true`, so their behaviour is unchanged; the new structural guards are the only
+  passes that return `false`.
+- **Structural pass guards** (`passes/mod.rs`): `if_convert` skips functions with
+  fewer than 3 blocks (a two-way diamond needs `then_block != else_block`, i.e.
+  head + two distinct arms) and `rotate` skips single-block functions (no distinct
+  latch). Both are **provably no-ops** on the skipped shapes.
+  - **NOT guarded: `unroll`.** `unroll::run` also performs the loop-independent
+    `narrow_uint_fcvt` rewrite (zero-extension / constant-mask proofs and the
+    dominator bound proofs), which applies to single-block functions too, so an
+    earlier single-block guard there was wrong and was removed.
+  - **Zero IR change, proven empirically:** with vs without the remaining guards,
+    the binaries for all 15 bench programs are **byte-identical** (md5).
 - **Rotate reorder** (`rotate.rs`): the cheap structural rejection (header must
   have non-empty params and some arm must pass them through unchanged) now runs
   *before* the region reachability walk. Most `brif` blocks are plain if/else
-  heads with no params, so this skips the walk for them. Rotate pass time on
-  `p2_mem`/`h_mem` cgu.1 drops 2.2–3.0 ms → **0.3–0.4 ms**; accepted loops are
-  identical, so the binary is again byte-identical (p2 md5 unchanged).
+  heads with no params, so this skips the walk. Rotate pass time on `p2_mem`/
+  `h_mem` cgu.1 drops 2.2–3.0 ms → **0.3–0.4 ms**; accepted loops are identical,
+  so the binary is byte-identical.
+- **Compile measurements vs the pre-guard tree** (median, reps≥7, wall/cpu ms):
+  `p2_mem` 161→159 / 223→219, `h_mem` 172→168 / 244→237, `p4_simd` 104→103 /
+  130→127 (~1–3%). Full three-way matrix below.
 - **Verification:** `./y.sh build` exit 0; `./y.sh test --sysroot rakit` → 65
-  suites / 25,368 passed / 0 failed (run on the guard build; the rotate reorder
-  is IR-identical so the result carries); `bench/allaxes.sh` 45/45 rows `ok`.
-  `p3_calls` output byte-identical, `fib` still rotated.
-- **Still true:** runtime parity on p1–p4 is backend work (regalloc, loop
-  vectorizer), not a pass. This branch does not change runtime.
+  suites / 25,368 passed / 0 failed; `bench/allaxes.sh` (CREPS=3 RREPS=7) →
+  45/45 rows `ok` (stdout validated vs LLVM). `fib` still rotated; p3 output
+  byte-identical.
+
+### Full all-axes matrix (`bench/allaxes.sh`, CREPS=3 RREPS=7)
+L = stock LLVM nightly, U = cg_clif upstream, M = modified Rakit. Compile =
+wall ms / cpu ms (user+sys) / peak RSS MB / artifact bytes. Run = wall ms /
+cpu ms / peak RSS MB. All stdout matched LLVM.
+
+| prog | bk | Cwall | Ccpu | Crss | size(B) | Rwall | Rcpu | Rrss |
+|------|----|------:|-----:|-----:|--------:|------:|-----:|-----:|
+| h_arith | L | 120 | 144 | 117.7 | 4617128 | 2 | 2 | 10.8 |
+| h_arith | U | 94 | 127 | 120.2 | 5839120 | 2 | 2 | 11.0 |
+| h_arith | M | 102 | 129 | 120.7 | 4078672 | 2 | 2 | 11.0 |
+| h_branch | L | 119 | 145 | 118.3 | 4616832 | 2 | 2 | 11.1 |
+| h_branch | U | 90 | 118 | 120.3 | 5837264 | 2 | 2 | 11.0 |
+| h_branch | M | 101 | 129 | 120.9 | 4077008 | 2 | 2 | 11.0 |
+| h_calls | L | 118 | 143 | 118.6 | 4616872 | 2 | 2 | 10.8 |
+| h_calls | U | 92 | 123 | 120.8 | 5837792 | 2 | 2 | 11.0 |
+| h_calls | M | 102 | 131 | 121.1 | 4077368 | 2 | 2 | 11.1 |
+| h_float | L | 128 | 151 | 116.9 | 4637984 | 2 | 2 | 11.0 |
+| h_float | U | 92 | 119 | 120.1 | 5861024 | 3 | 2 | 10.8 |
+| h_float | M | 112 | 132 | 120.2 | 4118168 | 2 | 2 | 10.8 |
+| h_mem | L | 273 | 442 | 138.2 | 4646848 | 3 | 3 | 11.0 |
+| h_mem | U | 146 | 200 | 136.0 | 5959856 | 10 | 9 | 10.8 |
+| h_mem | M | 170 | 241 | 137.4 | 4166120 | 5 | 4 | 11.1 |
+| h_simd | L | 146 | 170 | 124.3 | 4617704 | 2 | 2 | 11.0 |
+| h_simd | U | 101 | 130 | 125.4 | 5843736 | 4 | 4 | 11.1 |
+| h_simd | M | 112 | 141 | 126.3 | 4081096 | 3 | 2 | 10.8 |
+| p1_arith | L | 86 | 105 | 105.7 | 4635232 | 81 | 81 | 11.1 |
+| p1_arith | U | 82 | 105 | 108.9 | 5877944 | 108 | 108 | 10.8 |
+| p1_arith | M | 86 | 109 | 109.5 | 4146112 | 101 | 101 | 10.8 |
+| p2_mem | L | 250 | 383 | 133.6 | 4639888 | 17 | 17 | 11.0 |
+| p2_mem | U | 132 | 176 | 132.1 | 5936144 | 156 | 157 | 11.1 |
+| p2_mem | M | 163 | 223 | 133.7 | 4143368 | 49 | 48 | 10.8 |
+| p3_calls | L | 103 | 123 | 116.2 | 4612368 | 37 | 37 | 10.8 |
+| p3_calls | U | 92 | 119 | 117.7 | 5820136 | 116 | 115 | 11.0 |
+| p3_calls | M | 96 | 124 | 118.2 | 4067048 | 56 | 55 | 11.0 |
+| p4_simd | L | 109 | 129 | 116.5 | 4636096 | 55 | 55 | 48.2 |
+| p4_simd | U | 94 | 120 | 118.0 | 5892376 | 157 | 155 | 49.4 |
+| p4_simd | M | 104 | 129 | 119.0 | 4152736 | 85 | 85 | 48.8 |
+| p5_inline | L | 82 | 102 | 104.8 | 4609368 | 58 | 57 | 11.0 |
+| p5_inline | U | 77 | 107 | 107.5 | 5813704 | 895 | 894 | 11.1 |
+| p5_inline | M | 84 | 108 | 108.4 | 4059960 | 7 | 6 | 11.1 |
+| p6_scalar | L | 82 | 99 | 101.2 | 4609368 | 58 | 57 | 11.1 |
+| p6_scalar | U | 77 | 98 | 103.8 | 5813688 | 902 | 902 | 10.7 |
+| p6_scalar | M | 83 | 104 | 104.3 | 4059960 | 6 | 6 | 11.0 |
+| p7_branchy | L | 83 | 104 | 105.3 | 4609520 | 43 | 42 | 11.0 |
+| p7_branchy | U | 78 | 101 | 107.4 | 5813800 | 100 | 100 | 10.8 |
+| p7_branchy | M | 86 | 106 | 108.5 | 4060120 | 35 | 35 | 11.0 |
+| p8_minmax | L | 84 | 103 | 104.9 | 4609544 | 18 | 18 | 11.0 |
+| p8_minmax | U | 79 | 101 | 107.3 | 5813752 | 39 | 39 | 11.0 |
+| p8_minmax | M | 84 | 108 | 108.0 | 4060088 | 20 | 20 | 11.1 |
+| p9_u64f32 | L | 96 | 113 | 110.6 | 4635448 | 30 | 29 | 17.8 |
+| p9_u64f32 | U | 86 | 109 | 113.8 | 5886872 | 76 | 76 | 18.9 |
+| p9_u64f32 | M | 94 | 118 | 114.3 | 4149744 | 33 | 33 | 18.2 |
 
 ## Session (2026-11-24) — loop rotation pass (LANDED locally, p3 −5%)
 

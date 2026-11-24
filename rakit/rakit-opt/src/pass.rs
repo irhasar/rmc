@@ -41,8 +41,12 @@ impl<'a> PassManager<'a> {
 
     pub fn run(&mut self, pctx: &mut PassCtx<'_>) {
         for pass in &mut self.passes {
-            pass.run(pctx);
-            pctx.analyses.invalidate();
+            // Analyses only need rebuilding when a pass changed the function; a
+            // pass that reports `false` left the IR intact, so the cached CFG and
+            // dominator tree are still valid.
+            if pass.run(pctx) {
+                pctx.analyses.invalidate();
+            }
         }
     }
 }

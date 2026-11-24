@@ -84,10 +84,9 @@ impl Pass for UnrollPass {
     }
 
     fn run(&mut self, pctx: &mut PassCtx<'_>) -> bool {
-        // A loop needs a back edge, so a single-block function has none.
-        if pctx.ctx.func.layout.blocks().nth(1).is_none() {
-            return false;
-        }
+        // `unroll::run` also does the loop-independent `narrow_uint_fcvt` rewrite,
+        // which applies to any function, so it must not be skipped on small
+        // functions.
         passtime::time(passtime::UNROLL, || unroll::run(&mut pctx.ctx.func, pctx.analyses));
         true
     }
