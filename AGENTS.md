@@ -1,3 +1,96 @@
+## Session (2026-11-24, branch `rakit-exp7`) — p9 reloads are real, but NOT soundly hoistable with the existing flags (alias tags don't move loads)
+
+CLIF dump (`rustc-rakit --emit=llvm-ir` writes `<out>.rakit/<sym>.opt.rakit`).
+For p9 `main`, block5 hoists the addresses `v197 = stack_addr ss0+8` /
+`v198 = stack_addr ss0+16` (the `a: Vec` header) out of the loop, but block8
+still does `v31 = load.i64 notrap v197`, `v36 = load.i64 notrap v198` every
+iteration. So the reloads are **redundant loop-invariant stack loads** (addresses
+hoisted; only the loads repeat), not regalloc spills. Whether they can be
+removed soundly, corrected against the code:
+
+- **LICM's flag check comes first.** `hoist_from_loop` (`licm.rs:288-304`)
+  rejects a load unless `flags.readonly() && notrap() && can_move()`; only then
+  tests `safe = !any_opaque_store && !store_bases.contains(base)`. The header
+  loads are `notrap`-only, so they `continue` before any store/alias reasoning.
+- **Calls are NOT opaque stores, and `addr_base` reads the wrong store operand.**
+  `any_opaque_store` is set only by a `can_store()` opcode whose `addr_base` is
+  `None` (`licm.rs:257-266`); the `call` opcode is declared **without**
+  `can_store` (`instructions.rs:188-205`). But `addr_base`'s `Store` arm reads
+  `args[0]` (`licm.rs:372-386`), which by the `store(flags, x, p)` operand order
+  (`instructions.rs` "store": `x` then `p`) is the **stored value**, not the
+  destination (`args[1]`). So the `None` result reflects the value operand
+  (`v17`, the `sinf` result), so the scan established **nothing about the
+  destination** — a **real operand bug, now FIXED** (the address is `args[1]`;
+  see "Fix applied" below).
+- **Alias tags do not hoist loads (verified).** `process_inst`
+  (`alias_analysis.rs:1353-1389`) only rewires a load's *result* to an
+  already-known value when that value's definition **dominates** the load
+  (`domtree.dominates(def_inst, inst, ..)`); it never relocates the first load.
+  And `is_pure_for_egraph` (`inst_predicates.rs:44-58`, plain `Opcode::Load`
+  only) plus `hoist_from_loop` (`licm.rs:288-304`) both require the
+  `readonly && notrap && can_move` **flags** — neither treats an alias region as
+  permission to move a load. Alias regions affect egraph *reuse*, not movement.
+- **`readonly` is function-wide, so it cannot be set here.** Per
+  `memflags.rs:359-366`, a `readonly` load is UB if the memory is mutated **at
+  any time between function call and exit**. p9's `Vec` header is written during
+  `Vec` construction **before** the loop, so "not written in the loop" does **not**
+  justify `readonly` — marking these loads `readonly` is **unsound**.
+- **A flag-only build is not even the same experiment.** Marking a load
+  `readonly+notrap+can_move` makes it `is_pure_for_egraph`, and the egraph
+  **elaboration** can then hoist pure nodes out of loops
+  (`elaborate.rs:649-680`, `elaborate_licm_hoist`) **before** `hoist_from_loop`
+  ever checks opaque stores. So a flag-only change could hoist the loads via
+  elaboration, independent of any LICM change — a flag-only control build is
+  required to isolate the effect of a separate LICM patch.
+- **The cost of removing p9's reloads is UNMEASURED.** The `licm_loads`
+  experiment (REPORT.md §26.2) left the header loads in place (13 = 13 reloads in
+  both builds); its neutral timing does not measure removal. (REPORT §26.2
+  "Akar 1" also cited `sinf` as the opaque store — wrong; calls are not
+  `can_store`.)
+
+**Fix applied (exp7): `addr_base` now reads the store address.**
+`licm.rs` `addr_base`: `InstructionData::Store | StoreNoOffset { args, .. } =>
+args[1]` (the destination address) instead of `args[0]` (the stored value). This
+also covers `istore8/16/32` (same `formats.store`, `[x, p]` order) and
+`store_no_offset` (`[x, p]`). Effect on `hoist_from_loop` (`licm.rs:257-304`): a
+store whose **destination** is a static stack slot/global now populates
+`store_bases` instead of setting `any_opaque_store`; a dynamic-destination store
+(p9's `a[i]=`, dest `iadd`) still yields `None` → opaque. Soundness unchanged: a
+load must still pass `readonly && notrap && can_move`, and a store to the load's
+own base still blocks (`store_bases.contains(base)`). I did **not** mark the p9
+`Vec`-header loads `readonly` — unsound (header written before the loop;
+`memflags.rs:359-366`).
+- **Results:** Rakit-vs-LLVM stdout/exit identical on all 30 bench programs +
+  tests **except two pre-existing, unrelated** diffs — `t_panic` (rakit aborts on
+  the `catch_unwind` path; LICM-independent) and `t_tls` (only thread print order
+  differs; same values). **Full suite `./y.sh test --sysroot rakit`: 65 suites /
+  25,368 passed / 0 failed.** Codegen unit tests `cargo test -p rakit-codegen
+  --lib`: **203 passed / 0 failed** (incl.
+  `licm::tests::licm_does_not_split_a_multi_entry_loop_header` and the new
+  `licm::tests::addr_base_uses_store_destination`); the LICM differential
+  `bench/tests/t_licm.rs` matches LLVM. The new test is the direct regression
+  for the operand fix: a **static value stored through a dynamic pointer** must
+  classify as `None`, and a **dynamic value stored into a static stack slot**
+  must classify as `Some(StackSlot)`. It **fails** with the old `args[0]`
+  (verified) and passes with `args[1]`, so the operand choice is covered even
+  though p9 itself does not exercise it.
+- **Benchmark p9 (before → after):** `main.opt` `load` lines **9 → 9**, disasm
+  `(%rsp)` refs in `main` **13 → 13**, run CPU **34.5 → 33.6 ms** (within noise),
+  output identical. The fix is **NEUTRAL on p9** — expected: p9's loop store
+  destination is dynamic (still opaque) and `main.opt` has **0 `readonly`**
+  loads, so no load meets LICM's `readonly+notrap+can_move` gate. The bug was
+  real; the fix is correctness groundwork (accurate `store_bases`), not a
+  speedup, on the current code.
+
+**Conclusion — stop pursuing p9 reloads.** They are **not soundly removable**
+with the existing flags: `readonly` is unjustified (pre-loop init write), the
+in-loop `a[i]=` store is opaque to LICM because its **destination** (`v85 =
+iadd …`) is not a static stack/global base (correct after the fix), and alias
+tags cannot move a load. Removing them
+needs a finer, point-sensitive mechanism (e.g. memory regions proving "no write
+to this region after this point in this loop"), which is large. Do **not** re-try
+flag-only marking of these loads — it is unsound.
+
 ## Session (2026-11-24, branch `rakit-exp6`) — M1 premise re-checked: reload cause is UNVERIFIED (diagnose first)
 
 A review corrected several overclaims about *why* residual loads survive.
