@@ -39,6 +39,12 @@
     `RAKIT_UNROLL_DEBUG` IR dump now runs **before** `narrow_uint_fcvt`, so
     single-block functions are still dumped and the conversion diagnostics
     `narrow_uint_fcvt` prints have the function header above them.
+  - Review follow-ups: `rec_loop::try_match` now checks `is_self(fr1)` right
+    after the first `call_sub`, before scanning the second arm (logically
+    identical; `call_sub` reads `jump_target` first, so `return`-terminated
+    shapes bail O(1) with **no** instruction scan). `sincos::run` site discovery
+    iterates the layout directly instead of snapshotting blocks/insts into
+    `Vec`s (no per-function allocation, call-free ones included).
 - **Honest measurement:** these guards are **marginal**. A synthetic file with
   **800** single-block leaf functions compiles 144/197 ms with the guards vs
   145/198 ms without (~1 ms, within noise) — tiny functions are cheap per pass;
