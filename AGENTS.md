@@ -1,3 +1,46 @@
+## Session (2026-11-24, branch `rakit-exp7`) — diagnosis from the CLIF dump: p9 reloads are loop-invariant loads (not spills), blocked by the sinf call fence
+
+Diagnosed the surviving reloads by dumping post-egraph CLIF:
+`rustc-rakit --emit=llvm-ir` writes `<out>.rakit/<sym>.opt.rakit` (post codegen
+optimizer, pre-lowering) and `<sym>.unopt.rakit`.
+
+- **p9 `main` (`_RNv...9p9_u64f324main.opt.rakit`):** the loop-invariant part IS
+  hoisted — `block5` computes `v197 = stack_addr.i64 ss0+8` and
+  `v198 = stack_addr.i64 ss0+16` (the local `a: Vec` header) **outside** the
+  loop. But the **loads** `v31 = load.i64 notrap v197` and
+  `v36 = load.i64 notrap v198` still sit **inside** `block8`, once per iteration.
+  The body runs `block6` → `v17 = call fn2` (`; lib_call sinf`) → `block8`
+  (reload+bounds-check) → `block10` (`store.f32 notrap v17, v85` = `a[i]=..`) →
+  back edge to `block2`.
+  - **Correction:** these are **redundant loop-invariant stack loads**, NOT
+    "regalloc spills of loop invariants" (the earlier unverified claim). The
+    addresses are hoisted; only the loads repeat.
+- **Why they survive:** `has_memory_fence_semantics` (`alias_analysis.rs:93-105`)
+  treats **every `Call`/`CallIndirect`/`TryCall` as a fence** that clobbers all
+  regions, and the loop contains the `sinf` call. So even with alias regions the
+  invariant loads cannot be CSE'd across the call; and Rakit LICM (vendor
+  `licm.rs`) refuses to hoist loads past an opaque store/call. p9 is therefore
+  blocked by the **call fence**, not by missing regions.
+- **And p9 is sinf-latency-bound** (the call dominates each iteration),
+  consistent with the earlier neutral `licm_loads` experiment: removing 2
+  loads/iteration is invisible. **Conclusion: p9 is not a worthwhile target.**
+
+**Lever, narrowed by the evidence:** alias regions (a per-private-stack-slot
+region vs one shared heap region) can let the egraph CSE/hoist invariant stack
+loads across an in-loop **store** — but **only for call-free loops**, because
+calls are unconditional fences. Realistic targets are **p2** inner loops and
+**p4 L3** (`c[i]=(a[i]^b[i])*K`, no call) — the same L3 the vectorizer needs.
+Sound scheme: tag only slots whose address never escapes (reuse
+`store_forward`'s `private_slots` idea), tag all other loads/stores with one
+shared region, and leave calls as fences. APIs: `func.dfg.alias_regions`
+(`AliasRegionSet::insert(AliasRegionData{ user_id })`; `user_id` must be unique
+across a compilation when inlining) and `func.dfg.mem_flags[flags].set_alias_region`.
+
+**Next (implementation candidate):** an `alias_regions` CLIF pass with that
+sound scheme, validated first on a **call-free** store-loop microbench (confirm
+the invariant loads leave the loop in `.opt.rakit`, and 15/15 outputs + suite
+stay green), then measured. p9 is explicitly out of scope (call fence).
+
 ## Session (2026-11-24, branch `rakit-exp6`) — M1 premise re-checked: reload cause is UNVERIFIED (diagnose first)
 
 A review corrected several overclaims about *why* residual loads survive.
