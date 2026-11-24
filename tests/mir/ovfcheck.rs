@@ -9,8 +9,8 @@ include!("prelude.rs");
 // folded away at compile time.
 #[no_mangle]
 pub extern "C" fn main() -> i64 {
-    let a = arg(0);
-    let b = arg(1);
+    let a = arg(1);
+    let b = arg(2);
     out(a + b);
     out(a - b);
     out(a * b);

@@ -14,10 +14,13 @@ the only variable is the code generator. They must print identical stdout and
 exit with the same status. This is the suite that actually exercises the MIR
 path; `tests/run.py` covers the AST path.
 
-Usage: python3 tests/mir/run.py [-v]
+Usage: python3 tests/mir/run.py [-v] [case ...]
+
+With case names, only those cases run (and the `reject/` cases are skipped).
 """
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -29,6 +32,36 @@ OUT = "/tmp/rmcmirtests"
 # argv vectors per case. Each vector is one run; the case passes only if every
 # run matches. A case with no entry runs once with no arguments.
 ARGS = {
+    "regshare": [["5", "3"], ["-4", "9"], ["0", "0"]],
+    "bigindex": [["2"], ["-1"], ["6"]],
+    "cmpkinds": [["3"], ["9"], ["-5"], ["0"]],
+    "looprange": [["9", "5"], ["0", "7"], ["40", "-3"], ["2", "0"], ["30", "11"]],
+    "scalarstruct": [["3"], ["-11"], ["0"], ["40"]],
+    "selects": [["3"], ["4"], ["-7"], ["9"], ["0"], ["6"]],
+    "argshuffle": [["3", "5"], ["-8", "21"], ["0", "0"], ["13", "-2"]],
+    "mulconst": [["7"], ["-1"], ["922337203685477581"], ["-4611686018427387904"], ["255"], ["0"]],
+    "ranges": [["0"], ["7"], ["-95"], ["60"], ["-616"], ["300"]],
+    "stalefacts": [["3", "5", "0"], ["3", "1005", "0"], ["3", "5", "1"], ["3", "1005", "1"]],
+    # One shape per run (first argument), one runtime value (second). A value
+    # that wraps in the narrow signed type must make both sides exit 101.
+    "narrowrange": [["0", "126"], ["0", "4"], ["0", "-1"], ["1", "15"], ["1", "3"],
+                    ["2", "63"], ["2", "5"], ["3", "32766"], ["3", "10"],
+                    ["4", "240"], ["4", "255"], ["4", "3"]],
+    # The split must not sink `x = 2` below a read or write through a pointer
+    # to `x`; zero, one and several loop trips.
+    "splitptr": [["7", "0"], ["7", "1"], ["-3", "5"]],
+    # An address-taken local read through a pointer across a split loop.
+    "splitescaped": [["7", "0"], ["7", "1"], ["-3", "5"]],
+    # A narrow signed wrap must keep its bounds check (both shapes panic).
+    "narrowwrap": [["127"], ["1"], ["-127"], ["0"]],
+    # Static tuple arrays keep rustc's packed element stride.
+    "statictuple": [["1"], ["2"], ["0"]],
+    # Mixed-width tuples in arrays: the written element equal to, before and
+    # after the read one, and the last element (whose `.1` ends the array).
+    "tupleelem": [["1", "2"], ["2", "2"], ["3", "6"], ["6", "6"], ["0", "4"], ["4", "4"]],
+    # black_box over a float, a reference to an array, and a thin reference to
+    # a type whose name contains `str`.
+    "blackbox": [["3"], ["-2"], ["0"], ["10"]],
     "cmp": [["-5"], ["0"], ["7"]],
     "forloop": [["6"], ["0"]],
     "calls": [["10", "20", "30"]],
@@ -55,9 +88,37 @@ ARGS = {
     # ovfcheck runs with overflow checks on: the first vector is in range, the
     # second overflows the add and must exit 101 on both binaries.
     "ovfcheck": [["2", "3"], ["9223372036854775807", "1"]],
+    # A constant on the left of `-`: small, negative, zero and extreme operands,
+    # and a loop count (the second argument) of zero, one and several.
+    "constleft": [["6", "0"], ["-6", "1"], ["0", "5"], ["9223372036854775807", "3"],
+                  ["-9223372036854775808", "2"]],
+    # With overflow checks: `5 - i64::MIN` overflows and must exit 101 on both
+    # sides; `5 - 6` must not.
+    "constleftovf": [["6"], ["-9223372036854775808"], ["-9223372036854775807"]],
     # srread reads its loop bounds from argv, so run zero, one and several
     # iterations to catch the off-by-one the strength-reduce guard prevents.
     "srread": [["0"], ["1"], ["2"], ["7"], ["64"]],
+    # The counted-loop closure: zero, one, negative and large trip counts for
+    # each of the three bounds, so the zero-trip guard and the fold are both hit.
+    "loopcount": [["0", "0", "0"], ["1", "1", "1"], ["5", "-3", "9"], ["1000", "7", "-1"]],
+    "loopneg": [["0"], ["1"], ["6"], ["-4"]],
+    # `[v; n]` with byte, word and multi-word elements, read at runtime indices.
+    "repeatelem": [["10", "0"], ["-3", "5"], ["7", "3"]],
+    # Realistic workloads, at small sizes. Each one found a back-end bug: a
+    # constant-left `-` (nqueens), an `&mut [T; N]` parameter written after
+    # inlining (fannkuch, matmul), a memory-to-memory `cmp` (sort), duplicate
+    # local labels across functions (vm), and an 8-byte `[0u8; N]` splat
+    # (textparse).
+    "real_vm": [["200"], ["1"]],
+    "real_sort": [["2"]],
+    "real_hashmap": [["20000"]],
+    "real_bfs": [["2"]],
+    "real_life": [["30"]],
+    "real_nqueens": [["8"], ["1"]],
+    "real_fannkuch": [["7"]],
+    "real_matmul": [["2"]],
+    "real_textparse": [["3"]],
+    "real_particles": [["100"]],
     # float accumulates `n` half-steps; run the empty and non-empty loops.
     "float": [["0"], ["1"], ["5"], ["9"]],
     # resenum builds a `Result` at runtime: n > 0 takes `Ok`, n <= 0 takes
@@ -152,9 +213,11 @@ def build_reference(name, rt):
     ])
     if rc != 0:
         return None, f"rustc failed:\n{err.decode(errors='replace')}"
-    link = ["cc", "-static", "-nostdlib", "-no-pie", obj, rt]
-    if overflow_checks(name):
-        link.append(overflow_stubs(obj))
+    # Every case, not only the `.overflow` ones: a runtime index keeps a
+    # `panic_bounds_check` call in the reference even with overflow checks
+    # off, and its mangled name is toolchain-specific, so it is stubbed from
+    # the object's own `nm -u` like the overflow entries.
+    link = ["cc", "-static", "-nostdlib", "-no-pie", obj, rt, overflow_stubs(obj)]
     link += ["-o", ref]
     rc, _, err = run(link)
     if rc != 0:
@@ -162,19 +225,47 @@ def build_reference(name, rt):
     return ref, None
 
 
-def build_rmc(name):
+def build_rmc(name, binutils=False):
+    """Build with rmc. `binutils` assembles with GNU `as` and links with `ld`
+    instead of the in-process encoder: the two must accept the same assembly
+    and produce binaries that behave identically. Label collisions and
+    width-ambiguous instructions (`cmp $k, mem`) each made them disagree."""
     src = os.path.join(ROOT, f"{name}.rs")
-    mir = os.path.join(OUT, f"{name}.mir.bin")
+    mir = os.path.join(OUT, f"{name}.{'bu' if binutils else 'mir'}.bin")
     argv = [RMC, "--rustc-frontend", src, "-o", mir]
     if overflow_checks(name):
         argv.insert(2, "--overflow-checks")
+    if binutils:
+        argv.insert(2, "--binutils")
     rc, _, err = run(argv)
     if rc != 0:
-        return None, f"rmc failed:\n{err.decode(errors='replace')}"
+        return None, f"rmc{' --binutils' if binutils else ''} failed:\n{err.decode(errors='replace')}"
+    if binutils and b"Warning" in err:
+        return None, f"`as` warned about the generated assembly:\n{err.decode(errors='replace')}"
     return mir, None
 
 
 REJECT = os.path.join(ROOT, "reject")
+
+# A reject fixture declares the feature its diagnostic must name in a
+# `// expect: <text>` comment. Checking only for a `note:` would accept a
+# rejection for an unrelated construct, so the marker is required and its text
+# must appear in the note itself. The parser quotes the rejected statement,
+# which can contain the feature name (`black_box`), so a match anywhere in
+# stderr would pass even when the note names another limitation.
+EXPECT_RE = re.compile(r"^[ \t]*//[ \t]*expect:[ \t]*(.+?)[ \t]*$", re.MULTILINE)
+NOTE_RE = re.compile(r"^[ \t]*note:[ \t]*(.*)$", re.MULTILINE)
+
+
+def expected_feature(src):
+    with open(src, encoding="utf-8", errors="replace") as f:
+        m = EXPECT_RE.search(f.read())
+    return m.group(1) if m else None
+
+
+def note_text(msg):
+    """The text of every `note:` line, without the surrounding error/quoted line."""
+    return "\n".join(NOTE_RE.findall(msg))
 
 
 def run_reject_cases(verbose):
@@ -184,7 +275,9 @@ def run_reject_cases(verbose):
     construct must exit with status 1 and a message that names the feature, not
     a panic (status 101) or a stray `undefined symbol` from the linker. Each
     case is checked on both sides - the reference must build and run, so the
-    program is real, and rmc must fail with status 1.
+    program is real, and rmc must fail with status 1. The feature is the text
+    of the fixture's `// expect:` marker and must appear in the `note:` line,
+    so the test cannot pass on a rejection for some other construct.
     """
     if not os.path.isdir(REJECT):
         return 0, 0
@@ -209,6 +302,7 @@ def run_reject_cases(verbose):
         out_bin = os.path.join(OUT, f"{name}.rej.bin")
         rc, _, err = run([RMC, "--rustc-frontend", src, "-o", out_bin])
         msg = err.decode(errors="replace")
+        want = expected_feature(src)
         if rc == 0:
             print(f"FAIL reject/{name}: rmc accepted a construct it cannot compile")
             failures += 1
@@ -216,8 +310,16 @@ def run_reject_cases(verbose):
             print(f"FAIL reject/{name}: rmc exited {rc} (want a clean 1, not a "
                   f"panic/abort):\n{msg}")
             failures += 1
-        elif "note:" not in msg:
+        elif want is None:
+            print(f"FAIL reject/{name}: the fixture declares no `// expect:` "
+                  f"feature, so any `note:` would pass:\n{msg}")
+            failures += 1
+        elif not NOTE_RE.search(msg):
             print(f"FAIL reject/{name}: the error names no feature (no `note:`):\n{msg}")
+            failures += 1
+        elif want not in note_text(msg):
+            print(f"FAIL reject/{name}: the error's note does not name `{want}`, "
+                  f"so it rejected for another reason:\n{msg}")
             failures += 1
         elif verbose:
             print(f"ok   reject/{name}")
@@ -234,6 +336,12 @@ def main():
     )
     if not cases:
         sys.exit("no cases found")
+    only = [a for a in sys.argv[1:] if not a.startswith("-")]
+    if only:
+        unknown = [n for n in only if n not in cases]
+        if unknown:
+            sys.exit(f"unknown case(s): {', '.join(unknown)}")
+        cases = [n for n in cases if n in only]
 
     failures = 0
     skipped = 0
@@ -244,6 +352,8 @@ def main():
             failures += 1
             continue
         mir, err = build_rmc(name)
+        if not err:
+            bu, err = build_rmc(name, binutils=True)
         if err:
             print(f"FAIL {name}: {err}")
             failures += 1
@@ -253,9 +363,16 @@ def main():
         for argv in vectors:
             r_rc, r_out, _ = run([ref] + argv)
             m_rc, m_out, _ = run([mir] + argv)
+            b_rc, b_out, _ = run([bu] + argv)
             if r_rc != m_rc or r_out != m_out:
                 print(f"FAIL {name} {argv}: rustc rc={r_rc} out={r_out!r} | "
                       f"rmc rc={m_rc} out={m_out!r}")
+                bad = True
+                failures += 1
+                break
+            if (b_rc, b_out) != (m_rc, m_out):
+                print(f"FAIL {name} {argv}: in-process rc={m_rc} out={m_out!r} | "
+                      f"--binutils rc={b_rc} out={b_out!r}")
                 bad = True
                 failures += 1
                 break
@@ -265,7 +382,7 @@ def main():
 
     # `reject/` cases: rustc accepts, rmc must refuse cleanly. Counted
     # separately so the "N cases matched" line stays about the positive suite.
-    n_reject, reject_failures = run_reject_cases(verbose)
+    n_reject, reject_failures = (0, 0) if only else run_reject_cases(verbose)
     failures += reject_failures
 
     total = len(cases)

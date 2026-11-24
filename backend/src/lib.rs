@@ -55,23 +55,10 @@ struct RmcBackend;
 /// parser's `switchInt(OverflowChecks)` fold and the loop rewrites below change
 /// behavior with it.
 fn compile_mir_text(mir_text: &str, overflow_checks: bool) -> Result<Vec<u8>, String> {
-    let mut prog = rmc::mir::parse_with(mir_text, overflow_checks)
-        .map_err(|e| format!("rmc-mir: error: {e}"))?;
-    let opts = rmc::mir_codegen::Options { promote: true };
-    rmc::mir::tco(&mut prog, overflow_checks);
-    rmc::mir::inline_calls(&mut prog);
-    rmc::mir::coalesce_call_results(&mut prog);
-    rmc::mir::merge_blocks(&mut prog);
-    prog.copy_propagate();
-    rmc::mir::drop_redundant_asserts(&mut prog);
-    rmc::mir::licm(&mut prog);
-    rmc::mir::fold_accumulators(&mut prog);
-    rmc::mir::strength_reduce(&mut prog);
-    rmc::mir::close_counted_loops(&mut prog, overflow_checks);
-    rmc::mir::jump_thread(&mut prog);
-    rmc::mir::rotate_loops(&mut prog);
-    rmc::mir::layout_blocks(&mut prog);
-    let asm = rmc::compile_mir_to_asm(&prog, &opts)?;
+    // The same pass pipeline as `rmc --rustc-frontend`: one list, in the
+    // library, so the two routes cannot drift apart again.
+    let opts = rmc::MirOptions { overflow_checks, ..rmc::MirOptions::default() };
+    let asm = rmc::mir_text_to_asm(mir_text, &opts).map_err(|e| format!("rmc-mir: error: {e}"))?;
     rmc::elf::assemble(&asm)
 }
 

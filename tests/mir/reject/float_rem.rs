@@ -2,6 +2,8 @@
 #![no_main]
 include!("../prelude.rs");
 
+// expect: %
+
 // Float remainder is a *rejected* case. The note must not claim "floating-point
 // types are not implemented" (they are; see `float.rs`), only that `%` is.
 // rustc compiles the reference.

@@ -2,6 +2,8 @@
 #![no_main]
 include!("../prelude.rs");
 
+// expect: dyn Trait
+
 // A trait object is a *rejected* case: the vtable and the virtual call are not
 // implemented, and the rejection must be a clean error naming `dyn Trait`, not
 // a crash or a stray `undefined symbol` from the linker. rustc compiles this

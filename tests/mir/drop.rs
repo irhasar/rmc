@@ -10,7 +10,7 @@ impl Drop for Guard {
 
 #[no_mangle]
 pub extern "C" fn main() -> i64 {
-    let g = Guard { v: arg(0) + 42 };
+    let g = Guard { v: arg(1) + 42 };
     out(1);
     0
 }

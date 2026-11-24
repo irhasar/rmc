@@ -1,5 +1,10 @@
 # rmc compiler design
 
+> Source paths: the compiler is split into `front/` (lexer, parser, ast, sema,
+> consts), `opt/` (inline, tco, licm, dce), `x86/` (codegen, elf, runtime) and
+> `mir/` (the rustc-MIR route). A file named here without a directory lives in
+> one of those; `AGENTS.md` has the map.
+
 `rmc` is a single-pass-per-stage, ahead-of-time compiler for a Rust subset. It
 is deliberately small: no external crates, no LLVM, no libc. The whole pipeline
 is `source -> lexer -> parser -> sema -> inline -> tco -> licm -> codegen
