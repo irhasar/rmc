@@ -1,3 +1,54 @@
+## Session (2026-11-24, branch `rakit-exp8`) — post-`addr_base`-fix all-axes scoreboard (L/U/M); remaining gap is all large
+
+Ran the canonical matrix on the merged build (`cd bench && CREPS=2 RREPS=7
+./allaxes.sh`; log `/tmp/allaxes_now.log`). All rows `ok` (stdout validated
+against LLVM by the harness). Run/compile in ms, size in bytes; RSS ~equal
+(L≈M, U slightly higher). Run `L/U/M`; Compile `M/L`; Size `M/L`.
+
+| prog | run L/U/M | comp M/L | size M/L |
+|------|-----------|----------|----------|
+| h_arith  | 2/2/2     | 106/121 | 4078672/4617128 |
+| h_branch | 2/2/2     | 108/119 | 4077008/4616832 |
+| h_calls  | 2/2/2     | 106/118 | 4077368/4616872 |
+| h_float  | 2/2/2     | 106/128 | 4118168/4637984 |
+| h_mem    | 3/10/4    | 172/262 | 4166120/4646848 |
+| h_simd   | 2/4/2     | 120/143 | 4081096/4617704 |
+| p1_arith | 81/108/101|  94/86  | 4146112/4635232 |
+| p2_mem   | 16/156/48 | 164/243 | 4143368/4639888 |
+| p3_calls | 41/117/55 |  98/100 | 4067048/4612368 |
+| p4_simd  | 56/166/84 | 110/113 | 4152736/4636096 |
+| p5_inline| 58/896/7  |  88/85  | 4059960/4609368 |
+| p6_scalar| 58/902/6  |  88/91  | 4059960/4609368 |
+| p7_branchy| 43/100/35|  90/87  | 4060120/4609520 |
+| p8_minmax| 18/38/20  |  90/91  | 4060088/4609544 |
+| p9_u64f32| 30/76/33  | 100/96  | 4149744/4635448 |
+
+**Findings**
+- **Size: M wins on every program** (~4.06–4.16 MB vs L 4.61–4.64, U 5.81–5.96).
+- **Compile: M ≈ L** (M faster on p2 164 vs 243, h_mem 172 vs 262; within 5–10%
+  elsewhere) but **slower than U** (the extra first-party passes cost ~10–30 ms
+  on the big programs). RSS equal.
+- **Run: M wins p5 (7 vs 58), p6 (6 vs 58), p7 (35 vs 43); ties p8 (20 vs 18),
+  p9 (33 vs 30); loses p1 (101 vs 81), p2 (48 vs 16), p3 (55 vs 41), p4 (84 vs 56).**
+- The merged `addr_base` fix caused **no change** on any row (confirmed neutral
+  across all axes — expected: 0 eligible `readonly` loads, see `rakit-exp7`).
+
+**Where the remaining gap is (all large; no sound micro-lever left)**
+- p1: branchy saturating `f64→u64` (documented negative result; constants not
+  loop-invariant at `emit`).
+- p2: sort/hash codegen + regalloc spills (backend, not a pass).
+- p3: `fib` tree + `format!`/std::fmt (algorithmic/std-level).
+- p4: separate `sinf`/`cosf` + no loop vectorizer (needs alias-aware vectorizer).
+- The hot "reloads" in p9/p4 are `Vec` **stack headers** that are written at
+  construction **before** the loop → `readonly` is unsound; alias tags do not
+  move loads; the in-loop store/call is opaque to LICM. So per-iteration header
+  reloads are **not soundly removable** with the existing flags.
+- **Conclusion:** to "win everything" the remaining work is the **loop
+  vectorizer** (p1/p4) plus backend regalloc/compile-quality (p2) — multi-week
+  efforts, not knob-sized. Next big lever = a legality analysis + map-only
+  vectorizer for the call-free `c[i]=(a[i]^b[i])*K` shape (p4 L3); the float
+  L2 loop (`acc += a[i]*b[i]`) cannot be vectorized (Rust forbids f32 reassoc).
+
 ## Session (2026-11-24, branch `rakit-exp7`) — p9 reloads are real, but NOT soundly hoistable with the existing flags (alias tags don't move loads)
 
 CLIF dump (`rustc-rakit --emit=llvm-ir` writes `<out>.rakit/<sym>.opt.rakit`).
