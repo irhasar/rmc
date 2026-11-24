@@ -161,7 +161,7 @@ blocker to solve for M1.
   Cwall | Ccpu | Crss | size(B) | Rwall | Rcpu | Rrss`):** M's compile is faster
   than **LLVM** but **slower than upstream cg_clif (U)** — `h_arith` Cwall U **88**
   ms vs M **100** ms. M's **artifact size is smallest** in that matrix (e.g.
-  `h_arith` size L 4616832 / U 5839120 / M **4078672** B). Runtime M wins only
+  `h_arith` size L 4617128 / U 5839120 / M **4078672** B). Runtime M wins only
   **p5/p6/p7**, **loses p1/p2/p3/p4**, and the `h_*` rows are **not uniformly
   ties** — `h_mem` Rcpu L **3** ms vs M **4** ms (M loses runtime CPU to LLVM).
   Do not state "M wins compile" or "ties h_*" without the full L/U/M matrix
