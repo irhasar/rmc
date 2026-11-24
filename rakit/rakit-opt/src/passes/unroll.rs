@@ -390,10 +390,10 @@ pub fn run(func: &mut ir::Function, analyses: &mut crate::analyses::Analyses) {
         collapse_forwarders(func);
         analyses.invalidate();
     }
-    narrow_uint_fcvt(func, analyses);
-    if !multi_block {
-        return;
-    }
+    // Dump the IR before `narrow_uint_fcvt` so that single-block functions
+    // (which return below without a loop analysis) still get a dump, and so the
+    // conversion diagnostics `narrow_uint_fcvt` prints have the function header
+    // above them.
     if std::env::var_os("RAKIT_UNROLL_DEBUG").is_some() {
         eprintln!("[unroll] func {:?} blocks={}", func.name, func.layout.blocks().count());
         for b in func.layout.blocks() {
@@ -417,6 +417,10 @@ pub fn run(func: &mut ir::Function, analyses: &mut crate::analyses::Analyses) {
                 eprintln!("[unroll]   {b:?} {i:?} {}{}", func.dfg.insts[i].opcode(), extra);
             }
         }
+    }
+    narrow_uint_fcvt(func, analyses);
+    if !multi_block {
+        return;
     }
     let plan = analyze(func);
     let Some(plan) = plan else {

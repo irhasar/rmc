@@ -26,14 +26,19 @@
   build; output unchanged):**
   - `passtime`: new `REC_LOOP`/`SINCOS` slots (ACC 7→9) so those passes are now
     timed and visible (`rec_loop=0.2ms sincos=0.4ms` on p2/h_mem cgu.1).
-  - `RecLoopPass`/`SincosPass` adapters: check their disable switch first, then
-    skip the pass unless the function has an `Opcode::Call` (rec_loop matches
-    only self-recursion; sin/cos are calls), run inside the timer, and return
-    the pass's **real** result. `rec_loop::run`/`sincos::run` now return whether
-    they rewrote / fused anything.
+  - `RecLoopPass`/`SincosPass` adapters: check their disable switch first, run
+    the pass inside the timer, and return the pass's **real** result.
+    `rec_loop::run`/`sincos::run` now return whether they rewrote / fused
+    anything. **No opcode pre-scan** for these two: `rec_loop::try_match` already
+    rejects non-recursive functions at the entry terminator (O(1)) and
+    `sincos::run` already does a single cheap walk, so a full `Call` scan in
+    front would be slower for call-free straight-line functions.
   - `unroll::run`: skip `collapse_forwarders` and the loop `analyze` for
     **single-block** functions (no second block to forward to; a loop needs a
-    back edge across blocks). `narrow_uint_fcvt` still runs (loop-independent).
+    back edge across blocks). `narrow_uint_fcvt` still runs. The
+    `RAKIT_UNROLL_DEBUG` IR dump now runs **before** `narrow_uint_fcvt`, so
+    single-block functions are still dumped and the conversion diagnostics
+    `narrow_uint_fcvt` prints have the function header above them.
 - **Honest measurement:** these guards are **marginal**. A synthetic file with
   **800** single-block leaf functions compiles 144/197 ms with the guards vs
   145/198 ms without (~1 ms, within noise) — tiny functions are cheap per pass;
