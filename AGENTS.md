@@ -1,3 +1,34 @@
+## Session (2026-11-24, branch `rakit-exp6`) — M1 redefined: the gap is alias info, not a CSE pass
+
+Investigated the next documented step (M1: cross-block load CSE) before
+implementing it, and it is **the wrong lever**:
+
+- `enable_alias_analysis = true` (`settings.rs:501`) — the egraph's
+  **alias-analysis path** (`OptResult::AliasedLoad`, `egraph/mod.rs:549-565`) is
+  ON and performs **global** cross-block load elimination wherever it can prove
+  safety. That is why the block-local CSE pass in `rakit-exp5` produced
+  byte-identical binaries: same-address loads are already eliminated (via the
+  flags-gated GVN for `readonly` loads, or via this alias analysis).
+- The residual cross-block reloads survive because the alias analysis has **no
+  alias-region information**: `alias_region` / `with_alias_region` are **never
+  used** anywhere in `src/` or `rakit-opt/src/`, and ordinary loads are only
+  `notrap` (`value_and_place.rs:139/161/604`) — no `readonly`/`can_move`, no
+  region. So a new CSE pass would be **redundant** where the analysis already
+  proves safety, and **unsound** where it cannot (the surviving reloads are
+  exactly the ones a pass cannot safely merge).
+- Therefore **M1 = supply alias information** (alias regions / `noalias`
+  evidence in `MemFlags`), not write a CSE pass. This is also the prerequisite
+  for any loop vectorization: the distinct `Vec` buffers in p4 need non-aliasing
+  facts before L3 can be widened without a miscompile.
+- Separately, p9's per-iteration `a.ptr`/`a.len` reloads are **regalloc spills of
+  loop invariants** (§9.9), not redundant loads — no load pass removes them.
+
+**Revised near-term order:** (1) frontend → `MemFlags.alias_region` propagation
+so the existing egraph alias analysis can disambiguate distinct stack slots and
+`noalias`-proven buffers (largest safe win available; correctness-critical — a
+wrong region is a miscompile, so land in small gated steps); (2) only then a
+vectorizer. Do **not** implement a standalone load-CSE pass.
+
 ## Project kickoff (2026-11-24, branch `rakit-exp5`) — p4 loop autovectorizer (milestone plan)
 
 Started "opsi 2" (the big backend project) targeting `p4_simd` (M ~83 ms vs LLVM
