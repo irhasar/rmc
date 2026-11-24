@@ -93,8 +93,23 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
 - **Backend can do it:** x64 lowers vector `i32x4.imul` on baseline SSE2 —
   `pmulld` when SSE4.1, else a `pmuludq` sequence (`lower.isle:1166-1182`).
 - **LLVM vectorizes it** (binary: 14 `pmuludq`, 15 `paddd`, 54 `pxor`, 98
-  `pshufd`); Rakit does not (0 `pmuludq`, 8 `pxor`). **L3 in isolation: M 66.7 ms
-  vs L 28.3 ms (38 ms gap).**
+  `pshufd`); Rakit does not (0 `pmuludq`, 8 `pxor`).
+  **Phases measured separately (`bench/l3/ktime.rs`; internal `Instant`; best of
+  3; `sum` matches L vs M):** **L init 14.9 / kernel 22.7 / hash 4.7 ms; M init
+  43.2 / kernel 73.5 / hash 4.7 ms.** So the **kernel gap ≈3.2x** (22.7->73.5),
+  init is also **≈2.9x** slower in M (43.2 vs 14.9), hash is equal. These are
+  direct per-phase timings, *not* a kernel sample subtracted from whole-process
+  runs. Probe phase boundaries: **`init` includes allocation + fill of a,b,c;
+  `kernel` excludes the probe's 3 warmup passes.** The **fixtures `l3_iso`/`l3_bw`
+  have NO in-process warmup** — they run 20 passes directly — so their process
+  totals (`l3_iso` L 54.0 / M 138.8; `l3_bw` L 56.0 / M 141.4) = init + 20 passes
+  + hash + free/teardown/startup/`println`. The excess over the *probe's* phase
+  sum is free/teardown/startup/`println` (the probe's warmup is separate and is
+  NOT part of the fixtures). So the ~2.57x *process* ratio mixes init+kernel and
+  is **not** the kernel-only gap. 960 MB / 22.7 ms ≈ **42
+  GB/s** achievable here (the earlier "~19 GB/s" was a process average). Older
+  "66.7 vs 28.3" (init-conflated) and "49.9 vs 110.3" (last-element) are
+  **historical**. A 4-wide vectorized M can approach L's ~22.7 ms kernel.
 - **Blocker is CFG shape:** p4 L3 is **multi-block** — `block29` (bounds check
   `brif`) → `block30` (compute+store) → back-edge. Address `base + i*4`, induction
   `i`, `i'=i+1`.
@@ -109,10 +124,19 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
   to *all* stages, including the `bounds-free` M3.1 shape.
 - **Staged plan** (each stage gated by output validation vs LLVM + full suite,
   **and** by the universal disjointness gate above):
-  1. **M3.1** single-block, bounds-free map loop `dst[i]=(s1[i]^s2[i])*K` (u32),
-     multiple-of-4 fast path + scalar tail; emit `I32X4` (`imul.i32x4` + `splat`).
-     Validated on a synthetic `get_unchecked` microbench (still subject to the
-     disjointness gate — the microbench uses distinct, non-overlapping buffers).
+  1. **M3.1** target = the raw-pointer map loop verified in CLIF: header
+     `block2(i)` brifs on a constant trip count; **single-block body**
+     `addr = base + (i<<2)` with loop-invariant bases, `load.i32` x2, `bxor`,
+     `imul` by const, `store.i32`, `i+=1`, `jump header`. Design: **runtime
+     disjointness guard** routes either to a new `I32X4` vector loop
+     (`imul.i32x4` + `splat`; 4 elems/iter, `i+=4`) or to the **original scalar
+     loop**; the original loop is **reused as the scalar tail** (re-enter its
+     header at `i` for `n % 4`), so the scalar loop is not duplicated. Fixtures
+     live in `bench/l3/` (excluded from the held-out `progs/h*.rs` argv sweep; run
+     via `bench/allaxes.sh "$PWD/bench/l3/l3_*.rs"`; the kernel-only timing probe is `bench/l3/ktime.rs`, run separately): `l3_iso` (disjoint fast path),
+     `l3_tail` (trip not divisible by 4 -> remainder), `l3_overlap` (dst overlaps
+     sources -> must fall back to scalar), `l3_bw` (reference). Each hashes **all**
+     output elements so every store is checked, not just the last.
   2. **M3.2** handle the bounds-check multi-block shape (hoist `i+3 < n` or require
      bound = slice length so checks are redundant); the disjointness proof is the
      universal gate above. Only then is p4 unlocked safely.
