@@ -22,11 +22,14 @@ removed soundly, corrected against the code:
   (`v17`, the `sinf` result), so the scan established **nothing about the
   destination** — a **real operand bug, now FIXED** (the address is `args[1]`;
   see "Fix applied" below).
-- **Alias tags do not hoist loads.** `process_inst`
-  (`alias_analysis.rs:1353-1389`) can reuse a *dominating* matching value but
-  cannot move the first load; `is_pure_for_egraph` (`inst_predicates.rs:44-58`)
-  and `hoist_from_loop` gate on `readonly+notrap+can_move` **flags**, not on an
-  alias region. Alias regions only help egraph reuse, not movement.
+- **Alias tags do not hoist loads (verified).** `process_inst`
+  (`alias_analysis.rs:1353-1389`) only rewires a load's *result* to an
+  already-known value when that value's definition **dominates** the load
+  (`domtree.dominates(def_inst, inst, ..)`); it never relocates the first load.
+  And `is_pure_for_egraph` (`inst_predicates.rs:44-58`, plain `Opcode::Load`
+  only) plus `hoist_from_loop` (`licm.rs:288-304`) both require the
+  `readonly && notrap && can_move` **flags** — neither treats an alias region as
+  permission to move a load. Alias regions affect egraph *reuse*, not movement.
 - **`readonly` is function-wide, so it cannot be set here.** Per
   `memflags.rs:359-366`, a `readonly` load is UB if the memory is mutated **at
   any time between function call and exit**. p9's `Vec` header is written during
