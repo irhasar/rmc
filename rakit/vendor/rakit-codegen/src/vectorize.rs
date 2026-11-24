@@ -48,6 +48,19 @@ pub fn enabled() -> bool {
     }
 }
 
+/// Whether to run the Cranelift verifier after vectorizing (`RAKIT_VEC_VERIFY`).
+pub fn verify_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static VERIFY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *VERIFY.get_or_init(|| std::env::var_os("RAKIT_VEC_VERIFY").is_some())
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        false
+    }
+}
+
 /// Vectorize every canonical loop in `func`. Returns whether the CFG changed
 /// (the caller must recompute cfg/domtree when it did).
 ///
@@ -828,6 +841,9 @@ fn apply(func: &mut Function, p: Plan) {
     let vh_i = func.dfg.append_block_param(vh, types::I64);
     let vb_i = func.dfg.append_block_param(vb, types::I64);
     let mut vbound: Option<Value> = None;
+    let mut vother: Option<Value> = None;
+    let vt = p.lanes.vec();
+    let is_shift = matches!(p.op, Opcode::Ishl | Opcode::Ushr | Opcode::Sshr);
 
     let pterm = func.layout.last_inst(p.preheader).unwrap();
     func.layout.remove_inst(pterm);
@@ -858,6 +874,23 @@ fn apply(func: &mut Function, p: Plan) {
         .collect();
     {
         let mut cur = FuncCursor::new(func).at_bottom(g);
+        // Broadcast a constant/scalar operand once here, not once per chunk.
+        vother = match p.rhs {
+            Rhs::IntConst(c) if !is_shift => {
+                let kc = cur.ins().iconst(p.lanes.scalar(), c);
+                Some(cur.ins().splat(vt, kc))
+            }
+            Rhs::FConst { bits, is_f32 } if !is_shift => {
+                let fc = if is_f32 {
+                    cur.ins().f32const(Ieee32::with_bits(bits as u32))
+                } else {
+                    cur.ins().f64const(Ieee64::with_bits(bits))
+                };
+                Some(cur.ins().splat(vt, fc))
+            }
+            Rhs::Scalar(v) if !is_shift => Some(cur.ins().splat(vt, v)),
+            _ => None,
+        };
         // Bounds checks are hoisted out of the vector body by clamping the
         // vector loop to `min(n, len...)`; the checked scalar loop keeps the
         // original panic behaviour for the tail.
@@ -878,7 +911,10 @@ fn apply(func: &mut Function, p: Plan) {
             cur.ins().jump(vh, &[p.init.into()]);
         } else {
             let size = cur.ins().iconst(types::I64, p.lanes.size() as i64);
-            let lbytes = cur.ins().imul(sb, size);
+            // Only [start, bound) is touched; using the whole range would bail
+            // out when just the untouched prefix overlaps another buffer.
+            let span = cur.ins().isub(sb, p.init);
+            let lbytes = cur.ins().imul(span, size);
             let pc = p.base_c;
             let mut ov = None;
             for src in srcs {
@@ -896,7 +932,7 @@ fn apply(func: &mut Function, p: Plan) {
             // `n*size` is only a faithful span when n < u64::MAX/size; for a
             // larger runtime n the multiply wraps, so fall back to scalar.
             let lim = cur.ins().iconst(types::I64, (u64::MAX / p.lanes.size()) as i64);
-            let big = cur.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, sb, lim);
+            let big = cur.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, span, lim);
             let ov = cur.ins().bor(ov, big);
             cur.ins().brif(ov, h, &[p.init.into()], vh, &[p.init.into()]);
         }
@@ -934,24 +970,13 @@ fn apply(func: &mut Function, p: Plan) {
             }
         } else {
             match p.rhs {
-            Rhs::Mem(bb) => {
-                let addr_b = cur.ins().iadd(bb, off);
-                cur.ins().load(vt, flags, addr_b, Offset32::new(0))
-            }
-            Rhs::IntConst(c) => {
-                let kc = cur.ins().iconst(p.lanes.scalar(), c);
-                cur.ins().splat(vt, kc)
-            }
-            Rhs::FConst { bits, is_f32 } => {
-                let fc = if is_f32 {
-                    cur.ins().f32const(Ieee32::with_bits(bits as u32))
-                } else {
-                    cur.ins().f64const(Ieee64::with_bits(bits))
-                };
-                cur.ins().splat(vt, fc)
-            }
-            Rhs::Scalar(v) => cur.ins().splat(vt, v),
-            Rhs::Double => va,
+                Rhs::Mem(bb) => {
+                    let addr_b = cur.ins().iadd(bb, off);
+                    cur.ins().load(vt, flags, addr_b, Offset32::new(0))
+                }
+                Rhs::Double => va,
+                // Constant/scalar operands are broadcast once in the guard.
+                _ => vother.expect("broadcast operand hoisted in the guard"),
             }
         };
         let combined = match p.op {
@@ -1145,12 +1170,18 @@ fn body_chain_checked(
         if !dfg.block_params(cur).is_empty() {
             return None;
         }
-        let p = preds(func, cur);
-        if p.len() != 1 || p[0] != expect_pred {
+        let t = func.layout.last_inst(cur)?;
+        if !matches!(
+            dfg.insts[t],
+            ir::InstructionData::Jump { .. } | ir::InstructionData::Brif { .. }
+        ) {
+            return None;
+        }
+        let q = preds(func, cur);
+        if q.len() != 1 || q[0] != expect_pred {
             return None;
         }
         chain.push(cur);
-        let t = func.layout.last_inst(cur)?;
         match &dfg.insts[t] {
             ir::InstructionData::Jump { destination, .. } => {
                 let nxt = destination.block(&dfg.value_lists);
@@ -1252,11 +1283,15 @@ fn body_chain(func: &Function, start: Block, h: Block) -> Option<Vec<Block>> {
         if p.len() != 1 || p[0] != expect_pred {
             return None;
         }
-        chain.push(cur);
         let t = func.layout.last_inst(cur)?;
         let ir::InstructionData::Jump { destination, .. } = dfg.insts[t] else {
             return None; // brif / return / call: not a straight-line body
         };
+        let q = preds(func, cur);
+        if q.len() != 1 || q[0] != expect_pred {
+            return None;
+        }
+        chain.push(cur);
         let nxt = destination.block(&dfg.value_lists);
         if nxt == h {
             return Some(chain);

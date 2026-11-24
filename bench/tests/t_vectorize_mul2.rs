@@ -26,8 +26,12 @@ fn ck(v: &[u64]) -> u64 {
 fn main() {
     for &raw in &[1000usize, 999, 5, 2, 0] {
         let n = std::hint::black_box(raw);
-        let a: Vec<u32> = (0..n).map(|i| (i as u32).wrapping_mul(7) ^ 0x1234).collect();
-        let b: Vec<u32> = (0..n).map(|i| (i as u32).wrapping_mul(13) ^ 0x99).collect();
+        let a: Vec<u32> = (0..n)
+            .map(|i| (i as u32).wrapping_mul(0x9E37_79B9) ^ 0x5bf0_3635)
+            .collect();
+        let b: Vec<u32> = (0..n)
+            .map(|i| (i as u32).wrapping_mul(0x85EB_CA6B) ^ 0x27d4_eb2f)
+            .collect();
         let mut c = vec![0u32; n];
         let f: unsafe extern "C" fn(*const u32, *const u32, *mut u32, usize) = mul2;
         unsafe { f(a.as_ptr(), b.as_ptr(), c.as_mut_ptr(), n) };

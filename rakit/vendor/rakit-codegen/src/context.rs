@@ -208,8 +208,7 @@ impl Context {
                 && isa.name() == "x64"
                 && crate::vectorize::do_vectorize(&mut self.func)
             {
-                #[cfg(feature = "std")]
-                if std::env::var_os("RAKIT_VEC_VERIFY").is_some() {
+                if crate::vectorize::verify_enabled() {
                     crate::verifier::verify_function(&self.func, isa)
                         .expect("vectorized function fails verification");
                 }

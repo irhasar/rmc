@@ -67,6 +67,14 @@ fn main() {
         let mut af = fb.clone();
         unsafe { f(af.as_mut_ptr(), n) };
         hs[3] = ck(&af.iter().map(|x| x.to_bits() as u64).collect::<Vec<_>>());
-        println!("n={} {} {} {} {}", n, hs[0], hs[1], hs[2], hs[3]);
+        // `pb` starts one element *before* `pa`: partially overlapping, so this
+        // must take the scalar fallback and still match LLVM byte for byte.
+        let mut buf = base.clone();
+        let f: FU2 = inplace_add2;
+        if n >= 1 {
+            unsafe { f(buf.as_mut_ptr().add(1), buf.as_ptr(), n - 1) };
+        }
+        let mix = ck(&buf.iter().map(|x| *x as u64).collect::<Vec<_>>());
+        println!("n={} {} {} {} {} mix={}", n, hs[0], hs[1], hs[2], hs[3], mix);
     }
 }

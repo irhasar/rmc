@@ -50,6 +50,12 @@ fn main() {
         let f: unsafe extern "C" fn(*const f32, *mut f32, f32, usize) = fscale;
         unsafe { f(af.as_ptr(), cf.as_mut_ptr(), kf, n) };
         let h3 = ck(&cf.iter().map(|x| x.to_bits() as u64).collect::<Vec<_>>());
-        println!("n={} mul={} add={} fmul={}", n, h1, h2, h3);
+        let mut ov = vec![0u32; n];
+        let f: unsafe extern "C" fn(*const u32, *mut u32, u32, usize) = scalemul;
+        if n >= 1 {
+            unsafe { f(a.as_ptr(), ov.as_mut_ptr().add(1), k, n - 1) };
+        }
+        let h4 = ck(&ov.iter().map(|x| *x as u64).collect::<Vec<_>>());
+        println!("n={} mul={} add={} fmul={} ov={}", n, h1, h2, h3, h4);
     }
 }

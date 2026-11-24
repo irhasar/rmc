@@ -37,6 +37,28 @@ pub unsafe extern "C" fn mul8(pa: *const u32, pc: *mut u32, n: usize) {
         i += 1;
     }
 }
+// Two header parameters only: the purity guard (not the parameter count) must
+// reject this, because the header stores the counter.
+#[inline(never)]
+#[no_mangle]
+pub unsafe extern "C" fn sum_ctr2(pa: *const u32, ctr: *mut u32, n: usize) -> u32 {
+    let mut s = 0u32;
+    let mut i = 0usize;
+    while {
+        *ctr = i as u32;
+        i < n
+    } {
+        s = s.wrapping_add(*pa.add(i));
+        i += 1;
+    }
+    s
+}
+// The result is discarded: the volatile read must still happen.
+#[inline(never)]
+#[no_mangle]
+pub unsafe extern "C" fn vol_discard(pa: *const u8) {
+    let _ = core::ptr::read_volatile(pa);
+}
 #[inline(never)]
 #[no_mangle]
 pub unsafe extern "C" fn vol_loop(pa: *const u8, pc: *mut u8, n: usize) {
@@ -72,14 +94,22 @@ fn main() {
         let m8: unsafe extern "C" fn(*const u32, *mut u32, usize) = mul8;
         unsafe { m8(a.as_ptr(), o2.as_mut_ptr(), n) };
         let h8 = ck(&o2.iter().map(|x| *x as u64).collect::<Vec<_>>());
+        let mut ctr2 = 0u32;
+        let f2: unsafe extern "C" fn(*const u32, *mut u32, usize) -> u32 = sum_ctr2;
+        let s2 = unsafe { f2(a.as_ptr(), &mut ctr2, n) };
+        let vd: unsafe extern "C" fn(*const u8) = std::hint::black_box(vol_discard);
+        let one = [7u8; 1];
+        unsafe { vd(one.as_ptr()) };
         println!(
-            "n={} sum={} ctr={} vol={} mul2={} mul8={}",
+            "n={} sum={} ctr={} vol={} mul2={} mul8={} sum2={} ctr2={}",
             n,
             s,
             ctr,
             ck(&ob.iter().map(|x| *x as u64).collect::<Vec<_>>()),
             h2,
-            h8
+            h8,
+            s2,
+            ctr2
         );
     }
 }

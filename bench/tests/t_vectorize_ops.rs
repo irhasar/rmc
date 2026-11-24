@@ -17,6 +17,18 @@ pub unsafe extern "C" fn ops2(
         j += 1;
     }
 }
+// `a - b` with the loads emitted in the *opposite* order (b first), so the
+// vectorizer must map operands to bases by value, not by load order.
+#[no_mangle]
+pub unsafe extern "C" fn ops2r(pa: *const u32, pb: *const u32, pc: *mut u32, n: usize) {
+    let mut i = 0usize;
+    while i < n {
+        let b = *pb.add(i);
+        let a = *pa.add(i);
+        *pc.add(i) = a.wrapping_sub(b);
+        i += 1;
+    }
+}
 fn ck(v: &[u32]) -> u64 {
     let mut h = 1469598103934665603u64;
     for &x in v {
@@ -37,5 +49,8 @@ fn main() {
     unsafe {
         f(a1.as_ptr(), b1.as_ptr(), c1.as_mut_ptr(), a2.as_ptr(), b2.as_ptr(), c2.as_mut_ptr(), n)
     };
-    println!("add {} sub {}", ck(&c1), ck(&c2));
+    let mut c3 = vec![0u32; n];
+    let r: unsafe extern "C" fn(*const u32, *const u32, *mut u32, usize) = ops2r;
+    unsafe { r(a2.as_ptr(), b2.as_ptr(), c3.as_mut_ptr(), n) };
+    println!("add {} sub {} rev {}", ck(&c1), ck(&c2), ck(&c3));
 }

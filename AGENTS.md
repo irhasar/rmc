@@ -362,6 +362,32 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
     two-source `a[i] += b[i]` -> `paddd` (guard still emitted for `b`), f32
     `a[i] *= 2.0` -> `mulps`. New `t_vectorize_inplace`
     (n=1000/999/17/15/1/0); regressions asserts the four ops.
+  - **M4.8 LANDED: second review round.**
+    (a) A discarded volatile read was still dropped: `load_scalar` emits a
+    `notrap` load and `must_lower_even_if_unused` skips it, leaving only the
+    fence. `volatile_load` now emits a **trapping** load for scalar/vector
+    layouts (`fx.bcx.ins().load(ty, MemFlagsData::new(), …)` +
+    `CValue::by_val`); verified `mfence` + `movzbq` in `vol_discard`.
+    (b) The old `sum_ctr` fixture passed for the wrong reason — three header
+    params are rejected *before* the purity check. New `sum_ctr2` keeps two
+    header params and stores the counter, so it exercises `header_is_pure`
+    (asserted: no `paddd`/`movdqu`, counter matches LLVM).
+    (c) `RAKIT_VEC_VERIFY` is cached in a `OnceLock` (`vectorize::verify_enabled`)
+    per the tunables rule, and both the constant and runtime shift fixtures are
+    compiled with it.
+    (d) `body_chain`/`body_chain_checked` check the terminator shape before
+    scanning predecessors (a `return`/`brif` no longer pays for the scan).
+    (e) Constant/scalar operands are broadcast **once** in the guard block
+    (`vother`) instead of once per chunk; (f) the map overlap guard spans
+    `bound - start`, so only the touched range is compared (an untouched prefix
+    that happens to overlap no longer blocks vectorization).
+    Fixtures: `mul2` inputs now wrap; `ops2r` pins the reversed load order
+    (asserted `psubd`); `constmul1`/`scalemul` overlap (dest one ahead of src)
+    and `inplace_add2` with `pb = pa - 1` exercise the scalar fallback.
+    Gate: suite 65/25368/0; regressions green; allaxes 15/15 ok, run total
+    416 ms vs L 412 (1.01x), compile 1625 vs 1906 ms (0.85x), size 61.5 vs
+    69.4 MB (-11.3%). Focused 15-rep medians: p2_mem 48.3 ms (L 15.5),
+    p8_minmax 19.2 ms (L 16.7) — the allaxes +4/5% deltas were noise.
   - **M4.7 LANDED: correctness hardening (code-review findings).**
     (a) Vector headers (map and reduction) now require `nxt > i` *and*
     `nxt <= bound`, so a start near `u64::MAX` (`usize::MAX` with `n = 3`) can no

@@ -17,6 +17,7 @@ mod llvm_aarch64;
 mod llvm_x86;
 mod simd;
 
+use rakit_codegen::ir::immediates::Offset32;
 use rakit_codegen::ir::{
     AtomicRmwOp, BlockArg, ExceptionTableData, ExceptionTableItem, ExceptionTag,
 };
@@ -713,12 +714,35 @@ fn codegen_regular_intrinsic_call<'tcx>(
         sym::volatile_load | sym::unaligned_volatile_load => {
             intrinsic_args!(fx, args => (ptr); intrinsic);
 
-            // Rakit has no volatile bit in its IR, so a `fence` both provides the
+            // Rakit has no volatile bit in its IR: the fence provides the
             // ordering volatile requires and keeps the vectorizer from widening
-            // these accesses (it rejects blocks with side effects).
+            // these accesses (it rejects blocks with side effects). A `notrap`
+            // load is dropped when its result is unused, which would discard the
+            // read entirely, so emit a trapping load instead.
             let _ = fx.bcx.ins().fence();
             let inner_layout = fx.layout_of(ptr.layout().ty.builtin_deref(true).unwrap());
-            let val = CValue::by_ref(Pointer::new(ptr.load_scalar(fx)), inner_layout);
+            let ptr_val = ptr.load_scalar(fx);
+            let rakit_ty = match inner_layout.layout.backend_repr {
+                BackendRepr::Scalar(scalar) => {
+                    Some(crate::common::scalar_to_rakit_type(fx.tcx, scalar))
+                }
+                BackendRepr::SimdVector { element, count } => Some(
+                    crate::common::scalar_to_rakit_type(fx.tcx, element)
+                        .by(count.as_u32())
+                        .unwrap(),
+                ),
+                _ => None,
+            };
+            let val = match rakit_ty {
+                Some(ty) => {
+                    let v = fx
+                        .bcx
+                        .ins()
+                        .load(ty, MemFlagsData::new(), ptr_val, Offset32::new(0));
+                    CValue::by_val(v, inner_layout)
+                }
+                None => CValue::by_ref(Pointer::new(ptr_val), inner_layout),
+            };
             ret.write_cvalue(fx, val);
         }
         sym::volatile_store | sym::unaligned_volatile_store | sym::nontemporal_store => {

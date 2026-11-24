@@ -29,6 +29,16 @@ pub unsafe extern "C" fn constops(
         i += 1;
     }
 }
+// Destination one element ahead of the source: the ranges overlap, so this must
+// stay scalar (the scalar fallback still has to produce LLVM's bytes).
+#[no_mangle]
+pub unsafe extern "C" fn constmul1(pa: *const u32, pc: *mut u32, n: usize) {
+    let mut i = 0usize;
+    while i < n {
+        *pc.add(i) = (*pa.add(i)).wrapping_mul(2654435761);
+        i += 1;
+    }
+}
 fn ck(v: &[u64]) -> u64 {
     let mut h = 1469598103934665603u64;
     for &x in v {
@@ -54,5 +64,15 @@ fn main() {
     let h64 = ck(&o64);
     let hf1 = ck(&of1.iter().map(|x| x.to_bits() as u64).collect::<Vec<_>>());
     let hf2 = ck(&of2.iter().map(|x| x.to_bits() as u64).collect::<Vec<_>>());
-    println!("u32mul={} i64add={} f32mul={} f32sub={}", h32, h64, hf1, hf2);
+    let mut ov = vec![0u32; n];
+    let o: unsafe extern "C" fn(*const u32, *mut u32, usize) = constmul1;
+    unsafe { o(a32.as_ptr(), ov.as_mut_ptr().add(1), n - 1) };
+    println!(
+        "u32mul={} i64add={} f32mul={} f32sub={} ov={}",
+        h32,
+        h64,
+        hf1,
+        hf2,
+        ck(&ov.iter().map(|x| *x as u64).collect::<Vec<_>>())
+    );
 }
