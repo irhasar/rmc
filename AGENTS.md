@@ -25,9 +25,19 @@ order:
 3. **Loop legality + widening**: single induction var (step 1), pure elementwise
    body, no calls/traps, contiguous access, then build `i32x4`/`f32x4`
    loads/stores, splat the constant, vector `bxor`/`imulx`/`fmulx`/`fabsx`, and
-   a horizontal reduce for L2; scalar tail for `n % lanes`.
+   a horizontal reduce for L2 **only if it preserves the f32 addition order**
+   (see the ordering caveat below); scalar tail for `n % lanes`.
 4. **Codegen support check**: `pmulld` is SSE4.1 — must be feature-gated;
    verify `bzhi`/vector `imul` lower in `rakit-codegen`.
+
+**Float-reduction ordering is a hard constraint (not optional).** p4's L2 is
+`s += a[i]*b[i] + (a[i]-b[i]).abs()` on `f32`. Rust does **not** permit
+reassociating floating-point additions, so a lane-wise (horizontal) reduction
+that regroups them is **not a legal transform** — it can change the printed
+result. L2 may only be vectorized in a way that keeps the exact addition order
+(e.g. no regroup across lanes), or left scalar. The safe first real target is
+**L3** (`u32` xor-mul), which has no ordering constraint; L1 (sin/cos) is
+libcall-bound.
 
 **Milestones (each its own commit, each validated by the full gate: build,
 15/15 stdout identical to LLVM, suite 65/25,368/0, allaxes 45/45):**
@@ -47,8 +57,12 @@ reordering loads/stores of possibly-aliasing Vecs silently corrupts results.
 Wrote `rakit-opt/src/passes/load_cse.rs`: block-local redundant-load elimination
 (merge a `load` with an earlier same-address/type/offset/flags `load` in the same
 block when no store/call/side-effect lies between; this IR has **no volatile
-flag**, so it is semantically safe in a store-free stretch, and the egraph only
-CSEs `readonly+notrap+can_move` loads, which Rust `Vec` loads are not). It
+flag**, so it is semantically safe in a store-free stretch). Note the egraph has **two** load-elimination paths: the
+flags-gated GVN (`readonly+notrap+can_move`, which Rust `Vec` loads are not) and
+a separate **alias-analysis** path (`OptResult::AliasedLoad`,
+`egraph/mod.rs:549-565`) that replaces a load with an earlier load or stored
+value regardless of those flags — the latter is why the block-local pass was
+redundant. It
 **ICE'd compiling `core`**: `change_to_alias` inserts a
 `ValueLabelAssignments::Alias` entry keyed by the *removed* value
 (`dfg.rs:270-271`), and the machinst value-label emitter then does
@@ -87,6 +101,14 @@ blocker to solve for M1.
     offset shifts.
   - `isa/x64/abi.rs` `gen_prologue_frame_setup` / `gen_epilogue_frame_restore`:
     early-return an empty vector when `!flags.preserve_frame_pointers()`.
+  - **Unwind must also change (the recipe above is not enough).** Even with no
+    frame setup, `gen_clobber_save` still emits `UnwindInst::DefineNewFrame`
+    (`x64/abi.rs:697-712`) and the System V encoder sets
+    `CallFrameInstruction::CfaRegister(fp)` when `mr.fp()` exists
+    (`isa/unwind/systemv.rs:209-220`), i.e. it tells the unwinder to use RBP
+    even though the function never set it. A correct omit-FP build must suppress
+    `DefineNewFrame`/CFA-register for non-FP frames (or clear `mr.fp()`), or
+    backtraces/unwinding are wrong even when execution is correct.
   - Incoming stack args RBP → RSP in **both** lowering paths (they must agree):
     `args.rs` `SyntheticAmode::finalize` (`sp_offset = tail_args_size +
     setup_area_size + clobber_size + fixed_frame_storage_size +
@@ -104,7 +126,10 @@ blocker to solve for M1.
   `SipHasher::write` compile to `sub $N,%rsp; ...` with **no** `push %rbp` /
   `mov %rsp,%rbp`.
 - **Runtime A/B (cpu ms, 21 reps, FP → omit-FP):** p1 100→102, p3 55→56,
-  p4 83→83, p2 48→48, p8 21→20, p9 33→34 — all within ±3% noise. Artifact size
+  p4 83→83, p2 48→48, p8 21→20, p9 33→34. Most are within the ±3% band, **but
+  p8's −4.8% (21→20) is above it**; with only 15–21 reps a single clamped A/B
+  does **not** establish that as a real win — treat p8 as inconclusive/noise
+  until measured with many more reps and unrounded medians. Artifact size
   ±0.0% (e.g. p2 4143368→4141728 B).
 - **Why reverted:** neutral on every axis yet it carries real correctness risk
   for code we don't exercise: `emit.rs:1893` `emit_return_call_common_sequence`
@@ -127,9 +152,14 @@ blocker to solve for M1.
   (M ~20 ms vs LLVM ~18 ms) is not a removable spill/cycle — it is inherent to
   the scalar recurrence; LLVM's edge is elsewhere. Do not chase a "parallel-copy
   cycle" in p8.
-- **Standing (honest) scoreboard on this harness:** M wins **compile** (wall &
-  CPU), **size**, and **runtime p5/p6/p7**; **ties** p8/p9/h_* (~±10%); **loses**
-  p1/p2/p3/p4. Closing p1 (memory-operand constants + branchy saturating cast +
+- **Standing scoreboard, corrected (consult the full matrix, per the mandatory
+  benchmark rules):** M's compile is faster than **LLVM** but **slower than
+  upstream cg_clif (U)** (e.g. `h_arith` compile wall U 88 ms vs M 100 ms);
+  M has the **smallest artifacts**; runtime M wins only **p5/p6/p7**, **loses
+  p1/p2/p3/p4**, and the `h_*` rows are **not uniformly ties** (e.g. `h_mem`
+  does not tie LLVM on runtime CPU). Do not state "M wins compile" or "ties
+  h_*" without the full L/U/M matrix (compile wall/cpu/RSS/size + run
+  wall/cpu/RSS) to back it. Closing p1 (memory-operand constants + branchy saturating cast +
   serial int↔float chain), p2 (hashbrown/sort codegen depth), p3 (call-latency /
   middle-end), p4 (a real loop autovectorizer) is a **months-scale backend
   effort** comparable to LLVM's own middle-end, not an incremental pass.
