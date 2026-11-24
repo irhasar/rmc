@@ -36,11 +36,20 @@
     `SyntheticAmode::IncomingArg { offset }` to an `Amode::ImmReg` with
     `base: Gpr::RBP` and `simm32 = -offset`, whereas local
     `SyntheticAmode::SlotOffset` uses `base: Gpr::RSP`. So **any callee whose
-    arguments spill to the stack (e.g. >6 register args) reads them via RBP**;
-    omitting the frame pointer breaks such ordinary calls. Making them
-    rsp-relative is hard because RSP moves within a function
-    (clobbers/slots/calls) — which is exactly why Cranelift uses RBP and
-    resolves `KEY_INCOMING_ARG` against it at emit time.
+    arguments spill to the stack (e.g. >6 register args, or any stack-passed
+    arg) reads them via RBP**; omitting the frame pointer breaks such
+    **ordinary calls**, not only `return_call`. This is **fixable by mirroring
+    RISC-V**, which already lowers `AMode::IncomingArg` **SP-relative** from the
+    frame layout (`isa/riscv64/inst/args.rs:124-149`:
+    `sp_offset = tail_args_size + setup_area_size + clobber_size +
+    fixed_frame_storage_size + outgoing_args_size`, then `sp_offset - off`).
+    The earlier claim that "RSP moves within a function" is **wrong for
+    clobbers/slots**: `isa/x64/abi.rs:714-729` (`gen_clobber_save`) reserves
+    `fixed_frame_storage_size + clobber_size + outgoing_args_size` **once in the
+    prologue** with a single `sub rsp`, then stores clobbers at fixed RSP
+    offsets, so those SP offsets are constant. RSP is only adjusted
+    transiently for outgoing call args and for the `tail_args_size` growth of a
+    `return_call` — both folded into the RISC-V formula above.
   - `isa/x64/abi.rs:673` `gen_clobber_save` additionally does rbp-relative
     surgery when a `return_call` grows the incoming-arg area.
   - `isa/x64/inst/emit.rs:1893` `emit_return_call_common_sequence` **asserts**
@@ -53,8 +62,10 @@
     (or save it via `gen_clobber_save`).
   - s390x/riscv64 already gate `setup_area_size`/prologue on
     `flags.preserve_frame_pointers()` (`isa/s390x/abi.rs:761,789,973`,
-    `isa/riscv64/abi.rs:664`); x64 never implemented it. The **RBP-relative
-    incoming-arg addressing above is the hard part**.
+    `isa/riscv64/abi.rs:664`); x64 never implemented it. On x64 the extra piece
+    is the SP-relative incoming-arg lowering above (RISC-V's is the template);
+    the remaining gates are the `return_call` FP assert and the
+    `get_frame_pointer` verifier.
 - **Landed (safe, byte-identical):** the unroller's remaining per-function env
   reads (`RAKIT_UNROLL_DEBUG`, `RAKIT_LANE_DEBUG`, `RAKIT_NO_NARROW_FCVT`,
   `RAKIT_NO_LANES`) now go through cached `OnceLock` tunables, completing the
