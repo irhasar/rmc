@@ -303,6 +303,11 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
     stores, which the matcher rejects (it requires exact `Load`/`Store`).
     Supporting them needs widening/narrow load-store handling. The
     `Lanes::U8/U16` experiment did not fire and was reverted (no effect).
+  - **M3.9 LANDED: two-source u32 multiply.** `c[i] = a[i] * b[i]` (and
+    `(a[i]*b[i])*K`) now vectorize: when `imul`'s operands are both loads the
+    matcher takes the two-source path with `op = Imul` → `pmuludq` (one
+    `imul.i32x4` lowers to 2 `pmuludq`). New `t_vectorize_mul2` (`mul2`,
+    `mul2k`; n=1000/999/5/2/0); `regressions.sh` asserts `pmuludq` in both.
 
 ## Session (2026-11-24, branch `rakit-exp7`) — p9 reloads are real, but NOT soundly hoistable with the existing flags (alias tags don't move loads)
 

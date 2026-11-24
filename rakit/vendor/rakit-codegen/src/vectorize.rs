@@ -362,16 +362,23 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
     //                either side; `-`/`/` require the load on the left).
     let (top, tx, ty) = binary(dfg, sargs[0])?;
     let (op, lhs, rhs, k) = if loads.len() == 2 && top == Opcode::Imul && lanes == Lanes::U32 {
-        let (bx, kv) = if iconst_i64(dfg, ty).is_some() {
-            (tx, ty)
+        // `(a OP b) * K` where K is a constant, or a plain two-source
+        // multiply `a * b` when neither operand is a constant.
+        let const_side = if iconst_i64(dfg, ty).is_some() {
+            Some((tx, ty))
         } else if iconst_i64(dfg, tx).is_some() {
-            (ty, tx)
+            Some((ty, tx))
         } else {
-            return None;
+            None
         };
-        let k = iconst_i64(dfg, kv)?;
-        let (xop, xa, xb) = binary(dfg, bx)?;
-        (xop, xa, xb, Some(k))
+        match const_side {
+            Some((bx, kv)) => {
+                let k = iconst_i64(dfg, kv)?;
+                let (xop, xa, xb) = binary(dfg, bx)?;
+                (xop, xa, xb, Some(k))
+            }
+            None => (Opcode::Imul, tx, ty, None),
+        }
     } else {
         (top, tx, ty, None)
     };
