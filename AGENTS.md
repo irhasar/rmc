@@ -298,7 +298,7 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
     (`pmuludq`/`paddd`/`mulps`/…). The disjointness guard ignores scalars (only
     memory sources count). New `t_vectorize_scalar` (u32 `*k`, u32 `+k`, f32
     `*k`; n=1000/999/5/2/0); `regressions.sh` asserts `pmuludq`/`paddd`/`mulps`.
-  - **u8/u16 lanes: deferred (reverted).** Plain `a[i]` on `&[u8]`/`&[u16]`
+  - **u8/u16 lanes: deferred in M3.8, then LANDED in M4.0 (below).** Plain `a[i]` on `&[u8]`/`&[u16]`
     lowers to **narrow** `uload8`/`sload16` loads and `istore8`/`istore16`
     stores, which the matcher rejects (it requires exact `Load`/`Store`).
     Supporting them needs widening/narrow load-store handling. The
@@ -308,6 +308,19 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
     matcher takes the two-source path with `op = Imul` → `pmuludq` (one
     `imul.i32x4` lowers to 2 `pmuludq`). New `t_vectorize_mul2` (`mul2`,
     `mul2k`; n=1000/999/5/2/0); `regressions.sh` asserts `pmuludq` in both.
+  - **M4.0 LANDED: u8/u16 lanes.** `Lanes::U8`/`U16` (`I8X16`/`I16X8`, shift
+    0/1, size 1/2, per_vec 16/8) for exact ops {add, sub, xor, and, or} →
+    `paddb`/`psubb`/`pxor`/`pand`/`por`/`paddw`/`psubw`. Two extra addressing
+    forms were required and added to `scaled_of`: `base + i` with **no** `ishl`
+    (byte, shift 0) and `base + (i + i)` == `i*2` (word). Constant and min/max
+    for u8/u16 stay out (no `iconst.i8` path / SSE4.1 needed). New
+    `t_vectorize_u8u16` (10 fns, n=1000/999/17/15/1/0); `regressions.sh`
+    asserts the seven SSE2 ops.
+  - **Environment (important):** the sandbox repeatedly wiped `$HOME` and
+    `/tmp` (toolchain + probes vanished mid-run). The toolchain now lives in
+    `/workspace/.rustup` + `/workspace/.cargo` (survives resets; export
+    `RUSTUP_HOME`/`CARGO_HOME`/`PATH` accordingly) and throwaway probes live in
+    `bench/out/probe` (inside the repo, not `/tmp`).
 
 ## Session (2026-11-24, branch `rakit-exp7`) — p9 reloads are real, but NOT soundly hoistable with the existing flags (alias tags don't move loads)
 

@@ -87,6 +87,8 @@ enum Bound {
 /// Element/lane kind. `per_vec` is the number of elements in a 128-bit vector.
 #[derive(Clone, Copy, PartialEq)]
 enum Lanes {
+    U8,
+    U16,
     U32,
     I64,
     F32,
@@ -95,7 +97,11 @@ enum Lanes {
 
 impl Lanes {
     fn from_scalar(t: ir::Type) -> Option<Lanes> {
-        if t == types::I32 {
+        if t == types::I8 {
+            Some(Lanes::U8)
+        } else if t == types::I16 {
+            Some(Lanes::U16)
+        } else if t == types::I32 {
             Some(Lanes::U32)
         } else if t == types::I64 {
             Some(Lanes::I64)
@@ -113,6 +119,8 @@ impl Lanes {
             Lanes::I64 => types::I64X2,
             Lanes::F32 => types::F32X4,
             Lanes::F64 => types::F64X2,
+            Lanes::U8 => types::I8X16,
+            Lanes::U16 => types::I16X8,
         }
     }
     fn scalar(self) -> ir::Type {
@@ -121,22 +129,30 @@ impl Lanes {
             Lanes::I64 => types::I64,
             Lanes::F32 => types::F32,
             Lanes::F64 => types::F64,
+            Lanes::U8 => types::I8,
+            Lanes::U16 => types::I16,
         }
     }
     fn shift(self) -> i64 {
         match self {
+            Lanes::U8 => 0,
+            Lanes::U16 => 1,
             Lanes::U32 | Lanes::F32 => 2,
             Lanes::I64 | Lanes::F64 => 3,
         }
     }
     fn size(self) -> u64 {
         match self {
+            Lanes::U8 => 1,
+            Lanes::U16 => 2,
             Lanes::U32 | Lanes::F32 => 4,
             Lanes::I64 | Lanes::F64 => 8,
         }
     }
     fn per_vec(self) -> i64 {
         match self {
+            Lanes::U8 => 16,
+            Lanes::U16 => 8,
             Lanes::U32 | Lanes::F32 => 4,
             Lanes::I64 | Lanes::F64 => 2,
         }
@@ -391,6 +407,10 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
             op,
             Opcode::Bxor | Opcode::Band | Opcode::Bor | Opcode::Iadd | Opcode::Isub
         ),
+        // u8/u16: exact bitwise/arith only (no packed multiply; no min/max on SSE2).
+        Lanes::U8 | Lanes::U16 => {
+            matches!(op, Opcode::Bxor | Opcode::Band | Opcode::Bor | Opcode::Iadd | Opcode::Isub)
+        }
         Lanes::F32 | Lanes::F64 => {
             matches!(op, Opcode::Fadd | Opcode::Fsub | Opcode::Fmul | Opcode::Fdiv)
         }
@@ -909,6 +929,10 @@ fn base_and_off(
 }
 
 fn scaled_of(dfg: &DataFlowGraph, v: Value, i: Value, shift: i64, size: i64) -> Option<()> {
+    // `base + i` with no scaling (byte elements, shift 0).
+    if shift == 0 && dfg.resolve_aliases(v) == i {
+        return Some(());
+    }
     let (op, a, b) = binary(dfg, v)?;
     match op {
         // `i << shift` only: the shifted value must be `i` (reject `shift << i`).
@@ -919,6 +943,12 @@ fn scaled_of(dfg: &DataFlowGraph, v: Value, i: Value, shift: i64, size: i64) -> 
         Opcode::Imul
             if (dfg.resolve_aliases(a) == i && iconst_i64(dfg, b) == Some(size))
                 || (dfg.resolve_aliases(b) == i && iconst_i64(dfg, a) == Some(size)) =>
+        {
+            Some(())
+        }
+        // `i + i` == `i * 2` (u16 addressing).
+        Opcode::Iadd
+            if size == 2 && dfg.resolve_aliases(a) == i && dfg.resolve_aliases(b) == i =>
         {
             Some(())
         }
