@@ -19,13 +19,9 @@ removed soundly, corrected against the code:
   `args[0]` (`licm.rs:372-386`), which by the `store(flags, x, p)` operand order
   (`instructions.rs` "store": `x` then `p`) is the **stored value**, not the
   destination (`args[1]`). So the `None` result reflects the value operand
-  (`v17`, the `sinf` result), and the scan establishes **nothing about the
-  destination** — a latent conservative operand bug (for stores, `args[1]` is the
-  address). Because the value operand (`v17`) is not a `StackAddr`/global,
-  `addr_base` returns `None`, so the store is counted **opaque** — but this is
-  inferred from the (wrong) value operand, **not** from the destination; the CLIF
-  destination `v85 = iadd v31, i<<2` is simply never examined by `addr_base`, so
-  the code says nothing about it either way.
+  (`v17`, the `sinf` result), so the scan established **nothing about the
+  destination** — a **real operand bug, now FIXED** (the address is `args[1]`;
+  see "Fix applied" below).
 - **Alias tags do not hoist loads.** `process_inst`
   (`alias_analysis.rs:1353-1389`) can reuse a *dominating* matching value but
   cannot move the first load; `is_pure_for_egraph` (`inst_predicates.rs:44-58`)
@@ -49,11 +45,39 @@ removed soundly, corrected against the code:
   "Akar 1" also cited `sinf` as the opaque store — wrong; calls are not
   `can_store`.)
 
+**Fix applied (exp7): `addr_base` now reads the store address.**
+`licm.rs` `addr_base`: `InstructionData::Store | StoreNoOffset { args, .. } =>
+args[1]` (the destination address) instead of `args[0]` (the stored value). This
+also covers `istore8/16/32` (same `formats.store`, `[x, p]` order) and
+`store_no_offset` (`[x, p]`). Effect on `hoist_from_loop` (`licm.rs:257-304`): a
+store whose **destination** is a static stack slot/global now populates
+`store_bases` instead of setting `any_opaque_store`; a dynamic-destination store
+(p9's `a[i]=`, dest `iadd`) still yields `None` → opaque. Soundness unchanged: a
+load must still pass `readonly && notrap && can_move`, and a store to the load's
+own base still blocks (`store_bases.contains(base)`). I did **not** mark the p9
+`Vec`-header loads `readonly` — unsound (header written before the loop;
+`memflags.rs:359-366`).
+- **Results:** Rakit-vs-LLVM stdout/exit identical on all 30 bench programs +
+  tests **except two pre-existing, unrelated** diffs — `t_panic` (rakit aborts on
+  the `catch_unwind` path; LICM-independent) and `t_tls` (only thread print order
+  differs; same values). **Full suite `./y.sh test --sysroot rakit`: 65 suites /
+  25,368 passed / 0 failed.** Codegen unit tests `cargo test -p rakit-codegen
+  --lib`: **202 passed / 0 failed** (incl.
+  `licm::tests::licm_does_not_split_a_multi_entry_loop_header`); the LICM
+  differential `bench/tests/t_licm.rs` matches LLVM.
+- **Benchmark p9 (before → after):** `main.opt` `load` lines **9 → 9**, disasm
+  `(%rsp)` refs in `main` **13 → 13**, run CPU **34.5 → 33.6 ms** (within noise),
+  output identical. The fix is **NEUTRAL on p9** — expected: p9's loop store
+  destination is dynamic (still opaque) and `main.opt` has **0 `readonly`**
+  loads, so no load meets LICM's `readonly+notrap+can_move` gate. The bug was
+  real; the fix is correctness groundwork (accurate `store_bases`), not a
+  speedup, on the current code.
+
 **Conclusion — stop pursuing p9 reloads.** They are **not soundly removable**
 with the existing flags: `readonly` is unjustified (pre-loop init write), the
-in-loop `a[i]=` store is counted opaque by LICM (`addr_base` returns `None` from
-the stored-value operand, not the destination), and alias tags cannot move a
-load. Removing them
+in-loop `a[i]=` store is opaque to LICM because its **destination** (`v85 =
+iadd …`) is not a static stack/global base (correct after the fix), and alias
+tags cannot move a load. Removing them
 needs a finer, point-sensitive mechanism (e.g. memory regions proving "no write
 to this region after this point in this loop"), which is large. Do **not** re-try
 flag-only marking of these loads — it is unsound.

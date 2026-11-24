@@ -372,7 +372,13 @@ fn hoist_from_loop(
 fn addr_base(func: &Function, data: &InstructionData) -> Option<AddrBase> {
     let addr = match data {
         InstructionData::Load { arg, .. } | InstructionData::LoadNoOffset { arg, .. } => *arg,
-        InstructionData::Store { args, .. } | InstructionData::StoreNoOffset { args, .. } => args[0],
+        // `store` operand order is `x` (value) then `p` (address); the address
+        // is `args[1]` (see `formats.store` / `store_no_offset` in
+        // `rakit-codegen-meta/src/shared/instructions.rs`). `args[0]` is the
+        // stored value, which is not the address.
+        InstructionData::Store { args, .. } | InstructionData::StoreNoOffset { args, .. } => {
+            args[1]
+        }
         _ => return None,
     };
     let addr = func.dfg.resolve_aliases(addr);
