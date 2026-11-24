@@ -204,6 +204,14 @@ impl Context {
                 self.compute_cfg();
                 self.compute_domtree();
             }
+            if crate::vectorize::enabled()
+                && crate::vectorize::do_vectorize(&mut self.func)
+            {
+                // The pass adds blocks and edges; the dominator tree used by
+                // block ordering must see them.
+                self.compute_cfg();
+                self.compute_domtree();
+            }
         }
 
         Ok(())

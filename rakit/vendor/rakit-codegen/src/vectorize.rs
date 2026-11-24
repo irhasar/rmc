@@ -1,34 +1,53 @@
 //! Vectorize one canonical map loop to a 4-lane `I32X4` body.
 //!
-//! Target (verified from CLIF): loop header `H(i)` brifs on a **constant** trip
-//! `i < n`; single-block body `B` computes, for loop-invariant base pointers
-//! `sa/sb/sc`,
-//!   `c[i] = (a[i] ^ b[i]) * K`   with `addr = base + (i << 2)` (u32 lanes),
-//! then `i += 1` and jumps back to `H`.
+//! This runs **after the egraph** (see `context.rs`), where the loop is in SSA
+//! form with a block-parameter induction. The earlier `rakit-opt` pipeline runs
+//! before the egraph, where the induction is still a stack slot, so this must
+//! live in the backend.
 //!
-//! The transform **never edits `H` or `B`**. It inserts a runtime
-//! *disjointness guard* plus a new vector loop:
-//!   preheader P -> G (guard) -> { H(0)  [overlap: scalar] | VH(0) [disjoint] }
+//! Target: header `H(i: i64)` brifs on a constant trip `i < n`; single-block
+//! body `B` computes `c[i] = (a[i] ^ b[i]) * K` for loop-invariant base
+//! pointers, `addr = base + (i << 2)` (u32 lanes), then `i += 1` and jumps `H`.
+//!
+//! The transform never edits `H`/`B`. It inserts a runtime disjointness guard
+//! plus a vector loop:
+//!   P -> G (guard) -> { H(0) [overlap: scalar] | VH(0) [disjoint] }
 //!   VH(i): `i+4 <= n` ? VB(i) : H(i)          (original `H` is the scalar tail)
 //!   VB(i): 16-byte load A/B, xor, `imul.i32x4` by `splat(K)`, 16-byte store C,
 //!          `i += 4`, jump VH(i)
 //!
-//! The guard proves the stored buffer is **disjoint** from both loaded buffers
-//! over the whole loop (`|dst - src| >= n*4` unsigned); distinct base pointers
-//! are *not* enough (`dst = src + 1` overlaps). Because `H`/`B` are reused as the
-//! scalar tail and the overlap fallback, there is no scalar-loop duplication and
-//! no SSA value is deleted.
-use rakit_codegen::cursor::{Cursor, FuncCursor};
-use rakit_codegen::ir::condcodes::IntCC;
-use rakit_codegen::ir::immediates::Offset32;
-use rakit_codegen::ir::{
-    self, Block, InstBuilder, MemFlagsData, Opcode, Value, ValueDef, types,
+//! The guard proves the stored buffer is disjoint from both loaded buffers over
+//! the whole loop (`|dst - src| >= n*4` unsigned); distinct base pointers are
+//! *not* enough (`dst = src + 1` overlaps). `H`/`B` are reused as the scalar
+//! tail and overlap fallback, so there is no scalar-loop duplication and no SSA
+//! value is deleted.
+
+use alloc::vec::Vec;
+
+use crate::cursor::{Cursor, FuncCursor};
+use crate::ir::condcodes::IntCC;
+use crate::ir::immediates::Offset32;
+use crate::ir::{
+    self, Block, DataFlowGraph, Function, InstBuilder, Layout, MemFlagsData, Opcode, Value,
+    ValueDef, types,
 };
 
-pub fn run(func: &mut ir::Function) -> bool {
-    if std::env::var_os("RAKIT_NO_VECTORIZE").is_some() {
-        return false;
+/// Whether the pass is enabled at runtime (`RAKIT_NO_VECTORIZE` disables it).
+pub fn enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("RAKIT_NO_VECTORIZE").is_none())
     }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
+/// Vectorize at most one canonical loop in `func`. Returns whether the CFG
+/// changed (the caller must recompute cfg/domtree when it did).
+pub fn do_vectorize(func: &mut Function) -> bool {
     let Some(plan) = find_plan(func) else { return false };
     apply(func, plan);
     true
@@ -44,7 +63,7 @@ struct Plan {
     k: i64,
 }
 
-fn find_plan(func: &ir::Function) -> Option<Plan> {
+fn find_plan(func: &Function) -> Option<Plan> {
     for h in func.layout.blocks().collect::<Vec<_>>() {
         if let Some(plan) = match_header(func, h) {
             return Some(plan);
@@ -53,7 +72,7 @@ fn find_plan(func: &ir::Function) -> Option<Plan> {
     None
 }
 
-fn match_header(func: &ir::Function, h: Block) -> Option<Plan> {
+fn match_header(func: &Function, h: Block) -> Option<Plan> {
     let dfg = &func.dfg;
     let params = dfg.block_params(h);
     if params.len() != 1 || dfg.value_type(params[0]) != types::I64 {
@@ -88,7 +107,6 @@ fn match_header(func: &ir::Function, h: Block) -> Option<Plan> {
     if pb.len() != 1 || pb[0] != h {
         return None;
     }
-    // Preheader: `H` has exactly two predecessors, `B` and a distinct `P`.
     let ph = preds(func, h);
     if ph.len() != 2 || !ph.contains(&b) {
         return None;
@@ -107,9 +125,8 @@ fn match_header(func: &ir::Function, h: Block) -> Option<Plan> {
     }
     let init = pargs[0].as_value()?;
     if iconst_i64(dfg, init)? != 0 {
-        return None; // trip must start at 0 (matches the target shape)
+        return None;
     }
-    // Latch: `B` jumps to `H(i + 1)`.
     let bterm = func.layout.last_inst(b)?;
     let ir::InstructionData::Jump { destination: bnext, .. } = dfg.insts[bterm] else {
         return None;
@@ -123,12 +140,12 @@ fn match_header(func: &ir::Function, h: Block) -> Option<Plan> {
     }
     let nextv = bargs[0].as_value()?;
     let (nop, na, nb) = binary(dfg, nextv)?;
-    if nop != Opcode::Iadd || dfg.resolve_aliases(if iconst_i64(dfg, nb) == Some(1) { na } else { nb }) != i {
+    if nop != Opcode::Iadd
+        || dfg.resolve_aliases(if iconst_i64(dfg, nb) == Some(1) { na } else { nb }) != i
+    {
         return None;
     }
 
-    // Body memory ops: exactly two i32 loads and one i32 store, offset 0, all at
-    // the same `base + scaled(i)` with `scaled(i) = i << 2` (or `i * 4`).
     let mut loads = Vec::new();
     let mut stores = Vec::new();
     for inst in func.layout.block_insts(b) {
@@ -178,7 +195,6 @@ fn match_header(func: &ir::Function, h: Block) -> Option<Plan> {
         return None;
     }
 
-    // Store value = `imul(bxor(load, load), K)`.
     let (mop, mx, my) = binary(dfg, sargs[0])?;
     if mop != Opcode::Imul {
         return None;
@@ -202,9 +218,7 @@ fn match_header(func: &ir::Function, h: Block) -> Option<Plan> {
         return None;
     }
 
-    // All three bases must be loop-invariant (defined outside `H`/`B`).
-    let scatter = [load_bases[0], load_bases[1], store_base];
-    for &base in &scatter {
+    for &base in &[load_bases[0], load_bases[1], store_base] {
         if !defined_outside(dfg, &func.layout, base, h, b) {
             return None;
         }
@@ -221,7 +235,7 @@ fn match_header(func: &ir::Function, h: Block) -> Option<Plan> {
     })
 }
 
-fn apply(func: &mut ir::Function, p: Plan) {
+fn apply(func: &mut Function, p: Plan) {
     let h = p.h;
     let g = func.dfg.make_block();
     let vh = func.dfg.make_block();
@@ -239,7 +253,6 @@ fn apply(func: &mut ir::Function, p: Plan) {
         cur.ins().jump(g, &[]);
     }
 
-    // Guard: overlap iff `|dst - src| < n*4`; if either overlaps, stay scalar.
     {
         let mut cur = FuncCursor::new(func).at_bottom(g);
         let zero = cur.ins().iconst(types::I64, 0);
@@ -260,11 +273,9 @@ fn apply(func: &mut ir::Function, p: Plan) {
             });
         }
         let ov = ov.unwrap();
-        // overlap (true) -> scalar `H`; disjoint (false) -> vector `VH`.
         cur.ins().brif(ov, h, &[zero.into()], vh, &[zero.into()]);
     }
 
-    // Vector header: `i + 4 <= n` ? VB(i) : H(i)  (H handles the scalar tail).
     {
         let mut cur = FuncCursor::new(func).at_bottom(vh);
         let four = cur.ins().iconst(types::I64, 4);
@@ -274,7 +285,6 @@ fn apply(func: &mut ir::Function, p: Plan) {
         cur.ins().brif(cond, vb, &[vh_i.into()], h, &[vh_i.into()]);
     }
 
-    // Vector body: 4-wide 16-byte loads/stores at `base + (i << 2)`.
     {
         let mut cur = FuncCursor::new(func).at_bottom(vb);
         let two = cur.ins().iconst(types::I64, 2);
@@ -296,16 +306,14 @@ fn apply(func: &mut ir::Function, p: Plan) {
     }
 }
 
-// --- helpers -------------------------------------------------------------
-
-fn binary(dfg: &ir::DataFlowGraph, v: Value) -> Option<(Opcode, Value, Value)> {
+fn binary(dfg: &DataFlowGraph, v: Value) -> Option<(Opcode, Value, Value)> {
     let v = dfg.resolve_aliases(v);
     let ValueDef::Result(inst, _) = dfg.value_def(v) else { return None };
     let ir::InstructionData::Binary { opcode, args, .. } = dfg.insts[inst] else { return None };
     Some((opcode, args[0], args[1]))
 }
 
-fn icmp_parts(dfg: &ir::DataFlowGraph, v: Value) -> Option<(IntCC, Value, Value)> {
+fn icmp_parts(dfg: &DataFlowGraph, v: Value) -> Option<(IntCC, Value, Value)> {
     let v = dfg.resolve_aliases(v);
     let ValueDef::Result(inst, _) = dfg.value_def(v) else { return None };
     let ir::InstructionData::IntCompare { opcode: Opcode::Icmp, cond, args, .. } = dfg.insts[inst]
@@ -315,7 +323,7 @@ fn icmp_parts(dfg: &ir::DataFlowGraph, v: Value) -> Option<(IntCC, Value, Value)
     Some((cond, args[0], args[1]))
 }
 
-fn iconst_i64(dfg: &ir::DataFlowGraph, v: Value) -> Option<i64> {
+fn iconst_i64(dfg: &DataFlowGraph, v: Value) -> Option<i64> {
     let v = dfg.resolve_aliases(v);
     let ValueDef::Result(inst, _) = dfg.value_def(v) else { return None };
     let ir::InstructionData::UnaryImm { opcode: Opcode::Iconst, imm, .. } = dfg.insts[inst] else {
@@ -324,8 +332,7 @@ fn iconst_i64(dfg: &ir::DataFlowGraph, v: Value) -> Option<i64> {
     Some(imm.bits())
 }
 
-/// `addr = base + scaled(i)` where `scaled(i) = i << 2` or `i * 4`.
-fn base_and_off(dfg: &ir::DataFlowGraph, addr: Value, i: Value) -> Option<(Value, Value)> {
+fn base_and_off(dfg: &DataFlowGraph, addr: Value, i: Value) -> Option<(Value, Value)> {
     let (op, x, y) = binary(dfg, addr)?;
     if op != Opcode::Iadd {
         return None;
@@ -338,11 +345,16 @@ fn base_and_off(dfg: &ir::DataFlowGraph, addr: Value, i: Value) -> Option<(Value
     None
 }
 
-fn scaled_of(dfg: &ir::DataFlowGraph, v: Value, i: Value) -> Option<()> {
+fn scaled_of(dfg: &DataFlowGraph, v: Value, i: Value) -> Option<()> {
     let (op, a, b) = binary(dfg, v)?;
     let (l, r) = (dfg.resolve_aliases(a), dfg.resolve_aliases(b));
-    let (i_on_left, c) = if l == i { (true, b) } else if r == i { (false, a) } else { return None };
-    let _ = i_on_left;
+    let c = if l == i {
+        b
+    } else if r == i {
+        a
+    } else {
+        return None;
+    };
     match op {
         Opcode::Ishl if iconst_i64(dfg, c) == Some(2) => Some(()),
         Opcode::Imul if iconst_i64(dfg, c) == Some(4) => Some(()),
@@ -350,7 +362,7 @@ fn scaled_of(dfg: &ir::DataFlowGraph, v: Value, i: Value) -> Option<()> {
     }
 }
 
-fn jumps_to(func: &ir::Function, from: Block, target: Block) -> bool {
+fn jumps_to(func: &Function, from: Block, target: Block) -> bool {
     let Some(t) = func.layout.last_inst(from) else { return false };
     if let ir::InstructionData::Jump { destination, .. } = func.dfg.insts[t] {
         destination.block(&func.dfg.value_lists) == target
@@ -359,7 +371,7 @@ fn jumps_to(func: &ir::Function, from: Block, target: Block) -> bool {
     }
 }
 
-fn preds(func: &ir::Function, target: Block) -> Vec<Block> {
+fn preds(func: &Function, target: Block) -> Vec<Block> {
     let mut out = Vec::new();
     for b in func.layout.blocks() {
         if let Some(t) = func.layout.last_inst(b) {
@@ -375,13 +387,7 @@ fn preds(func: &ir::Function, target: Block) -> Vec<Block> {
     out
 }
 
-fn defined_outside(
-    dfg: &ir::DataFlowGraph,
-    layout: &ir::Layout,
-    v: Value,
-    h: Block,
-    b: Block,
-) -> bool {
+fn defined_outside(dfg: &DataFlowGraph, layout: &Layout, v: Value, h: Block, b: Block) -> bool {
     let v = dfg.resolve_aliases(v);
     match dfg.value_def(v) {
         ValueDef::Result(inst, _) => match layout.inst_block(inst) {
@@ -392,4 +398,3 @@ fn defined_outside(
         _ => true,
     }
 }
-

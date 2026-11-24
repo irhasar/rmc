@@ -1,0 +1,74 @@
+thread 'opt cgu.0' panicked at vendor/rakit-codegen/src/machinst/blockorder.rs:258:84:
+no entry found for key
+stack backtrace:
+   0:     0x7e218aff6ee5 - <std[fb80353258e89686]::backtrace::Backtrace>::create
+   1:     0x7e218aff6e35 - <std[fb80353258e89686]::backtrace::Backtrace>::force_capture
+   2:     0x7e2189d7c472 - std[fb80353258e89686]::panicking::update_hook::<alloc[853481b65ea3acd4]::boxed::Box<rustc_driver_impl[4017350140c73312]::install_ice_hook::{closure#1}>>::{closure#0}
+   3:     0x7e218b00ca62 - std[fb80353258e89686]::panicking::panic_with_hook
+   4:     0x7e218afea112 - std[fb80353258e89686]::panicking::panic_handler::{closure#0}
+   5:     0x7e218afe2789 - std[fb80353258e89686]::sys::backtrace::__rust_end_short_backtrace::<std[fb80353258e89686]::panicking::panic_handler::{closure#0}, !>
+   6:     0x7e218afebe6d - __rustc[c8e27d340f631b6a]::rust_begin_unwind
+   7:     0x7e2187871ecc - core[d05945f167f7bcf4]::panicking::panic_fmt
+   8:     0x7e21889e7f64 - core[d05945f167f7bcf4]::option::expect_failed
+   9:     0x7e2175e6f8a8 - <alloc[853481b65ea3acd4]::vec::Vec<(core[d05945f167f7bcf4]::option::Option<rakit_codegen[a6e4a31fd1f1174f]::ir::entities::Inst>, core[d05945f167f7bcf4]::ops::range::Range<usize>)> as alloc[853481b65ea3acd4]::vec::spec_from_iter::SpecFromIter<(core[d05945f167f7bcf4]::option::Option<rakit_codegen[a6e4a31fd1f1174f]::ir::entities::Inst>, core[d05945f167f7bcf4]::ops::range::Range<usize>), core[d05945f167f7bcf4]::iter::adapters::map::Map<core[d05945f167f7bcf4]::iter::adapters::enumerate::Enumerate<core[d05945f167f7bcf4]::slice::iter::Iter<rakit_codegen[a6e4a31fd1f1174f]::machinst::blockorder::LoweredBlock>>, <rakit_codegen[a6e4a31fd1f1174f]::machinst::blockorder::BlockLoweringOrder>::new::{closure#2}>>>::from_iter
+  10:     0x7e2175d5d84b - <rakit_codegen[a6e4a31fd1f1174f]::machinst::blockorder::BlockLoweringOrder>::new
+  11:     0x7e2175d59c25 - rakit_codegen[a6e4a31fd1f1174f]::machinst::compile::compile::<rakit_codegen[a6e4a31fd1f1174f]::isa::x64::X64Backend>
+  12:     0x7e2175f2b250 - <rakit_codegen[a6e4a31fd1f1174f]::isa::x64::X64Backend as rakit_codegen[a6e4a31fd1f1174f]::isa::TargetIsa>::compile_function
+  13:     0x7e2175f02c11 - <rakit_codegen[a6e4a31fd1f1174f]::context::Context>::compile_stencil
+  14:     0x7e2175f03548 - <rakit_codegen[a6e4a31fd1f1174f]::context::Context>::compile
+  15:     0x7e2175b2fe13 - <rakit_object[36488a69c4c6c0c8]::backend::ObjectModule as rakit_module[3ce507e36f0b0547]::module::Module>::define_function_with_control_plane
+  16:     0x7e21759b380a - <rustc_codegen_rakit[9e3a602d765eb4f9]::unwind_module::UnwindModule<rakit_object[36488a69c4c6c0c8]::backend::ObjectModule> as rakit_module[3ce507e36f0b0547]::module::Module>::define_function
+  17:     0x7e2175ad1f39 - rustc_codegen_rakit[9e3a602d765eb4f9]::base::compile_fn
+  18:     0x7e2175a67315 - <rustc_codegen_rakit[9e3a602d765eb4f9]::driver::aot::AotDriver as rustc_codegen_ssa[c0b5b53d2648dd96]::traits::write::WriteBackendMethods>::codegen
+  19:     0x7e2175a12203 - rustc_codegen_ssa[c0b5b53d2648dd96]::back::write::execute_optimize_work_item::<rustc_codegen_rakit[9e3a602d765eb4f9]::driver::aot::AotDriver>
+  20:     0x7e2175a9ba50 - std[fb80353258e89686]::sys::backtrace::__rust_begin_short_backtrace::<rustc_codegen_ssa[c0b5b53d2648dd96]::back::write::spawn_work<rustc_codegen_rakit[9e3a602d765eb4f9]::driver::aot::AotDriver>::{closure#2}, ()>
+  21:     0x7e2175a22755 - <std[fb80353258e89686]::thread::lifecycle::spawn_unchecked<rustc_codegen_ssa[c0b5b53d2648dd96]::back::write::spawn_work<rustc_codegen_rakit[9e3a602d765eb4f9]::driver::aot::AotDriver>::{closure#2}, ()>::{closure#1} as core[d05945f167f7bcf4]::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+  22:     0x7e218c95f1e3 - <std[fb80353258e89686]::sys::thread::unix::Thread>::new::thread_start
+  23:     0x7e2185a9e8bb - <unknown>
+  24:     0x7e2185b1c538 - <unknown>
+  25:                0x0 - <unknown>
+
+
+rustc version: 1.102.0-nightly (5df8c02af 2026-11-16)
+platform: x86_64-unknown-linux-gnuthread 'coordinator' panicked at /home/openhands/.rustup/toolchains/nightly-2026-11-17-x86_64-unknown-linux-gnu/lib/rustlib/rustc-src/rust/compiler/rustc_codegen_ssa/src/back/write.rs:1698:29:
+worker thread panicked
+stack backtrace:
+   0:     0x7e218aff6ee5 - <std[fb80353258e89686]::backtrace::Backtrace>::create
+   1:     0x7e218aff6e35 - <std[fb80353258e89686]::backtrace::Backtrace>::force_capture
+   2:     0x7e2189d7c472 - std[fb80353258e89686]::panicking::update_hook::<alloc[853481b65ea3acd4]::boxed::Box<rustc_driver_impl[4017350140c73312]::install_ice_hook::{closure#1}>>::{closure#0}
+   3:     0x7e218b00ca62 - std[fb80353258e89686]::panicking::panic_with_hook
+   4:     0x7e218ab99206 - std[fb80353258e89686]::panicking::begin_panic::<alloc[853481b65ea3acd4]::string::String>::{closure#0}
+   5:     0x7e218ab97166 - std[fb80353258e89686]::sys::backtrace::__rust_end_short_backtrace::<std[fb80353258e89686]::panicking::begin_panic<alloc[853481b65ea3acd4]::string::String>::{closure#0}, !>
+   6:     0x7e218ab97153 - std[fb80353258e89686]::panicking::begin_panic::<alloc[853481b65ea3acd4]::string::String>
+   7:     0x7e2187512be7 - rustc_span[3116a6fa6fcaeb24]::macros::bug_impl
+   8:     0x7e2175a9e77a - std[fb80353258e89686]::sys::backtrace::__rust_begin_short_backtrace::<rustc_codegen_ssa[c0b5b53d2648dd96]::back::write::start_executing_work<rustc_codegen_rakit[9e3a602d765eb4f9]::driver::aot::AotDriver>::{closure#3}, core[d05945f167f7bcf4]::result::Result<rustc_codegen_ssa[c0b5b53d2648dd96]::back::write::MaybeLtoModules<rustc_codegen_rakit[9e3a602d765eb4f9]::driver::aot::AotDriver>, ()>>
+   9:     0x7e2175a22b96 - <std[fb80353258e89686]::thread::lifecycle::spawn_unchecked<rustc_codegen_ssa[c0b5b53d2648dd96]::back::write::start_executing_work<rustc_codegen_rakit[9e3a602d765eb4f9]::driver::aot::AotDriver>::{closure#3}, core[d05945f167f7bcf4]::result::Result<rustc_codegen_ssa[c0b5b53d2648dd96]::back::write::MaybeLtoModules<rustc_codegen_rakit[9e3a602d765eb4f9]::driver::aot::AotDriver>, ()>>::{closure#1} as core[d05945f167f7bcf4]::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+  10:     0x7e218c95f1e3 - <std[fb80353258e89686]::sys::thread::unix::Thread>::new::thread_start
+  11:     0x7e2185a9e8bb - <unknown>
+  12:     0x7e2185b1c538 - <unknown>
+  13:                0x0 - <unknown>
+thread 'rustc' panicked at /home/openhands/.rustup/toolchains/nightly-2026-11-17-x86_64-unknown-linux-gnu/lib/rustlib/rustc-src/rust/compiler/rustc_codegen_ssa/src/back/write.rs:2125:17:
+panic during codegen/LLVM phase
+stack backtrace:
+   0:     0x7e218aff6ee5 - <std[fb80353258e89686]::backtrace::Backtrace>::create
+   1:     0x7e218aff6e35 - <std[fb80353258e89686]::backtrace::Backtrace>::force_capture
+   2:     0x7e2189d7c472 - std[fb80353258e89686]::panicking::update_hook::<alloc[853481b65ea3acd4]::boxed::Box<rustc_driver_impl[4017350140c73312]::install_ice_hook::{closure#1}>>::{closure#0}
+   3:     0x7e218b00ca62 - std[fb80353258e89686]::panicking::panic_with_hook
+   4:     0x7e218ab99206 - std[fb80353258e89686]::panicking::begin_panic::<alloc[853481b65ea3acd4]::string::String>::{closure#0}
+   5:     0x7e218ab97166 - std[fb80353258e89686]::sys::backtrace::__rust_end_short_backtrace::<std[fb80353258e89686]::panicking::begin_panic<alloc[853481b65ea3acd4]::string::String>::{closure#0}, !>
+   6:     0x7e218ab97153 - std[fb80353258e89686]::panicking::begin_panic::<alloc[853481b65ea3acd4]::string::String>
+   7:     0x7e2187512be7 - rustc_span[3116a6fa6fcaeb24]::macros::bug_impl
+   8:     0x7e2175953d6b - <rustc_session[353cd9de09cab51d]::session::Session>::time::<rustc_codegen_ssa[c0b5b53d2648dd96]::back::write::MaybeLtoModules<rustc_codegen_rakit[9e3a602d765eb4f9]::driver::aot::AotDriver>, <rustc_codegen_ssa[c0b5b53d2648dd96]::back::write::OngoingCodegen<rustc_codegen_rakit[9e3a602d765eb4f9]::driver::aot::AotDriver>>::join::{closure#0}>
+   9:     0x7e2175a12f80 - <rustc_codegen_ssa[c0b5b53d2648dd96]::back::write::OngoingCodegen<rustc_codegen_rakit[9e3a602d765eb4f9]::driver::aot::AotDriver>>::join
+  10:     0x7e2175acd4c1 - <rustc_codegen_rakit[9e3a602d765eb4f9]::RakitCodegenBackend as rustc_codegen_ssa[c0b5b53d2648dd96]::traits::backend::CodegenBackend>::join_codegen
+  11:     0x7e218cb8f52e - <rustc_interface[b7da42965084f0ea]::queries::Linker>::link
+  12:     0x7e218c8e97e7 - rustc_interface[b7da42965084f0ea]::interface::run_compiler::<(), rustc_driver_impl[4017350140c73312]::compiler_entrypoint::{closure#0}>::{closure#2}
+  13:     0x7e218cbdf27a - <rustc_thread_pool[22e63e7495d6baf6]::job::StackJob<rustc_thread_pool[22e63e7495d6baf6]::latch::LatchRef<rustc_thread_pool[22e63e7495d6baf6]::latch::LockLatch>, <rustc_thread_pool[22e63e7495d6baf6]::registry::Registry>::in_worker_cold<<rustc_thread_pool[22e63e7495d6baf6]::thread_pool::ThreadPool>::install<rustc_interface[b7da42965084f0ea]::util::run_in_thread_pool_with_globals<rustc_interface[b7da42965084f0ea]::interface::run_compiler<(), rustc_driver_impl[4017350140c73312]::compiler_entrypoint::{closure#0}>::{closure#2}, ()>::{closure#6}::{closure#0}::{closure#1}::{closure#0}, ()>::{closure#0}, ()>::{closure#0}::{closure#0}, ()> as rustc_thread_pool[22e63e7495d6baf6]::job::Job>::execute
+  14:     0x7e218cbdebb6 - <rustc_thread_pool[22e63e7495d6baf6]::registry::WorkerThread>::wait_or_steal_until_cold
+  15:     0x7e218cbdf9e3 - <rustc_thread_pool[22e63e7495d6baf6]::registry::ThreadBuilder>::run
+  16:     0x7e218cbdf82e - std[fb80353258e89686]::sys::backtrace::__rust_begin_short_backtrace::<<rustc_thread_pool[22e63e7495d6baf6]::ThreadPoolBuilder>::build_scoped<rustc_interface[b7da42965084f0ea]::util::run_in_thread_pool_with_globals<rustc_interface[b7da42965084f0ea]::interface::run_compiler<(), rustc_driver_impl[4017350140c73312]::compiler_entrypoint::{closure#0}>::{closure#2}, ()>::{closure#6}::{closure#0}::{closure#0}, rustc_interface[b7da42965084f0ea]::util::run_in_thread_pool_with_globals<rustc_interface[b7da42965084f0ea]::interface::run_compiler<(), rustc_driver_impl[4017350140c73312]::compiler_entrypoint::{closure#0}>::{closure#2}, ()>::{closure#6}::{closure#0}::{closure#1}, ()>::{closure#0}::{closure#0}::{closure#0}, ()>
+  17:     0x7e218cbdf6d4 - <std[fb80353258e89686]::thread::lifecycle::spawn_unchecked<<rustc_thread_pool[22e63e7495d6baf6]::ThreadPoolBuilder>::build_scoped<rustc_interface[b7da42965084f0ea]::util::run_in_thread_pool_with_globals<rustc_interface[b7da42965084f0ea]::interface::run_compiler<(), rustc_driver_impl[4017350140c73312]::compiler_entrypoint::{closure#0}>::{closure#2}, ()>::{closure#6}::{closure#0}::{closure#0}, rustc_interface[b7da42965084f0ea]::util::run_in_thread_pool_with_globals<rustc_interface[b7da42965084f0ea]::interface::run_compiler<(), rustc_driver_impl[4017350140c73312]::compiler_entrypoint::{closure#0}>::{closure#2}, ()>::{closure#6}::{closure#0}::{closure#1}, ()>::{closure#0}::{closure#0}::{closure#0}, ()>::{closure#1} as core[d05945f167f7bcf4]::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+  18:     0x7e218c95f1e3 - <std[fb80353258e89686]::sys::thread::unix::Thread>::new::thread_start
+  19:     0x7e2185a9e8bb - <unknown>
+  20:     0x7e2185b1c538 - <unknown>
+  21:                0x0 - <unknown>

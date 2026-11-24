@@ -156,6 +156,26 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
     `rakit-opt/src/passes/vectorize.rs` (strict shape match + runtime
     disjointness guard + `I32X4` body + reuse original loop as scalar tail) is
     written but **unwired** from the pipeline until moved to the post-egraph hook.
+  - **LANDED (post-egraph, `rakit-exp10`):** M3.1 is now implemented as a
+    post-egraph pass in the vendored backend
+    (`vendor/rakit-codegen/src/vectorize.rs`, called from `context.rs` right
+    after egraph+LICM). It matches the raw-pointer loop
+    `c[i]=(a[i]^b[i])*K`, `addr=base+(i<<2)`, constant trip; adds a **runtime
+    disjointness guard** (`|dst-src| >= n*4`, else scalar), an `I32X4` vector
+    loop (16-byte load/load, `bxor`, `imul.i32x4` by `splat(K)`, 16-byte store),
+    and **reuses the original loop as the scalar tail/fallback** (no scalar
+    duplication, no SSA value deleted). The pass **recomputes cfg+domtree** after
+    adding blocks — a stale dominator tree otherwise panics `blockorder`
+    (`lb_to_bindex[lb]` missing key). Knob `RAKIT_NO_VECTORIZE`.
+    - Measured (medians, A/B same compiler): `l3_iso` 140.0→**93.5** ms wall,
+      `l3_tail` 139.7→**94.0** ms (**−33%**); `pmuludq` now present. All four L3
+      fixtures match L's checksum on/off (incl. `l3_overlap`→scalar fallback and
+      `l3_tail`→scalar remainder).
+    - `l3_bw` (add) and `ktime` (slice/bounds-checked) are **not** matched yet;
+      `l3_iso` is still ~1.6× L because its init loops are not vectorized. M3.2
+      (bounds-check multi-block) and M3.3 remain.
+    - Suite: 65 suites / 25,368 passed / 0 failed. `allaxes` 15 progs all `ok`
+      with no runtime regression on p1–p9/h_*.
 
 ## Session (2026-11-24, branch `rakit-exp7`) — p9 reloads are real, but NOT soundly hoistable with the existing flags (alias tags don't move loads)
 
