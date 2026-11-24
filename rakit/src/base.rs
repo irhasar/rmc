@@ -30,8 +30,6 @@ pub(crate) struct CodegenedFunction {
     rakit_comments: CommentWriter,
     func_debug_cx: Option<FunctionDebugContext>,
     inline_asm: String,
-    crate_name: String,
-    user_crate: bool,
 }
 
 pub(crate) fn codegen_fn<'tcx>(
@@ -154,16 +152,7 @@ pub(crate) fn codegen_fn<'tcx>(
     // Verify function
     verify_func(tcx, &rakit_comments, &func);
 
-    CodegenedFunction {
-        symbol_name,
-        func_id,
-        func,
-        rakit_comments,
-        func_debug_cx,
-        inline_asm,
-        crate_name: tcx.crate_name(LOCAL_CRATE).to_string(),
-        user_crate: format!("{:?}", tcx.crate_types()).contains("Executable"),
-    }
+    CodegenedFunction { symbol_name, func_id, func, rakit_comments, func_debug_cx, inline_asm }
 }
 
 pub(crate) fn compile_fn(
@@ -205,7 +194,6 @@ pub(crate) fn compile_fn(
     // analysis rejects any loop that still contains a call or touches memory.
     let mut pipeline = rakit_opt::PassManager::new();
     pipeline
-        .push(Box::new(rakit_opt::RirPass::new(bodies)))
         .push(Box::new(rakit_opt::RecLoopPass))
         .push(Box::new(rakit_opt::StoreForwardPass))
         .push(Box::new(rakit_opt::DivTestPass))
@@ -213,13 +201,8 @@ pub(crate) fn compile_fn(
         .push(Box::new(rakit_opt::UnrollPass))
         .push(Box::new(rakit_opt::SincosPass));
     let mut analyses = rakit_opt::Analyses::new();
-    let mut pctx = rakit_opt::PassCtx {
-        ctx: &mut *context,
-        module: &mut *module,
-        analyses: &mut analyses,
-        crate_name: &codegened_func.crate_name,
-        user_crate: codegened_func.user_crate,
-    };
+    let mut pctx =
+        rakit_opt::PassCtx { ctx: &mut *context, module: &mut *module, analyses: &mut analyses };
     pipeline.run(&mut pctx);
 
     #[cfg(false)]

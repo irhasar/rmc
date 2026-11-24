@@ -294,10 +294,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rakit-ir"
-version = "0.1.0"
-
-[[package]]
 name = "rakit-isle"
 version = "0.137.0"
 
@@ -358,7 +354,6 @@ name = "rakit-opt"
 version = "0.1.0"
 dependencies = [
  "rakit-codegen",
- "rakit-ir",
  "rakit-module",
 ]
 

@@ -235,7 +235,7 @@ fn compile_cgu(
         // use bounded and to avoid changing the semantics of separately compiled symbols. The
         // bound is the larger of the two caps so a leaf-only body is still collected. Each body's
         // leaf-ness is computed here, once, instead of on every call site that names it.
-        let mut bodies = crate::passtime::time(crate::passtime::COLLECT, || {
+        let bodies = crate::passtime::time(crate::passtime::COLLECT, || {
             let collect_max =
                 crate::inliner::max_leaf_insts().max(crate::inliner::max_callee_insts());
             crate::inliner::CguBodies::collect(
@@ -254,22 +254,6 @@ fn compile_cgu(
                 collect_max,
             )
         });
-        // The inliner cache is filtered by the inlining size cap, so its length
-        // cannot classify the RIR budget. Count bridge-supported functions over
-        // the whole CGU; only do the preflight when the unit is large enough for
-        // the answer to matter.
-        let cgu_functions = aot_module.codegened_functions.len();
-        let rir_eligible = if cgu_functions > rakit_opt::tunables::rir_large_cgu_functions() {
-            aot_module
-                .codegened_functions
-                .iter()
-                .filter(|f| rakit_opt::rir::is_supported(&f.func))
-                .count()
-        } else {
-            cgu_functions
-        };
-        bodies.set_rir_eligible(rir_eligible);
-
         for codegened_func in aot_module.codegened_functions {
             crate::base::compile_fn(
                 &prof,
