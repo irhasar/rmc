@@ -187,8 +187,13 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
       (`trapnz`/div) since the vector body would skip it; pass gated to
       `isa.name()=="x64"` (baseline RISC-V cannot lower `I32X4`). Regression
       `bench/tests/t_vectorize.rs` (+ `regressions.sh` `check`) covers
-      unit/strided/zero-trip/overlap/in-place/tail/u8. Removed the committed
-      `rustc-ice-*.txt` dumps and gitignored them.
+      unit/strided/**zero-trip (n=0 leaves dst untouched)**/overlap/in-place/
+      tail/u8; the `overlap` fixture uses `dst = src+1` so a store feeds a later
+      read (a real overwrite hazard), and `regressions.sh` **also asserts the M
+      binary contains `pmuludq`** — output equality alone cannot prove the
+      vectorizer ran (with `RAKIT_NO_VECTORIZE=1` the output still matches but
+      there is no packed multiply). Removed the committed `rustc-ice-*.txt`
+      dumps and gitignored them.
 
 ## Session (2026-11-24, branch `rakit-exp7`) — p9 reloads are real, but NOT soundly hoistable with the existing flags (alias tags don't move loads)
 

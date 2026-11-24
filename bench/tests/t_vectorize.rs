@@ -1,7 +1,7 @@
-//! The post-egraph vectorizer must not change observable behaviour: unit-stride
-//! disjoint loops vectorize, while strided loops, zero-trip loops, overlapping
-//! buffers (dst aliasing a source), in-place writes and narrow (u8) loops must
-//! all still match the scalar semantics.
+//! The post-egraph vectorizer must not change observable behaviour. Unit-stride
+//! disjoint loops vectorize; strided loops, zero-trip loops, overlapping
+//! buffers (a store feeding a later iteration's read), in-place writes, tails
+//! and narrow (u8) loops must all still match the scalar semantics.
 fn ck(v: &[u32]) -> u64 {
     let mut h = 1469598103934665603u64;
     for &x in v {
@@ -49,22 +49,33 @@ fn main() {
         println!("strided2 {}", ck(&c));
     }
     {
+        // Zero-trip: n == 0 must leave the destination untouched.
+        let a = vec![7u32; 4];
+        let b = vec![9u32; 4];
+        let mut c = vec![0xDEAD_BEEFu32; 4];
+        unsafe { kern(a.as_ptr(), b.as_ptr(), c.as_mut_ptr(), 0, K) };
+        println!("zerotrip {} unchanged={}", ck(&c), c.iter().all(|&x| x == 0xDEAD_BEEF));
+    }
+    {
+        // Sub-vector trip (n = 2): only the scalar tail runs.
         const N: usize = 2;
         let a: Vec<u32> = (0..N).map(|i| (i as u32) + 5).collect();
         let b: Vec<u32> = (0..N).map(|i| (i as u32) + 9).collect();
         let mut c = vec![0u32; N];
         unsafe { kern(a.as_ptr(), b.as_ptr(), c.as_mut_ptr(), N, K) };
-        println!("zero {}", ck(&c));
+        println!("small {}", ck(&c));
     }
     {
+        // Overwrite hazard: dst = src + 1, so a store feeds a later read. This
+        // differs from the scalar result if the overlap guard is missing.
         const N: usize = 1000;
         let mut a: Vec<u32> = (0..N + 1).map(|i| (i as u32).wrapping_mul(7) ^ 0x1234).collect();
         let b: Vec<u32> = (0..N).map(|i| (i as u32).wrapping_mul(13) ^ 0x99).collect();
-        let p = a.as_mut_ptr();
-        unsafe { kern(p, p.add(1), p, N, K) };
+        unsafe { kern(a.as_ptr(), b.as_ptr(), a.as_mut_ptr().add(1), N, K) };
         println!("overlap {}", ck(&a));
     }
     {
+        // In-place: dst aliases a source exactly.
         const N: usize = 1000;
         let mut a: Vec<u32> = (0..N).map(|i| (i as u32).wrapping_mul(7) ^ 0x1234).collect();
         let b: Vec<u32> = (0..N).map(|i| (i as u32).wrapping_mul(13) ^ 0x99).collect();
