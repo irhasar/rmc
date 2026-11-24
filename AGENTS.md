@@ -28,7 +28,7 @@ order:
    a horizontal reduce for L2 **only if it preserves the f32 addition order**
    (see the ordering caveat below); scalar tail for `n % lanes`.
 4. **Codegen support check**: `pmulld` is SSE4.1 — must be feature-gated;
-   verify `bzhi`/vector `imul` lower in `rakit-codegen`.
+   verify vector `bxor`/`imul` (`pmulld`) lower in `rakit-codegen`.
 
 **Float-reduction ordering is a hard constraint (not optional).** p4's L2 is
 `s += a[i]*b[i] + (a[i]-b[i]).abs()` on `f32`. Rust does **not** permit
@@ -44,7 +44,7 @@ libcall-bound.
 - M1: load-value-numbering / redundant-load CSE + `v.len()==n` proof (enables
   bounds-check elimination) — also helps p2.
 - M2: bounds-check elimination for `0..v.len()` loops (retire §25's blocker).
-- M3: legality analysis + a **dilated / read-only** vectorizer for L3
+- M3: legality analysis + a **map-only (no reduction)** vectorizer for L3
   (`u32` xor-mul map) as the first real target (simplest body, no reduction).
 - M4: L2 reduction (horizontal), tails, `f32x4`.
 - M5: tune; measure vs LLVM.
@@ -105,7 +105,7 @@ blocker to solve for M1.
     early-return an empty vector when `!flags.preserve_frame_pointers()`.
   - **Unwind must ALSO change — the recipe as written is not a correct build.**
     Even with no frame setup, `gen_clobber_save` still emits
-    `UnwindInst::DefineNewFrame` (`x64/abi.rs:697-712`) and the System V encoder
+    `UnwindInst::DefineNewFrame` in `gen_clobber_save` (`x64/abi.rs:652`; `DefineNewFrame` at line 707) and the System V encoder
     sets `CallFrameInstruction::CfaRegister(fp)` when `mr.fp()` exists
     (`isa/unwind/systemv.rs:209-220`) — it tells the unwinder the CFA is in RBP
     even though the function never set RBP. So the omit-FP build would produce
@@ -120,7 +120,7 @@ blocker to solve for M1.
     `external.rs` `From<SyntheticAmode> for asm::Amode` (`base: Gpr::RSP`, same
     `-offset`); `emit.rs` `incoming_arg_offset = tail_args_size +
     setup_area_size + clobber_size + fixed_frame_storage_size +
-    outgoing_args_size`. (Same formula as `isa/riscv64/inst/args.rs:124-149`.)
+    outgoing_args_size`. (Same formula as `isa/riscv64/inst/args.rs:142-151`.)
 - **Correctness — EXECUTION ONLY (unwind is NOT correct, see the unwind bullet
   above).** After `rm -rf build/stdlib_target`
   (the backend `.so` is not fingerprinted, so std keeps the old lowering
@@ -146,7 +146,7 @@ blocker to solve for M1.
   bottleneck on these workloads — they are compute/memory/vectorization bound,
   and even call-heavy `p3` (`fib`) is call-*latency* bound, so the prologue
   instructions hide under the call latency. Remaining backend levers are
-  regalloc quality (p8) and a loop vectorizer (p4), both large.
+  a loop vectorizer (p4), which is large.
 - **Addendum — p8 is already near-optimal (so "regalloc cycle" was a red
   herring).** Disassembling `p8_minmax`'s hot loop: state `(i, a, mn)` is carried
   entirely in registers (`rax`=i, `r10`=a, `r8`=mn) with **no stack traffic** —
@@ -212,7 +212,7 @@ blocker to solve for M1.
     arg) reads them via RBP**; omitting the frame pointer breaks such
     **ordinary calls**, not only `return_call`. This is **fixable by mirroring
     RISC-V**, which already lowers `AMode::IncomingArg` **SP-relative** from the
-    frame layout (`isa/riscv64/inst/args.rs:124-149`:
+    frame layout (`isa/riscv64/inst/args.rs:142-151`:
     `sp_offset = tail_args_size + setup_area_size + clobber_size +
     fixed_frame_storage_size + outgoing_args_size`, then `sp_offset - off`).
     The earlier claim that "RSP moves within a function" is **wrong for
