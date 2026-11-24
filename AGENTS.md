@@ -56,8 +56,9 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
 **Findings**
 - **Size: M smallest on every program** (~4.06–4.16 MB vs L 4.61–4.64, U 5.81–5.96).
 - **Compile:** M ≈ L on wall/cpu (M faster on p2 164/222 vs 243/371, h_mem
-  172/239 vs 262/424); M is **slower than U** (extra passes). Compile RSS ~equal
-  (M/U ~118–137 MB; L ~101–137 MB; M ≈ U within ~1–3 MB).
+  172/239 vs 262/424); M is **slower than U** (extra passes). Compile RSS is ~equal; observed ranges
+  over these programs: L 101.1–137.6, U 103.9–136.2, M 104.2–137.2 MB (e.g. p6
+  U 103.9 vs M 104.2; M ≈ U, not ≈ 118 MB).
 - **Run:** M wins p5 (7/6 vs 58/57), p6 (6/6 vs 58/57), p7 (35/35 vs 43/42); ties
   p8 (20/20 vs 18/17), p9 (33/33 vs 30/29); loses p1 (101/100 vs 81/81),
   p2 (48/48 vs 16/16), p3 (55/55 vs 41/39), p4 (84/83 vs 56/55). Run RSS ~equal.
@@ -71,9 +72,10 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
 - p1: branchy saturating `f64→u64` (documented negative result).
 - p2: sort/hash codegen + regalloc spills (backend).
 - p3: `fib` + `std::fmt`.
-- p4: **`sincosf` fusion IS firing** (the M binary references `sincosf`; `nm` shows
-  `U sincosf`), so p4 is *not* separate `sinf`/`cosf`. The cost is the unvectorized
-  L2/L3 plus libm cost.
+- p4: **`sincosf` fusion IS firing in `main`** — the `sincosf@GLIBC` reference is
+  attributed to `main` (`_RNvCscHQzel4R8V1_7p4_simd4main`), i.e. the init loop
+  (`p4_simd.rs:2-6`). So p4 is *not* separate `sinf`/`cosf`; the cost is the
+  unvectorized L2/L3 plus libm cost.
 - p4 **L2 is partially vectorizable**: `s += a[i]*b[i] + (a[i]-b[i]).abs()` — the
   per-element term is independent, so SIMD can compute the terms while the
   accumulator `s` still adds them **in program order** (f32 non-associativity
@@ -101,7 +103,12 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
      multiple-of-4 fast path + scalar tail; emit `I32X4` (`imul.i32x4` + `splat`).
      Validated on a synthetic `get_unchecked` microbench.
   2. **M3.2** handle the bounds-check multi-block shape (hoist `i+3 < n` or require
-     bound = slice length so checks are redundant) — this is what unlocks p4.
+     bound = slice length so checks are redundant) **and** prove the stored buffer
+     does not overlap the loaded buffers across the widened 4-wide window: if
+     `dst` may alias `s1`/`s2`, vectorizing reorders loads before stores and
+     changes results. Safe Rust's distinct `Vec` borrows imply non-overlap, but
+     CLIF carries no such provenance, so the pass must require distinct base
+     pointers or a no-overlap proof, else skip. Only then is p4 unlocked safely.
   3. **M3.3** generalize ops (xor/add first), then integrate `addr_base`/private-slot.
 - Not implemented in code yet; recorded so the multi-session effort is grounded.
 
