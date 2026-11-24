@@ -1,45 +1,53 @@
-## Session (2026-11-24, branch `rakit-exp7`) — diagnosis from the CLIF dump: p9 reloads are loop-invariant loads (not spills), blocked by the sinf call fence
+## Session (2026-11-24, branch `rakit-exp7`) — p9 reload diagnosis corrected: flag-check + dynamic store (not the call), and alias tags do NOT hoist
 
-Diagnosed the surviving reloads by dumping post-egraph CLIF:
-`rustc-rakit --emit=llvm-ir` writes `<out>.rakit/<sym>.opt.rakit` (post codegen
-optimizer, pre-lowering) and `<sym>.unopt.rakit`.
+CLIF dump (`rustc-rakit --emit=llvm-ir` writes `<out>.rakit/<sym>.opt.rakit`
+post-optimizer and `.unopt.rakit`). For p9 `main`, block5 hoists the addresses
+`v197 = stack_addr ss0+8`, `v198 = stack_addr ss0+16` (the `a: Vec` header) out
+of the loop, but block8 still does `v31 = load.i64 notrap v197`,
+`v36 = load.i64 notrap v198` every iteration. So the reloads are **redundant
+loop-invariant stack loads**, not regalloc spills — the addresses are hoisted,
+only the loads repeat. But the *mechanism* I first wrote was wrong; corrected
+against the code:
 
-- **p9 `main` (`_RNv...9p9_u64f324main.opt.rakit`):** the loop-invariant part IS
-  hoisted — `block5` computes `v197 = stack_addr.i64 ss0+8` and
-  `v198 = stack_addr.i64 ss0+16` (the local `a: Vec` header) **outside** the
-  loop. But the **loads** `v31 = load.i64 notrap v197` and
-  `v36 = load.i64 notrap v198` still sit **inside** `block8`, once per iteration.
-  The body runs `block6` → `v17 = call fn2` (`; lib_call sinf`) → `block8`
-  (reload+bounds-check) → `block10` (`store.f32 notrap v17, v85` = `a[i]=..`) →
-  back edge to `block2`.
-  - **Correction:** these are **redundant loop-invariant stack loads**, NOT
-    "regalloc spills of loop invariants" (the earlier unverified claim). The
-    addresses are hoisted; only the loads repeat.
-- **Why they survive:** `has_memory_fence_semantics` (`alias_analysis.rs:93-105`)
-  treats **every `Call`/`CallIndirect`/`TryCall` as a fence** that clobbers all
-  regions, and the loop contains the `sinf` call. So even with alias regions the
-  invariant loads cannot be CSE'd across the call; and Rakit LICM (vendor
-  `licm.rs`) refuses to hoist loads past an opaque store/call. p9 is therefore
-  blocked by the **call fence**, not by missing regions.
-- **And p9 is sinf-latency-bound** (the call dominates each iteration),
-  consistent with the earlier neutral `licm_loads` experiment: removing 2
-  loads/iteration is invisible. **Conclusion: p9 is not a worthwhile target.**
+- **The blocker is LICM's flag check, not a call fence.** `hoist_from_loop`
+  (`licm.rs:288-304`) rejects a load **first** unless
+  `flags.readonly() && flags.notrap() && flags.can_move()`; only then does it
+  test `safe = !any_opaque_store && !store_bases.contains(base)`. The header
+  loads are `notrap` only, so they `continue` at the flag check before any
+  aliasing/store reasoning.
+- **Calls are NOT opaque stores.** `any_opaque_store` is set only by a
+  `can_store()` opcode whose `addr_base` is `None` (`licm.rs:257-266`), and the
+  `call` opcode is declared **without** `can_store`
+  (`rakit-codegen-meta/src/shared/instructions.rs:188-205`). The store that
+  actually sets `any_opaque_store` in p9's loop is the dynamic element store
+  `store.f32 notrap v17, v85` (`v85 = iadd v31, i<<2`): `addr_base`
+  (`licm.rs:372-390`) only recognizes a direct `StackAddr`/`UnaryGlobalValue`, so
+  a value derived from a load returns `None` → `any_opaque_store = true`. So even
+  if the header loads carried readonly+can_move, this dynamic store would still
+  block them. (REPORT.md §26.2 "Akar 1" gave `sinf` as the opaque-store example;
+  that example is wrong — the dynamic `a[i]=` store is the one.)
+- **Alias tags do not hoist loads.** The egraph's `process_inst`
+  (`alias_analysis.rs:1353-1389`) can reuse a *dominating* matching value but
+  cannot move the first load; and both `is_pure_for_egraph`
+  (`inst_predicates.rs:44-58`) and `hoist_from_loop` gate on the
+  `readonly+notrap+can_move` **flags**, not on an alias region. So the earlier
+  "alias regions → CSE/hoist invariant stack loads" idea is **wrong** for
+  hoisting a first load; alias regions only help egraph *reuse*, not movement.
+- **The cost of removing p9's reloads is UNMEASURED.** The `licm_loads`
+  experiment (REPORT.md §26.2) left the p9 header loads in place (13 = 13
+  reloads in both builds), so its neutral timing does **not** measure the effect
+  of removing them. (The old "removing 2 loads is invisible" note is therefore
+  unsupported; p9 may still be sinf-latency-bound, but that must be measured,
+  not inferred from that experiment.)
 
-**Lever, narrowed by the evidence:** alias regions (a per-private-stack-slot
-region vs one shared heap region) can let the egraph CSE/hoist invariant stack
-loads across an in-loop **store** — but **only for call-free loops**, because
-calls are unconditional fences. Realistic targets are **p2** inner loops and
-**p4 L3** (`c[i]=(a[i]^b[i])*K`, no call) — the same L3 the vectorizer needs.
-Sound scheme: tag only slots whose address never escapes (reuse
-`store_forward`'s `private_slots` idea), tag all other loads/stores with one
-shared region, and leave calls as fences. APIs: `func.dfg.alias_regions`
-(`AliasRegionSet::insert(AliasRegionData{ user_id })`; `user_id` must be unique
-across a compilation when inlining) and `func.dfg.mem_flags[flags].set_alias_region`.
-
-**Next (implementation candidate):** an `alias_regions` CLIF pass with that
-sound scheme, validated first on a **call-free** store-loop microbench (confirm
-the invariant loads leave the loop in `.opt.rakit`, and 15/15 outputs + suite
-stay green), then measured. p9 is explicitly out of scope (call fence).
+**What hoisting would actually require (all in LICM, not alias regions):**
+(1) mark a private-slot header load `readonly+can_move+notrap` (sound if the slot
+is not written in the loop — true here), **and** (2) make LICM's `safe` check
+treat a dynamic / opaque store as unable to hit a **private** stack slot (one
+whose address never escapes). Only (2) can lift `any_opaque_store = true` for the
+`a[i]=` store. That is the real, narrow lever — a LICM change — and it must be
+justified by a controlled experiment that *actually* removes the loads and
+measures the delta.
 
 ## Session (2026-11-24, branch `rakit-exp6`) — M1 premise re-checked: reload cause is UNVERIFIED (diagnose first)
 
