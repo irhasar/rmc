@@ -43,6 +43,23 @@ Each milestone is independently landable and correctness-gated; none is
 attempted blindly. Do **not** land a vectorizer without the alias proof (M1) —
 reordering loads/stores of possibly-aliasing Vecs silently corrupts results.
 
+### M1 first attempt — blocked by debug value-labels (reverted)
+Wrote `rakit-opt/src/passes/load_cse.rs`: block-local redundant-load elimination
+(merge a `load` with an earlier same-address/type/offset/flags `load` in the same
+block when no store/call/side-effect lies between; this IR has **no volatile
+flag**, so it is semantically safe in a store-free stretch, and the egraph only
+CSEs `readonly+notrap+can_move` loads, which Rust `Vec` loads are not). It
+**ICE'd compiling `core`**: `change_to_alias` inserts a
+`ValueLabelAssignments::Alias` entry keyed by the *removed* value
+(`dfg.rs:270-271`), and the machinst value-label emitter then does
+`self.value_regs[val]... .only_reg().unwrap()` on an empty reg set
+(`machinst/lower.rs:1064`). Guarding on a pre-existing label is not enough —
+`change_to_alias` creates the entry itself. Safe load elimination that removes a
+value therefore needs the value-label machinery to follow/relocate alias labels
+(or debuginfo to be dropped for the merged value), which is a real M1 sub-task,
+not a drop-in pass. **Reverted** (no ICE shipped); this is the first concrete
+blocker to solve for M1.
+
 ## Session (2026-11-24, branch `rakit-exp5`) — x64 omit-FP: implemented, correct, RUNTIME-NEUTRAL (reverted)
 
 - **Outcome:** implemented full omit-frame-pointer for x64 (mirroring RISC-V),
