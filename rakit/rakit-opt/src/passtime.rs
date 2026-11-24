@@ -4,9 +4,13 @@
 //! thread-local cell; [`report`] prints the per-thread totals. Used to keep the
 //! compile-time cost of the custom passes honest without a profiler.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
-static ENABLED: AtomicBool = AtomicBool::new(false);
+/// Read once: `std::env::var_os` takes a global lock, and `time()` is called for
+/// nearly every function, so re-reading the variable per call shows up in a
+/// normal (accounting-off) build.
+static ENABLED: OnceLock<bool> = OnceLock::new();
 
 /// Codegen runs on rustc's worker threads, so the totals have to be shared: a
 /// thread-local accumulator would be reset before [`report`] ever ran.
@@ -31,12 +35,7 @@ const NAMES: [&str; 7] = [
 ];
 
 fn enabled() -> bool {
-    if ENABLED.load(Ordering::Relaxed) {
-        return true;
-    }
-    let on = std::env::var_os("RAKIT_PASS_TIME").is_some();
-    ENABLED.store(on, Ordering::Relaxed);
-    on
+    *ENABLED.get_or_init(|| std::env::var_os("RAKIT_PASS_TIME").is_some())
 }
 
 /// Run `f`, charging its wall time to `slot` when accounting is on.

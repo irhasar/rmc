@@ -12,6 +12,19 @@ pub mod unroll;
 use crate::pass::{Pass, PassCtx};
 use crate::passtime;
 
+use rakit_codegen::ir::{self, Opcode};
+
+/// Cheap necessary-condition prefilter: does any instruction use `want`? An
+/// opcode-only walk is far cheaper than the per-pass setup (use-count maps,
+/// CFG/dominator construction) the pass would otherwise run before finding
+/// nothing, and the vast majority of functions do not contain the opcode a
+/// given pass looks for.
+fn has_opcode(func: &ir::Function, want: Opcode) -> bool {
+    func.layout
+        .blocks()
+        .any(|b| func.layout.block_insts(b).any(|i| func.dfg.insts[i].opcode() == want))
+}
+
 pub struct RecLoopPass;
 
 impl Pass for RecLoopPass {
@@ -51,8 +64,22 @@ impl Pass for DivTestPass {
     }
 
     fn run(&mut self, pctx: &mut PassCtx<'_>) -> bool {
-        passtime::time(passtime::DIV_TEST, || div_test::run(&mut pctx.ctx.func));
-        true
+        // Respect the disable switch before doing any work: a disabled pass must
+        // cost nothing, not even the opcode pre-scan.
+        if !crate::tunables::div_test_enabled() {
+            return false;
+        }
+        // The pre-scan is inside the timer so the reported time includes it, and
+        // the closure's result is the pass result: `div_test::run` reports
+        // whether it rewrote anything, so a function with no candidate or a
+        // rejected function both yield `false`.
+        passtime::time(passtime::DIV_TEST, || {
+            if has_opcode(&pctx.ctx.func, Opcode::Urem) {
+                div_test::run(&mut pctx.ctx.func)
+            } else {
+                false
+            }
+        })
     }
 }
 
@@ -64,15 +91,23 @@ impl Pass for IfConvertPass {
     }
 
     fn run(&mut self, pctx: &mut PassCtx<'_>) -> bool {
-        // A two-way diamond needs a head, two arms and a join, i.e. at least
-        // three blocks. Below that the pass can only scan and find nothing, so
-        // skip it: on a crate with thousands of small functions this is most of
-        // the compile cost.
-        if pctx.ctx.func.layout.blocks().nth(2).is_none() {
+        if !crate::tunables::if_convert_enabled() {
             return false;
         }
-        passtime::time(passtime::IF_CONVERT, || if_convert::run(&mut pctx.ctx.func, pctx.analyses));
-        true
+        // A two-way diamond needs a head, two arms and a join (>=3 blocks) and a
+        // `brif` head; skip otherwise. The block-count check and the opcode scan
+        // are inside the timer so the reported time includes them, and the
+        // closure's result is the pass result (`if_convert::run` reports whether
+        // it converted a diamond).
+        passtime::time(passtime::IF_CONVERT, || {
+            if pctx.ctx.func.layout.blocks().nth(2).is_some()
+                && has_opcode(&pctx.ctx.func, Opcode::Brif)
+            {
+                if_convert::run(&mut pctx.ctx.func, pctx.analyses)
+            } else {
+                false
+            }
+        })
     }
 }
 
@@ -115,7 +150,9 @@ impl Pass for SincosPass {
     }
 
     fn run(&mut self, pctx: &mut PassCtx<'_>) -> bool {
-        if std::env::var_os("RAKIT_NO_SINCOS").is_none() {
+        if std::env::var_os("RAKIT_NO_SINCOS").is_none()
+            && has_opcode(&pctx.ctx.func, Opcode::Call)
+        {
             sincos::run(&mut *pctx.module, &mut pctx.ctx.func, pctx.analyses);
         }
         true

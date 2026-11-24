@@ -54,14 +54,17 @@ struct Candidate {
     use_site: UseSite,
 }
 
-pub fn run(func: &mut ir::Function) {
+/// Returns whether any `urem`-by-constant was actually rewritten.
+pub fn run(func: &mut ir::Function) -> bool {
     if !crate::tunables::div_test_enabled() {
-        return;
+        return false;
     }
     let candidates = collect(func);
+    let changed = !candidates.is_empty();
     for cand in candidates {
         rewrite(func, &cand);
     }
+    changed
 }
 
 /// Find every `urem` by a constant whose sole use tests whether it is zero.

@@ -192,14 +192,18 @@ fn arm_values_are_dead_outside(
     true
 }
 
-pub fn run(func: &mut ir::Function, analyses: &mut crate::analyses::Analyses) {
+/// Returns whether any diamond was actually converted.
+pub fn run(func: &mut ir::Function, analyses: &mut crate::analyses::Analyses) -> bool {
     if !crate::tunables::if_convert_enabled() {
-        return;
+        return false;
     }
     // Convert to a fixed point: one rewrite can expose another.
+    let mut changed = false;
     while convert_one(func, analyses) {
+        changed = true;
         analyses.invalidate();
     }
+    changed
 }
 
 /// Find and rewrite a single convertible diamond, returning whether it changed

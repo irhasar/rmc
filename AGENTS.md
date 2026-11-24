@@ -1,3 +1,106 @@
+## Session (2026-11-24, branch `rakit-exp2`) — opcode pre-scans for cheap passes
+
+- **Branch:** created from `replace-main-with-cgclif-experiments` after PR #12
+  merged (`cb273bf`).
+- **Runtime exploration first (all architectural):**
+  - `p8` lane-factor sweep on the current tree: F=2/4/6/8 → **21/23/22/23 ms**
+    (L 18). F=2 still best; ≥4 spills. The residual gap is the forcing term being
+    recomputed per super-iteration (`lea`/`add`) instead of advanced by a
+    constant add as LLVM does. Closing it needs the deferred per-lane carried
+    state rewrite (AGENTS "LCG lane transform — next step"), not a factor tweak.
+  - `p9` disasm: loop is `xorps;cvtsi2ss;call sinf;` then reloads `a.ptr`/`a.len`
+    from `0x8/0x10(%rsp)` every iteration (regalloc keeps loop-invariants on the
+    stack) plus a `mov sinf@GOT` per iter. 85% is `sinf`; the reloads are L1 hits —
+    the documented wall, no pass-sized win.
+  - `p1` disasm: `f += sqrt(i)*0.5` is a serial f64 add chain; LLVM pipelines the
+    independent `sqrt`s by unrolling a multi-block body. Needs a multi-block
+    unroller, out of scope.
+- **Landed: opcode pre-scans in the pass adapters** (`passes/mod.rs`). Each cheap
+  pass did expensive setup (a use-count map, a CFG build, callee-name
+  resolution) for *every* function before finding nothing. New `has_opcode`
+  helper (opcode-only walk) gates them on a necessary condition:
+  - `div_test`: skip unless the function has an `Opcode::Urem`.
+  - `if_convert`: skip unless it has ≥3 blocks **and** an `Opcode::Brif`.
+  - `sincos`: skip unless it has an `Opcode::Call`.
+  All three are necessary conditions (no `urem`/`brif`/call ⇒ the pass cannot
+  fire), so the IR is unchanged. The disable switches (`RAKIT_NO_DIVTEST`,
+  `RAKIT_NO_IFCONV`) are checked **before** the scan, so a disabled pass costs
+  nothing; and the pre-scan runs **inside** the `passtime::time` region so the
+  reported per-pass time includes the scan. The adapters return the optimizer's
+  own result: `div_test::run` and `if_convert::run` now return whether they
+  actually rewrote (so a function with no `urem` candidate or no convertible
+  diamond yields `false`), and a prefilter rejection also returns `false` — so
+  `Pass::run`'s "did the function change" answer is truthful. `passtime::enabled()`
+  memoises `RAKIT_PASS_TIME` in a `OnceLock`, so the extra `time()` calls for
+  skipped functions do not re-read the environment in a normal build.
+  - **Byte-identical:** all 15 bench programs md5-match the pre-change build.
+  - **A/B compile (median, reps=15, same session):** `p2_mem` 158→**155** wall
+    (cpu 217→217), `h_mem` 168→**165** (238→233), `p4_simd` 107→**105**
+    (132→128). Scan-inclusive `div_test` per-pass on `p2_mem`/`h_mem` cgu.1:
+    1.7/2.1 → **0.6** ms (the 0.4 quoted earlier excluded the scan).
+- **Measurement caveat (wall vs cpu):** **runtime is unchanged on CPU time**;
+  wall time is sensitive to machine contention and must be read with CPU time.
+  One allaxes pass showed `p1_arith` M at **261 ms wall / 101 ms CPU** (a
+  scheduling stall); an isolated 20-rep re-measure gives **101/100 ms** and the
+  clean re-run matrix below shows 101/100. Judge runtime by CPU (and by a clean
+  re-run), not a single wall sample.
+- **Verification:** `./y.sh build` exit 0; `./y.sh test --sysroot rakit` → 65
+  suites / 25,368 passed / 0 failed; `bench/allaxes.sh` (CREPS=3 RREPS=7) →
+  45/45 rows `ok`. Runtime (CPU) and sizes unchanged (matrix below).
+
+### Full all-axes matrix (`bench/allaxes.sh`, CREPS=3 RREPS=7)
+L = LLVM, U = cg_clif upstream, M = modified Rakit. Compile = wall / cpu (user+sys)
+ms / peak RSS MB / artifact bytes. Run = wall / cpu ms / peak RSS MB. All stdout
+matched LLVM. (Run wall is contention-sensitive; compare with run cpu.)
+
+| prog | bk | Cwall | Ccpu | Crss | size(B) | Rwall | Rcpu | Rrss |
+|------|----|------:|-----:|-----:|--------:|------:|-----:|-----:|
+| h_arith | L | 148 | 154 | 117.7 | 4617128 | 193 | 2 | 10.8 |
+| h_arith | U | 92 | 119 | 120.0 | 5839120 | 2 | 2 | 11.0 |
+| h_arith | M | 104 | 132 | 120.6 | 4078672 | 2 | 2 | 11.0 |
+| h_branch | L | 122 | 149 | 118.1 | 4616832 | 2 | 2 | 11.1 |
+| h_branch | U | 91 | 121 | 120.3 | 5837264 | 2 | 2 | 10.8 |
+| h_branch | M | 103 | 131 | 120.5 | 4077008 | 2 | 2 | 11.0 |
+| h_calls | L | 118 | 143 | 118.8 | 4616872 | 2 | 2 | 11.1 |
+| h_calls | U | 92 | 122 | 120.8 | 5837792 | 3 | 2 | 10.8 |
+| h_calls | M | 103 | 133 | 120.8 | 4077368 | 2 | 2 | 10.8 |
+| h_float | L | 128 | 152 | 117.0 | 4637984 | 2 | 2 | 10.7 |
+| h_float | U | 95 | 125 | 119.7 | 5861024 | 3 | 3 | 11.0 |
+| h_float | M | 103 | 132 | 120.0 | 4118168 | 2 | 2 | 11.0 |
+| h_mem | L | 276 | 441 | 138.3 | 4646848 | 3 | 3 | 11.0 |
+| h_mem | U | 139 | 191 | 136.1 | 5959856 | 10 | 9 | 11.1 |
+| h_mem | M | 172 | 245 | 137.8 | 4166120 | 5 | 4 | 10.7 |
+| h_simd | L | 145 | 168 | 124.2 | 4617704 | 2 | 2 | 11.0 |
+| h_simd | U | 102 | 128 | 125.7 | 5843736 | 4 | 3 | 11.0 |
+| h_simd | M | 112 | 140 | 126.2 | 4081096 | 2 | 2 | 11.0 |
+| p1_arith | L | 89 | 110 | 105.8 | 4635232 | 82 | 83 | 11.1 |
+| p1_arith | U | 88 | 105 | 108.6 | 5877944 | 108 | 108 | 11.0 |
+| p1_arith | M | 90 | 115 | 109.4 | 4146112 | 101 | 100 | 11.0 |
+| p2_mem | L | 254 | 395 | 133.9 | 4639888 | 17 | 17 | 11.0 |
+| p2_mem | U | 139 | 183 | 132.3 | 5936144 | 159 | 156 | 11.0 |
+| p2_mem | M | 161 | 219 | 133.6 | 4143368 | 50 | 49 | 11.0 |
+| p3_calls | L | 101 | 126 | 116.2 | 4612368 | 37 | 37 | 11.0 |
+| p3_calls | U | 89 | 115 | 117.8 | 5820136 | 116 | 116 | 10.7 |
+| p3_calls | M | 112 | 134 | 118.7 | 4067048 | 56 | 55 | 10.8 |
+| p4_simd | L | 109 | 130 | 116.6 | 4636096 | 56 | 56 | 48.2 |
+| p4_simd | U | 94 | 118 | 118.2 | 5892376 | 157 | 155 | 49.5 |
+| p4_simd | M | 106 | 130 | 119.0 | 4152736 | 84 | 84 | 48.8 |
+| p5_inline | L | 84 | 104 | 104.8 | 4609368 | 58 | 58 | 10.8 |
+| p5_inline | U | 80 | 103 | 107.4 | 5813704 | 892 | 891 | 11.0 |
+| p5_inline | M | 84 | 109 | 108.0 | 4059960 | 7 | 6 | 10.8 |
+| p6_scalar | L | 83 | 102 | 101.2 | 4609368 | 58 | 57 | 11.1 |
+| p6_scalar | U | 77 | 98 | 103.7 | 5813688 | 903 | 901 | 10.9 |
+| p6_scalar | M | 83 | 105 | 104.2 | 4059960 | 7 | 6 | 10.8 |
+| p7_branchy | L | 85 | 103 | 105.2 | 4609520 | 43 | 42 | 10.8 |
+| p7_branchy | U | 79 | 102 | 107.6 | 5813800 | 102 | 102 | 11.0 |
+| p7_branchy | M | 88 | 109 | 108.1 | 4060120 | 36 | 35 | 11.0 |
+| p8_minmax | L | 87 | 106 | 105.2 | 4609544 | 18 | 18 | 10.7 |
+| p8_minmax | U | 80 | 102 | 107.3 | 5813752 | 38 | 38 | 10.8 |
+| p8_minmax | M | 87 | 110 | 107.9 | 4060088 | 21 | 20 | 11.1 |
+| p9_u64f32 | L | 97 | 117 | 110.9 | 4635448 | 31 | 30 | 17.8 |
+| p9_u64f32 | U | 108 | 116 | 113.6 | 5886872 | 77 | 76 | 18.8 |
+| p9_u64f32 | M | 99 | 124 | 114.5 | 4149744 | 34 | 34 | 18.2 |
+
 ## Session (2026-11-24, branch `rakit-further-experiments`) — compile-axis wins
 
 - **Goal shift:** the runtime gaps left (p2/h_mem hash+sort, p4 autovectorization,
