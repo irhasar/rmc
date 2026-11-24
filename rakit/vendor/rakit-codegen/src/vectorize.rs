@@ -407,11 +407,25 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
     let ok = match lanes {
         Lanes::U32 => matches!(
             op,
-            Opcode::Bxor | Opcode::Band | Opcode::Bor | Opcode::Iadd | Opcode::Isub | Opcode::Imul
+            Opcode::Bxor
+                | Opcode::Band
+                | Opcode::Bor
+                | Opcode::Iadd
+                | Opcode::Isub
+                | Opcode::Imul
+                | Opcode::Ishl
+                | Opcode::Ushr
+                | Opcode::Sshr
         ),
         Lanes::I64 => matches!(
             op,
-            Opcode::Bxor | Opcode::Band | Opcode::Bor | Opcode::Iadd | Opcode::Isub
+            Opcode::Bxor
+                | Opcode::Band
+                | Opcode::Bor
+                | Opcode::Iadd
+                | Opcode::Isub
+                | Opcode::Ishl
+                | Opcode::Ushr
         ),
         // u8: exact arith + unsigned min/max (pminub/pmaxub are SSE2; signed
         // byte min/max need SSE4.1, so smin/smax on I8 stay out).
@@ -491,6 +505,19 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
         (load_bases[0], cval)
     };
 
+    // Constant shifts only, with the amount in range (avoids masking differences
+    // between scalar and packed shift semantics).
+    if matches!(op, Opcode::Ishl | Opcode::Ushr | Opcode::Sshr) {
+        let width = match lanes {
+            Lanes::U32 => 32,
+            Lanes::I64 => 64,
+            _ => return None,
+        };
+        match rhs_val {
+            Rhs::IntConst(c) if c >= 0 && c < width => {}
+            _ => return None,
+        }
+    }
     for &base in &[base_a, store_base] {
         if !defined_outside_chain(dfg, &func.layout, base, h, &chain) {
             return None;
@@ -869,6 +896,9 @@ fn apply(func: &mut Function, p: Plan) {
             Opcode::Bor => cur.ins().bor(va, other),
             Opcode::Iadd => cur.ins().iadd(va, other),
             Opcode::Isub => cur.ins().isub(va, other),
+            Opcode::Ishl => cur.ins().ishl(va, other),
+            Opcode::Ushr => cur.ins().ushr(va, other),
+            Opcode::Sshr => cur.ins().sshr(va, other),
             Opcode::Imul => cur.ins().imul(va, other),
             Opcode::Umin => cur.ins().umin(va, other),
             Opcode::Umax => cur.ins().umax(va, other),

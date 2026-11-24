@@ -337,10 +337,15 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
     `por`/`paddw` (splat of `iconst.i8`/`i16` lowers fine; no multiply/min/max).
     New `t_vectorize_narrow_const` (8 fns, n=1000/999/17/15/1/0); regressions
     asserts `paddb`/`pxor`/`pand`/`por`/`paddw`.
-  - **Vector shifts: BLOCKED by a Cranelift ICE.** `ishl`/`ushr`/`sshr` with a
-    splat-constant amount ICEs in x64 lowering (`mask_xmm_shift`: "cannot
-    construct Gpr from register ... with register class Float"). Reverted; needs
-    a fix in the vendored Cranelift before shifts can vectorize.
+  - **M4.3 LANDED: vector shifts (ICE fixed in vendored Cranelift).** The x64
+    lowering's `mask_xmm_shift` fallback calls `lo_gpr`, which panics on a vector
+    (XMM/Float-class) amount. Added an ISLE rule in `isa/x64/lower.isle`
+    (`(rule 2 (mask_xmm_shift ty (splat _ (iconst _ n))) (RegMemImm.Imm
+    (shift_amount_masked ty n)))`) so a splat-constant amount takes the immediate
+    path. The vectorizer now allows constant shifts (amount < lane width): u32
+    `Ishl`/`Ushr`/`Sshr` and i64 `Ishl`/`Ushr` → `pslld`/`psrld`/`psrad`/
+    `psllq`/`psrlq`. New `t_vectorize_shift` (n=1000/999/17/15/1/0); regressions
+    asserts the five ops.
   - **Slice loops (bounds checks): not vectorized.** `for i in 0..n { c[i]=a[i]+b[i] }`
     lowers every access with a bounds `icmp`+`brif` to a cold `call panic; trap`
     block, i.e. a multi-block body *with internal control flow*. Vectorizing it
