@@ -86,13 +86,15 @@ blocker to solve for M1.
   plus a no-store-on-path proof — the same alias/analysis wall as §25, i.e. the
   genuinely hard part. Do not re-add a block-local-only version.
 
-## Session (2026-11-24, branch `rakit-exp5`) — x64 omit-FP: implemented, correct, RUNTIME-NEUTRAL (reverted)
+## Session (2026-11-24, branch `rakit-exp5`) — x64 omit-FP: execution-correct but UNWIND-INVALID, RUNTIME-NEUTRAL (reverted)
 
 - **Outcome:** implemented full omit-frame-pointer for x64 (mirroring RISC-V),
-  built the whole sysroot with it, validated correct, measured **neutral**, and
+  built the whole sysroot with it, validated **execution output only** (unwind
+  is NOT correct — see the unwind bullet), measured **neutral on runtime**, and
   **reverted**. This closes the biggest open runtime lever from the `rakit-exp4`
   blocker map — don't re-attempt it for runtime.
-- **Recipe that worked (reverted; keep for reference):**
+- **Recipe (execution works; unwind still needs the extra change below; kept for
+  reference, reverted):**
   - `isa/x64/abi.rs` `compute_frame_layout`: `setup_area_size = if
     flags.preserve_frame_pointers() {16} else {8}`, and **pad `clobber_size +=
     8`** when omitting. Dropping the 8-byte `push %rbp` leaves the frame 8 bytes
@@ -101,14 +103,16 @@ blocker to solve for M1.
     offset shifts.
   - `isa/x64/abi.rs` `gen_prologue_frame_setup` / `gen_epilogue_frame_restore`:
     early-return an empty vector when `!flags.preserve_frame_pointers()`.
-  - **Unwind must also change (the recipe above is not enough).** Even with no
-    frame setup, `gen_clobber_save` still emits `UnwindInst::DefineNewFrame`
-    (`x64/abi.rs:697-712`) and the System V encoder sets
-    `CallFrameInstruction::CfaRegister(fp)` when `mr.fp()` exists
-    (`isa/unwind/systemv.rs:209-220`), i.e. it tells the unwinder to use RBP
-    even though the function never set it. A correct omit-FP build must suppress
-    `DefineNewFrame`/CFA-register for non-FP frames (or clear `mr.fp()`), or
-    backtraces/unwinding are wrong even when execution is correct.
+  - **Unwind must ALSO change — the recipe as written is not a correct build.**
+    Even with no frame setup, `gen_clobber_save` still emits
+    `UnwindInst::DefineNewFrame` (`x64/abi.rs:697-712`) and the System V encoder
+    sets `CallFrameInstruction::CfaRegister(fp)` when `mr.fp()` exists
+    (`isa/unwind/systemv.rs:209-220`) — it tells the unwinder the CFA is in RBP
+    even though the function never set RBP. So the omit-FP build would produce
+    **wrong backtraces / broken unwinding**; a correct build must also suppress
+    `DefineNewFrame`/CFA-register for non-FP frames (e.g. clear `mr.fp()`).
+    Because of this the omit-FP experiment is **not fully correct**, and the
+    "outputs identical" check below proves only execution, never unwind.
   - Incoming stack args RBP → RSP in **both** lowering paths (they must agree):
     `args.rs` `SyntheticAmode::finalize` (`sp_offset = tail_args_size +
     setup_area_size + clobber_size + fixed_frame_storage_size +
@@ -117,7 +121,8 @@ blocker to solve for M1.
     `-offset`); `emit.rs` `incoming_arg_offset = tail_args_size +
     setup_area_size + clobber_size + fixed_frame_storage_size +
     outgoing_args_size`. (Same formula as `isa/riscv64/inst/args.rs:124-149`.)
-- **Correctness (validated before revert):** after `rm -rf build/stdlib_target`
+- **Correctness — EXECUTION ONLY (unwind is NOT correct, see the unwind bullet
+  above).** After `rm -rf build/stdlib_target`
   (the backend `.so` is not fingerprinted, so std keeps the old lowering
   otherwise) and a full rebuild, **all 15 bench outputs are byte-identical to
   LLVM**; a 10-arg `i64` fn and a 10-arg `f64` fn (stack-passed args) print
@@ -152,14 +157,15 @@ blocker to solve for M1.
   (M ~20 ms vs LLVM ~18 ms) is not a removable spill/cycle — it is inherent to
   the scalar recurrence; LLVM's edge is elsewhere. Do not chase a "parallel-copy
   cycle" in p8.
-- **Standing scoreboard, corrected (consult the full matrix, per the mandatory
-  benchmark rules):** M's compile is faster than **LLVM** but **slower than
-  upstream cg_clif (U)** (e.g. `h_arith` compile wall U 88 ms vs M 100 ms);
-  M has the **smallest artifacts**; runtime M wins only **p5/p6/p7**, **loses
-  p1/p2/p3/p4**, and the `h_*` rows are **not uniformly ties** (e.g. `h_mem`
-  does not tie LLVM on runtime CPU). Do not state "M wins compile" or "ties
-  h_*" without the full L/U/M matrix (compile wall/cpu/RSS/size + run
-  wall/cpu/RSS) to back it. Closing p1 (memory-operand constants + branchy saturating cast +
+- **Standing scoreboard, grounded in the full matrix below (`prog | bk |
+  Cwall | Ccpu | Crss | size(B) | Rwall | Rcpu | Rrss`):** M's compile is faster
+  than **LLVM** but **slower than upstream cg_clif (U)** — `h_arith` Cwall U **88**
+  ms vs M **100** ms. M's **artifact size is smallest** in that matrix (e.g.
+  `h_arith` size L 4616832 / U 5839120 / M **4078672** B). Runtime M wins only
+  **p5/p6/p7**, **loses p1/p2/p3/p4**, and the `h_*` rows are **not uniformly
+  ties** — `h_mem` Rcpu L **3** ms vs M **4** ms (M loses runtime CPU to LLVM).
+  Do not state "M wins compile" or "ties h_*" without the full L/U/M matrix
+  (Cwall/Ccpu/Crss/size + Rwall/Rcpu/Rrss) to back it. Closing p1 (memory-operand constants + branchy saturating cast +
   serial int↔float chain), p2 (hashbrown/sort codegen depth), p3 (call-latency /
   middle-end), p4 (a real loop autovectorizer) is a **months-scale backend
   effort** comparable to LLVM's own middle-end, not an incremental pass.
