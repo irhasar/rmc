@@ -228,6 +228,17 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
     one function) asserts **>=4 `pmuludq`** (an early exit after the first match
     would leave the second scalar); `regressions.sh` compiles `t_vectorize_unit`
     with `RAKIT_NO_LICM=1` and requires `pmuludq`.
+  - **M3.2 review round 2 (orientation + test attribution).** The matcher now
+    accepts both `i < n` (`ult i, n`) and the commuted `n > i` (`ugt n, i`): a
+    **standalone** dynamic loop lowers to `ugt` and was silently rejected (only
+    loops inlined into `main` used `ult`). Tests hardened: `t_vectorize_multi`
+    puts two loops in one **address-taken** `#[no_mangle] fn two_loops`, so
+    `regressions.sh` counts `pmuludq` **inside `two_loops`** (>=4) rather than
+    binary-wide (a vector multiply elsewhere could mask a scalar loop); the
+    `RAKIT_NO_LICM=1` check now also **runs** the binary and compares its output,
+    not just the disassembly. Known miss (correct, scalar): a bound that the
+    egraph rematerializes into the header (e.g. `n & mask`) is not hoisted, so
+    that loop is not vectorized.
 
 ## Session (2026-11-24, branch `rakit-exp7`) — p9 reloads are real, but NOT soundly hoistable with the existing flags (alias tags don't move loads)
 

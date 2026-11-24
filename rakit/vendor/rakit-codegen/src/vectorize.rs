@@ -101,9 +101,14 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
         return None;
     };
     let (cc, cx, cy) = icmp_parts(dfg, cond)?;
-    if cc != IntCC::UnsignedLessThan || dfg.resolve_aliases(cx) != i {
-        return None;
-    }
+    // Accept `i < n` (`ult i, n`) and the commuted `n > i` (`ugt n, i`): the
+    // frontend picks either orientation depending on context (a standalone
+    // dynamic loop lowers to `ugt`), and both mean "run while i < n".
+    let n_side = match cc {
+        IntCC::UnsignedLessThan if dfg.resolve_aliases(cx) == i => cy,
+        IntCC::UnsignedGreaterThan if dfg.resolve_aliases(cy) == i => cx,
+        _ => return None,
+    };
     let s0 = blocks[0].block(&dfg.value_lists);
     let s1 = blocks[1].block(&dfg.value_lists);
     // The body must be the *true* edge of `i < n` (the loop runs while i < n).
@@ -119,7 +124,7 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
     // RAKIT_NO_LICM=1). A runtime bound must be loop-invariant (defined outside
     // H/B) and of type i64. The `i+4 <= n` gate and `|dst-src| >= n*4` guard
     // work for any runtime n; n == 0 falls through to the scalar tail.
-    let nv = dfg.resolve_aliases(cy);
+    let nv = dfg.resolve_aliases(n_side);
     let n = if let Some(c) = iconst_i64(dfg, nv) {
         // n*4 must not overflow the span computation (see the guard's n<2^62 check).
         if c <= 0 || c >= (1i64 << 62) {

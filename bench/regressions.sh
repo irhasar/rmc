@@ -93,7 +93,7 @@ done
 # Two eligible loops in one function must BOTH vectorize (2 pmuludq each -> >=4);
 # an early exit after the first match would leave the second scalar (2).
 if command -v objdump >/dev/null 2>&1; then
-    mc=$(objdump -d "$TMP/t_vectorize_multi_M" --no-show-raw-insn 2>/dev/null | grep -c pmuludq)
+    mc=$(objdump -d --disassemble=two_loops "$TMP/t_vectorize_multi_M" --no-show-raw-insn 2>/dev/null | grep -c pmuludq)
     if [ "$mc" -lt 4 ]; then
         echo "[regression] t_vectorize_multi: only $mc pmuludq (expected >=4; a later loop stayed scalar)" >&2
         fail=1
@@ -107,6 +107,14 @@ if command -v objdump >/dev/null 2>&1; then
     if ! env -u RAKIT_HOST_LLVM RAKIT_NO_LICM=1 "$ROOT/rakit/dist/bin/rustc-rakit" --target "$TARGET" -C opt-level=3 "$BENCH/tests/t_vectorize_unit.rs" -o "$TMP/u_nolicm" --edition 2021 >"$TMP/u_nolicm.compile" 2>&1; then
         echo "[regression] t_vectorize_unit NO_LICM=1: compile failed" >&2
         cat "$TMP/u_nolicm.compile" >&2
+        fail=1
+    elif ! "$TMP/u_nolicm" >"$TMP/u_nolicm.out" 2>&1; then
+        echo "[regression] t_vectorize_unit NO_LICM=1: run failed" >&2
+        cat "$TMP/u_nolicm.out" >&2
+        fail=1
+    elif [ "$(cat "$TMP/u_nolicm.out")" != "unit 12776226417588255163" ]; then
+        echo "[regression] t_vectorize_unit NO_LICM=1: wrong output" >&2
+        printf 'expected:\nunit 12776226417588255163\nactual:\n%s\n' "$(cat "$TMP/u_nolicm.out")" >&2
         fail=1
     elif ! objdump -d "$TMP/u_nolicm" --no-show-raw-insn 2>/dev/null | grep -q pmuludq; then
         echo "[regression] t_vectorize_unit NO_LICM=1: no pmuludq (constant bound lost vectorization)" >&2
