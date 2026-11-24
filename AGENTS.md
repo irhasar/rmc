@@ -21,8 +21,11 @@ removed soundly, corrected against the code:
   destination (`args[1]`). So the `None` result reflects the value operand
   (`v17`, the `sinf` result), and the scan establishes **nothing about the
   destination** — a latent conservative operand bug (for stores, `args[1]` is the
-  address). p9's destination `v85 = iadd v31, i<<2` is a genuinely dynamic
-  pointer anyway → still `None`, so the store is opaque regardless.
+  address). Because the value operand (`v17`) is not a `StackAddr`/global,
+  `addr_base` returns `None`, so the store is counted **opaque** — but this is
+  inferred from the (wrong) value operand, **not** from the destination; the CLIF
+  destination `v85 = iadd v31, i<<2` is simply never examined by `addr_base`, so
+  the code says nothing about it either way.
 - **Alias tags do not hoist loads.** `process_inst`
   (`alias_analysis.rs:1353-1389`) can reuse a *dominating* matching value but
   cannot move the first load; `is_pure_for_egraph` (`inst_predicates.rs:44-58`)
@@ -48,8 +51,9 @@ removed soundly, corrected against the code:
 
 **Conclusion — stop pursuing p9 reloads.** They are **not soundly removable**
 with the existing flags: `readonly` is unjustified (pre-loop init write), the
-in-loop `a[i]=` store is genuinely opaque to LICM, `addr_base` mis-reads the
-store operand (conservative), and alias tags cannot move a load. Removing them
+in-loop `a[i]=` store is counted opaque by LICM (`addr_base` returns `None` from
+the stored-value operand, not the destination), and alias tags cannot move a
+load. Removing them
 needs a finer, point-sensitive mechanism (e.g. memory regions proving "no write
 to this region after this point in this loop"), which is large. Do **not** re-try
 flag-only marking of these loads — it is unsound.
