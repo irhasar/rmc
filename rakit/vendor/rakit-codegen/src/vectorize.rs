@@ -174,6 +174,7 @@ struct Plan {
     h: Block,
     preheader: Block,
     n: Bound,
+    lens: Vec<Value>,
     base_a: Value,
     base_c: Value,
     init: Value,
@@ -210,8 +211,8 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
     // vector gate would invert. The body may span several straight-line blocks
     // (`min`/`max` split the loads from the op+store), so follow the chain from
     // the true edge back to `h`.
-    let chain = body_chain(func, s0, h)?;
-    if body_chain(func, s1, h).is_some() {
+    let (chain, lens) = body_chain_checked(func, s0, h)?;
+    if body_chain_checked(func, s1, h).is_some() {
         return None; // ambiguous: the false edge also returns to the header
     }
     let b = chain[0];
@@ -521,6 +522,21 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
             _ => return None,
         }
     }
+    // Bounds-check lengths must be loop-invariant (a constant may be
+    // rematerialized inside the loop by the egraph).
+    let mut lens_v: Vec<Value> = Vec::new();
+    for &l in &lens {
+        let lv = dfg.resolve_aliases(l);
+        if dfg.value_type(lv) != types::I64 {
+            return None;
+        }
+        if iconst_i64(dfg, lv).is_none() && !defined_outside_chain(dfg, &func.layout, lv, h, &chain) {
+            return None;
+        }
+        if !lens_v.contains(&lv) {
+            lens_v.push(lv);
+        }
+    }
     for &base in &[base_a, store_base] {
         if !defined_outside_chain(dfg, &func.layout, base, h, &chain) {
             return None;
@@ -536,6 +552,7 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
         h,
         preheader,
         n,
+        lens: lens_v,
         base_a: dfg.resolve_aliases(base_a),
         base_c: dfg.resolve_aliases(store_base),
         init,
@@ -811,6 +828,7 @@ fn apply(func: &mut Function, p: Plan) {
     func.layout.append_block(vb);
     let vh_i = func.dfg.append_block_param(vh, types::I64);
     let vb_i = func.dfg.append_block_param(vb, types::I64);
+    let mut vbound: Option<Value> = None;
 
     let pterm = func.layout.last_inst(p.preheader).unwrap();
     func.layout.remove_inst(pterm);
@@ -831,18 +849,37 @@ fn apply(func: &mut Function, p: Plan) {
             srcs.push(bb);
         }
     }
+    let lens_vals: Vec<(Value, Option<i64>)> = p
+        .lens
+        .iter()
+        .map(|&l| {
+            let lv = func.dfg.resolve_aliases(l);
+            (lv, iconst_i64(&func.dfg, lv))
+        })
+        .collect();
     {
         let mut cur = FuncCursor::new(func).at_bottom(g);
+        // Bounds checks are hoisted out of the vector body by clamping the
+        // vector loop to `min(n, len...)`; the checked scalar loop keeps the
+        // original panic behaviour for the tail.
+        let mut sb = match p.n {
+            Bound::Const(c) => cur.ins().iconst(types::I64, c),
+            Bound::Runtime(v) => v,
+        };
+        for &(lv, c) in &lens_vals {
+            let l = match c {
+                Some(c) => cur.ins().iconst(types::I64, c),
+                None => lv,
+            };
+            sb = cur.ins().umin(sb, l);
+        }
+        vbound = Some(sb);
         if srcs.is_empty() {
             // In-place: no other buffer can overlap this one.
             cur.ins().jump(vh, &[p.init.into()]);
         } else {
             let size = cur.ins().iconst(types::I64, p.lanes.size() as i64);
-            let n = match p.n {
-                Bound::Const(c) => cur.ins().iconst(types::I64, c),
-                Bound::Runtime(v) => v,
-            };
-            let lbytes = cur.ins().imul(n, size);
+            let lbytes = cur.ins().imul(sb, size);
             let pc = p.base_c;
             let mut ov = None;
             for src in srcs {
@@ -860,7 +897,7 @@ fn apply(func: &mut Function, p: Plan) {
             // `n*size` is only a faithful span when n < u64::MAX/size; for a
             // larger runtime n the multiply wraps, so fall back to scalar.
             let lim = cur.ins().iconst(types::I64, (u64::MAX / p.lanes.size()) as i64);
-            let big = cur.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, n, lim);
+            let big = cur.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, sb, lim);
             let ov = cur.ins().bor(ov, big);
             cur.ins().brif(ov, h, &[p.init.into()], vh, &[p.init.into()]);
         }
@@ -870,10 +907,7 @@ fn apply(func: &mut Function, p: Plan) {
         let mut cur = FuncCursor::new(func).at_bottom(vh);
         let step = cur.ins().iconst(types::I64, p.lanes.per_vec());
         let nxt = cur.ins().iadd(vh_i, step);
-        let n = match p.n {
-            Bound::Const(c) => cur.ins().iconst(types::I64, c),
-            Bound::Runtime(v) => v,
-        };
+        let n = vbound.unwrap();
         let cond = cur.ins().icmp(IntCC::UnsignedLessThanOrEqual, nxt, n);
         cur.ins().brif(cond, vb, &[vh_i.into()], h, &[vh_i.into()]);
     }
@@ -1070,6 +1104,103 @@ fn preds(func: &Function, target: Block) -> Vec<Block> {
 /// have exactly one predecessor (the previous chain block, or `h` for the first),
 /// no block parameters, and end in an argument-less `jump`; the final block jumps
 /// to `h`. Returns the chain (`start` .. last, excluding `h`), or None.
+/// Like [`body_chain`], but tolerates the bounds checks rustc emits for slice
+/// indexing: a `brif` on `i < len` whose other edge traps. The safe edge must
+/// continue the chain and the length is recorded so the vector loop can stop
+/// before the first possibly out-of-bounds index.
+fn body_chain_checked(
+    func: &Function,
+    start: Block,
+    h: Block,
+) -> Option<(Vec<Block>, Vec<Value>)> {
+    let dfg = &func.dfg;
+    let params = dfg.block_params(h);
+    if params.len() != 1 {
+        return None;
+    }
+    let i = params[0];
+    let mut chain: Vec<Block> = Vec::new();
+    let mut lens: Vec<Value> = Vec::new();
+    let mut cur = start;
+    let mut expect_pred = h;
+    loop {
+        if chain.len() > 24 || cur == h {
+            return None;
+        }
+        if !dfg.block_params(cur).is_empty() {
+            return None;
+        }
+        let p = preds(func, cur);
+        if p.len() != 1 || p[0] != expect_pred {
+            return None;
+        }
+        chain.push(cur);
+        let t = func.layout.last_inst(cur)?;
+        match &dfg.insts[t] {
+            ir::InstructionData::Jump { destination, .. } => {
+                let nxt = destination.block(&dfg.value_lists);
+                if nxt == h {
+                    return Some((chain, lens));
+                }
+                if destination.args(&dfg.value_lists).count() != 0 {
+                    return None;
+                }
+                expect_pred = cur;
+                cur = nxt;
+            }
+            ir::InstructionData::Brif { arg: cond, blocks, .. } => {
+                let (len, safe_true) = check_len(dfg, *cond, i)?;
+                if blocks[0].args(&dfg.value_lists).count() != 0
+                    || blocks[1].args(&dfg.value_lists).count() != 0
+                {
+                    return None;
+                }
+                let b0 = blocks[0].block(&dfg.value_lists);
+                let b1 = blocks[1].block(&dfg.value_lists);
+                let (safe, panic) = if safe_true { (b0, b1) } else { (b1, b0) };
+                if safe == h || !is_panic_block(func, panic) {
+                    return None;
+                }
+                lens.push(len);
+                expect_pred = cur;
+                cur = safe;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// `cond` as an in-bounds test on `i`: the length and whether the true edge is
+/// the in-bounds one. Only strict `<` forms (`i < len`, `len > i`, `i >= len`,
+/// `len <= i`); `<=` would not exclude `i == len`.
+fn check_len(dfg: &DataFlowGraph, cond: Value, i: Value) -> Option<(Value, bool)> {
+    let (cc, a, b) = icmp_parts(dfg, cond)?;
+    let a = dfg.resolve_aliases(a);
+    let b = dfg.resolve_aliases(b);
+    let i = dfg.resolve_aliases(i);
+    if a == i {
+        match cc {
+            IntCC::UnsignedLessThan => Some((b, true)),
+            IntCC::UnsignedGreaterThanOrEqual => Some((b, false)),
+            _ => None,
+        }
+    } else if b == i {
+        match cc {
+            IntCC::UnsignedGreaterThan => Some((a, true)),
+            IntCC::UnsignedLessThanOrEqual => Some((a, false)),
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
+fn is_panic_block(func: &Function, b: Block) -> bool {
+    func.layout
+        .block_insts(b)
+        .any(|inst| func.dfg.insts[inst].opcode() == Opcode::Trap)
+}
+
 fn body_chain(func: &Function, start: Block, h: Block) -> Option<Vec<Block>> {
     let dfg = &func.dfg;
     let mut chain: Vec<Block> = Vec::new();

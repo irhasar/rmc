@@ -362,6 +362,22 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
     two-source `a[i] += b[i]` -> `paddd` (guard still emitted for `b`), f32
     `a[i] *= 2.0` -> `mulps`. New `t_vectorize_inplace`
     (n=1000/999/17/15/1/0); regressions asserts the four ops.
+  - **M4.6 LANDED: bounds-checked slice loops.** `body_chain_checked` follows the
+    `brif (icmp i, len)` checks rustc emits for indexing (the other edge must be
+    a trapping block) and records each length; `apply` builds
+    `min(n, len...)` (an `umin` chain) in the guard block and uses it as the
+    vector bound, so the vector body needs no checks while the original checked
+    scalar loop still runs the tail. A short destination therefore still panics
+    at the exact index (verified: same message/location as LLVM). New
+    `t_vectorize_slice` (`slice_map1`, `slice_map2`, `slice_param`;
+    n=1000/999/17/15/1/0), L==M; regressions asserts `paddd` and compares the
+    panic message. Panic exit codes differ (LLVM 101 unwind vs Rakit 134 abort)
+    — pre-existing, also for a plain out-of-bounds index. **Measured** (1M u32,
+    20x slice_map2 + 20x slice_map1, min of 5): M 46 ms vs
+    `RAKIT_NO_VECTORIZE=1` 82 ms (**-44%, 1.78x**); LLVM 18 ms (2.6x, was 4.6x).
+    Full all-axes suite (CREPS=2 RREPS=7) unchanged within noise: run total
+    416 ms vs LLVM 413 ms (1.01x), compile 1615 ms vs 1900 ms (0.85x), size
+    61.5 MB vs 69.4 MB (-11.3%); vs upstream 2589 ms run / 87.8 MB.
   - **Slice loops (bounds checks): not vectorized.** `for i in 0..n { c[i]=a[i]+b[i] }`
     lowers every access with a bounds `icmp`+`brif` to a cold `call panic; trap`
     block, i.e. a multi-block body *with internal control flow*. Vectorizing it
