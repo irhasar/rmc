@@ -1,3 +1,32 @@
+## Session (2026-11-24, branch `rakit-further-experiments`) — compile-axis wins
+
+- **Goal shift:** the runtime gaps left (p2/h_mem hash+sort, p4 autovectorization,
+  p1 saturating f64→u64) are the documented architectural wall, so this branch
+  targets the **compile axis**, where M still loses to upstream U on `p2`/`h_mem`
+  because the custom passes run on every function.
+- **Structural pass guards** (`passes/mod.rs`): `if_convert`, `unroll` and
+  `rotate` skip functions that cannot contain their target. A two-way diamond
+  needs a head, two arms and a join (≥3 blocks); a loop needs a back edge (≥2
+  blocks). Most of the thousands of small std functions are single-block, and
+  the passes could only scan them and find nothing. Guard returns `false` (no
+  change) so the manager also skips analysis invalidation.
+  - **Zero IR change, proven:** the `p2_mem` binary md5 is byte-identical with
+    and without the guards. Compile win measured by A/B (reps=15):
+    `p2_mem` 161→159 ms wall / 223→219 cpu, `h_mem` 172→168 / 244→237,
+    `p4_simd` 104→103 / 130→127 (~1–3%).
+- **Rotate reorder** (`rotate.rs`): the cheap structural rejection (header must
+  have non-empty params and some arm must pass them through unchanged) now runs
+  *before* the region reachability walk. Most `brif` blocks are plain if/else
+  heads with no params, so this skips the walk for them. Rotate pass time on
+  `p2_mem`/`h_mem` cgu.1 drops 2.2–3.0 ms → **0.3–0.4 ms**; accepted loops are
+  identical, so the binary is again byte-identical (p2 md5 unchanged).
+- **Verification:** `./y.sh build` exit 0; `./y.sh test --sysroot rakit` → 65
+  suites / 25,368 passed / 0 failed (run on the guard build; the rotate reorder
+  is IR-identical so the result carries); `bench/allaxes.sh` 45/45 rows `ok`.
+  `p3_calls` output byte-identical, `fib` still rotated.
+- **Still true:** runtime parity on p1–p4 is backend work (regalloc, loop
+  vectorizer), not a pass. This branch does not change runtime.
+
 ## Session (2026-11-24) — loop rotation pass (LANDED locally, p3 −5%)
 
 - **New pass** `rakit-opt/src/passes/rotate.rs`, wired in `src/base.rs` after

@@ -64,6 +64,13 @@ impl Pass for IfConvertPass {
     }
 
     fn run(&mut self, pctx: &mut PassCtx<'_>) -> bool {
+        // A two-way diamond needs a head, two arms and a join, i.e. at least
+        // three blocks. Below that the pass can only scan and find nothing, so
+        // skip it: on a crate with thousands of small functions this is most of
+        // the compile cost.
+        if pctx.ctx.func.layout.blocks().nth(2).is_none() {
+            return false;
+        }
         passtime::time(passtime::IF_CONVERT, || if_convert::run(&mut pctx.ctx.func, pctx.analyses));
         true
     }
@@ -77,6 +84,10 @@ impl Pass for UnrollPass {
     }
 
     fn run(&mut self, pctx: &mut PassCtx<'_>) -> bool {
+        // A loop needs a back edge, so a single-block function has none.
+        if pctx.ctx.func.layout.blocks().nth(1).is_none() {
+            return false;
+        }
         passtime::time(passtime::UNROLL, || unroll::run(&mut pctx.ctx.func, pctx.analyses));
         true
     }
@@ -90,6 +101,9 @@ impl Pass for RotatePass {
     }
 
     fn run(&mut self, pctx: &mut PassCtx<'_>) -> bool {
+        if pctx.ctx.func.layout.blocks().nth(1).is_none() {
+            return false;
+        }
         passtime::time(passtime::ROTATE, || rotate::run(&mut pctx.ctx.func));
         true
     }

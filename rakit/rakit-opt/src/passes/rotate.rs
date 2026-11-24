@@ -265,6 +265,26 @@ fn prepare(func: &ir::Function, h: Block) -> Option<Prepared> {
         return None;
     }
 
+    // Cheap structural rejection before the reachability walk. A rotatable loop
+    // header carries state (non-empty parameters) and its body arm passes those
+    // parameters through unchanged. Most `brif` blocks are plain if/else heads
+    // with no parameters or non-identity arms, so this skips the region walk for
+    // them.
+    let params: Vec<Value> = dfg.block_params(h).to_vec();
+    if params.is_empty() {
+        return None;
+    }
+    let passes_through = |a: &[BlockArg]| -> bool {
+        a.len() == params.len()
+            && a.iter().enumerate().all(|(i, x)| match x {
+                BlockArg::Value(v) => dfg.resolve_aliases(*v) == dfg.resolve_aliases(params[i]),
+                _ => false,
+            })
+    };
+    if !passes_through(&arms[0]) && !passes_through(&arms[1]) {
+        return None;
+    }
+
     // The loop body is everything reachable from the two arms without
     // re-entering the header. The preheader (which jumps *into* the header from
     // outside) is not in that set, so it cannot be mistaken for a latch.
@@ -306,8 +326,7 @@ fn prepare(func: &ir::Function, h: Block) -> Option<Prepared> {
     let body_target = targets[body_idx];
     let exit_target = targets[1 - body_idx];
 
-    let params: Vec<Value> = dfg.block_params(h).to_vec();
-    if params.is_empty() || arms[body_idx].len() != params.len() {
+    if arms[body_idx].len() != params.len() {
         return None;
     }
     if dfg.block_params(body_target).len() != params.len() {
