@@ -1,53 +1,58 @@
-## Session (2026-11-24, branch `rakit-exp7`) — p9 reload diagnosis corrected: flag-check + dynamic store (not the call), and alias tags do NOT hoist
+## Session (2026-11-24, branch `rakit-exp7`) — p9 reloads are real, but NOT soundly hoistable with the existing flags (alias tags don't move loads)
 
-CLIF dump (`rustc-rakit --emit=llvm-ir` writes `<out>.rakit/<sym>.opt.rakit`
-post-optimizer and `.unopt.rakit`). For p9 `main`, block5 hoists the addresses
-`v197 = stack_addr ss0+8`, `v198 = stack_addr ss0+16` (the `a: Vec` header) out
-of the loop, but block8 still does `v31 = load.i64 notrap v197`,
-`v36 = load.i64 notrap v198` every iteration. So the reloads are **redundant
-loop-invariant stack loads**, not regalloc spills — the addresses are hoisted,
-only the loads repeat. But the *mechanism* I first wrote was wrong; corrected
-against the code:
+CLIF dump (`rustc-rakit --emit=llvm-ir` writes `<out>.rakit/<sym>.opt.rakit`).
+For p9 `main`, block5 hoists the addresses `v197 = stack_addr ss0+8` /
+`v198 = stack_addr ss0+16` (the `a: Vec` header) out of the loop, but block8
+still does `v31 = load.i64 notrap v197`, `v36 = load.i64 notrap v198` every
+iteration. So the reloads are **redundant loop-invariant stack loads** (addresses
+hoisted; only the loads repeat), not regalloc spills. Whether they can be
+removed soundly, corrected against the code:
 
-- **The blocker is LICM's flag check, not a call fence.** `hoist_from_loop`
-  (`licm.rs:288-304`) rejects a load **first** unless
-  `flags.readonly() && flags.notrap() && flags.can_move()`; only then does it
-  test `safe = !any_opaque_store && !store_bases.contains(base)`. The header
-  loads are `notrap` only, so they `continue` at the flag check before any
-  aliasing/store reasoning.
-- **Calls are NOT opaque stores.** `any_opaque_store` is set only by a
-  `can_store()` opcode whose `addr_base` is `None` (`licm.rs:257-266`), and the
-  `call` opcode is declared **without** `can_store`
-  (`rakit-codegen-meta/src/shared/instructions.rs:188-205`). The store that
-  actually sets `any_opaque_store` in p9's loop is the dynamic element store
-  `store.f32 notrap v17, v85` (`v85 = iadd v31, i<<2`): `addr_base`
-  (`licm.rs:372-390`) only recognizes a direct `StackAddr`/`UnaryGlobalValue`, so
-  a value derived from a load returns `None` → `any_opaque_store = true`. So even
-  if the header loads carried readonly+can_move, this dynamic store would still
-  block them. (REPORT.md §26.2 "Akar 1" gave `sinf` as the opaque-store example;
-  that example is wrong — the dynamic `a[i]=` store is the one.)
-- **Alias tags do not hoist loads.** The egraph's `process_inst`
+- **LICM's flag check comes first.** `hoist_from_loop` (`licm.rs:288-304`)
+  rejects a load unless `flags.readonly() && notrap() && can_move()`; only then
+  tests `safe = !any_opaque_store && !store_bases.contains(base)`. The header
+  loads are `notrap`-only, so they `continue` before any store/alias reasoning.
+- **Calls are NOT opaque stores, and `addr_base` reads the wrong store operand.**
+  `any_opaque_store` is set only by a `can_store()` opcode whose `addr_base` is
+  `None` (`licm.rs:257-266`); the `call` opcode is declared **without**
+  `can_store` (`instructions.rs:188-205`). But `addr_base`'s `Store` arm reads
+  `args[0]` (`licm.rs:372-386`), which by the `store(flags, x, p)` operand order
+  (`instructions.rs` "store": `x` then `p`) is the **stored value**, not the
+  destination (`args[1]`). So the `None` result reflects the value operand
+  (`v17`, the `sinf` result), and the scan establishes **nothing about the
+  destination** — a latent conservative operand bug (for stores, `args[1]` is the
+  address). p9's destination `v85 = iadd v31, i<<2` is a genuinely dynamic
+  pointer anyway → still `None`, so the store is opaque regardless.
+- **Alias tags do not hoist loads.** `process_inst`
   (`alias_analysis.rs:1353-1389`) can reuse a *dominating* matching value but
-  cannot move the first load; and both `is_pure_for_egraph`
-  (`inst_predicates.rs:44-58`) and `hoist_from_loop` gate on the
-  `readonly+notrap+can_move` **flags**, not on an alias region. So the earlier
-  "alias regions → CSE/hoist invariant stack loads" idea is **wrong** for
-  hoisting a first load; alias regions only help egraph *reuse*, not movement.
+  cannot move the first load; `is_pure_for_egraph` (`inst_predicates.rs:44-58`)
+  and `hoist_from_loop` gate on `readonly+notrap+can_move` **flags**, not on an
+  alias region. Alias regions only help egraph reuse, not movement.
+- **`readonly` is function-wide, so it cannot be set here.** Per
+  `memflags.rs:359-366`, a `readonly` load is UB if the memory is mutated **at
+  any time between function call and exit**. p9's `Vec` header is written during
+  `Vec` construction **before** the loop, so "not written in the loop" does **not**
+  justify `readonly` — marking these loads `readonly` is **unsound**.
+- **A flag-only build is not even the same experiment.** Marking a load
+  `readonly+notrap+can_move` makes it `is_pure_for_egraph`, and the egraph
+  **elaboration** can then hoist pure nodes out of loops
+  (`elaborate.rs:649-680`, `elaborate_licm_hoist`) **before** `hoist_from_loop`
+  ever checks opaque stores. So a flag-only change could hoist the loads via
+  elaboration, independent of any LICM change — a flag-only control build is
+  required to isolate the effect of a separate LICM patch.
 - **The cost of removing p9's reloads is UNMEASURED.** The `licm_loads`
-  experiment (REPORT.md §26.2) left the p9 header loads in place (13 = 13
-  reloads in both builds), so its neutral timing does **not** measure the effect
-  of removing them. (The old "removing 2 loads is invisible" note is therefore
-  unsupported; p9 may still be sinf-latency-bound, but that must be measured,
-  not inferred from that experiment.)
+  experiment (REPORT.md §26.2) left the header loads in place (13 = 13 reloads in
+  both builds); its neutral timing does not measure removal. (REPORT §26.2
+  "Akar 1" also cited `sinf` as the opaque store — wrong; calls are not
+  `can_store`.)
 
-**What hoisting would actually require (all in LICM, not alias regions):**
-(1) mark a private-slot header load `readonly+can_move+notrap` (sound if the slot
-is not written in the loop — true here), **and** (2) make LICM's `safe` check
-treat a dynamic / opaque store as unable to hit a **private** stack slot (one
-whose address never escapes). Only (2) can lift `any_opaque_store = true` for the
-`a[i]=` store. That is the real, narrow lever — a LICM change — and it must be
-justified by a controlled experiment that *actually* removes the loads and
-measures the delta.
+**Conclusion — stop pursuing p9 reloads.** They are **not soundly removable**
+with the existing flags: `readonly` is unjustified (pre-loop init write), the
+in-loop `a[i]=` store is genuinely opaque to LICM, `addr_base` mis-reads the
+store operand (conservative), and alias tags cannot move a load. Removing them
+needs a finer, point-sensitive mechanism (e.g. memory regions proving "no write
+to this region after this point in this loop"), which is large. Do **not** re-try
+flag-only marking of these loads — it is unsound.
 
 ## Session (2026-11-24, branch `rakit-exp6`) — M1 premise re-checked: reload cause is UNVERIFIED (diagnose first)
 
