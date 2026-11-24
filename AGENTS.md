@@ -97,8 +97,14 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
   **Correction:** the earlier "L3 isolation M 66.7 vs L 28.3" **conflated the
   array-construction loops** with the kernel. Proper isolation (repeat the kernel
   20x on fixed data, 80M iters): **L 49.9 ms vs M 110.3 ms (~2.2x)**, and L is
-  **memory-bound** (~48 MB/pass x 20 = ~960 MB => ~50 ms at ~20 GB/s), so a 4-wide
-  vectorized M can reach ~L. Vectorizer justified by the *kernel*, not the init.
+  **memory-bound at ~19 GB/s (verified, not inferred):** a trivial vectorized
+  tri-stream `c=a+b` (`paddd`) with identical ~960 MB traffic and negligible
+  compute also runs **L 49.8 ms**, matching L3's **L 49.9 ms** — so L3 under LLVM
+  is bandwidth-bound, not compute-bound. Harness committed for reproducibility:
+  `bench/progs/h_l3iso.rs` (20-pass L3 kernel) and `bench/progs/h_l3bw.rs`
+  (reference tri-stream). `p4_simd.rs` itself includes init and does **not**
+  reproduce the 20-pass run. A 4-wide vectorized M can reach ~L; the vectorizer
+  is justified by the *kernel*.
 - **Blocker is CFG shape:** p4 L3 is **multi-block** — `block29` (bounds check
   `brif`) → `block30` (compute+store) → back-edge. Address `base + i*4`, induction
   `i`, `i'=i+1`.
@@ -113,10 +119,15 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
   to *all* stages, including the `bounds-free` M3.1 shape.
 - **Staged plan** (each stage gated by output validation vs LLVM + full suite,
   **and** by the universal disjointness gate above):
-  1. **M3.1** single-block, bounds-free map loop `dst[i]=(s1[i]^s2[i])*K` (u32),
-     multiple-of-4 fast path + scalar tail; emit `I32X4` (`imul.i32x4` + `splat`).
-     Validated on a synthetic `get_unchecked` microbench (still subject to the
-     disjointness gate — the microbench uses distinct, non-overlapping buffers).
+  1. **M3.1** target = the raw-pointer map loop verified in CLIF: header
+     `block2(i)` brifs on a constant trip count; **single-block body**
+     `addr = base + (i<<2)` with loop-invariant bases, `load.i32` x2, `bxor`,
+     `imul` by const, `store.i32`, `i+=1`, `jump header`. Design: **runtime
+     disjointness guard** routes either to a new `I32X4` vector loop
+     (`imul.i32x4` + `splat`; 4 elems/iter, `i+=4`) or to the **original scalar
+     loop**; the original loop is **reused as the scalar tail** (re-enter its
+     header at `i` for `n % 4`), so the scalar loop is not duplicated. Validated
+     on `bench/progs/h_l3iso.rs` (universal disjointness gate; distinct buffers).
   2. **M3.2** handle the bounds-check multi-block shape (hoist `i+3 < n` or require
      bound = slice length so checks are redundant); the disjointness proof is the
      universal gate above. Only then is p4 unlocked safely.
