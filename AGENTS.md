@@ -43,6 +43,22 @@
   and even call-heavy `p3` (`fib`) is call-*latency* bound, so the prologue
   instructions hide under the call latency. Remaining backend levers are
   regalloc quality (p8) and a loop vectorizer (p4), both large.
+- **Addendum — p8 is already near-optimal (so "regalloc cycle" was a red
+  herring).** Disassembling `p8_minmax`'s hot loop: state `(i, a, mn)` is carried
+  entirely in registers (`rax`=i, `r10`=a, `r8`=mn) with **no stack traffic** —
+  `imul a*C; or $1,%rax; add a; cmp; mov %r10,%rax; cmovb %r8,%rax; mov
+  %rax,%r8; mov %rcx,%rax; jmp` (~10 instrs/iter). The only copies are the
+  min-reduction (`mov/cmovb/mov`), which are needed because `a` (in `r10`) must
+  survive for the next iteration while `mn` is updated. So the residual p8 gap
+  (M ~20 ms vs LLVM ~18 ms) is not a removable spill/cycle — it is inherent to
+  the scalar recurrence; LLVM's edge is elsewhere. Do not chase a "parallel-copy
+  cycle" in p8.
+- **Standing (honest) scoreboard on this harness:** M wins **compile** (wall &
+  CPU), **size**, and **runtime p5/p6/p7**; **ties** p8/p9/h_* (~±10%); **loses**
+  p1/p2/p3/p4. Closing p1 (memory-operand constants + branchy saturating cast +
+  serial int↔float chain), p2 (hashbrown/sort codegen depth), p3 (call-latency /
+  middle-end), p4 (a real loop autovectorizer) is a **months-scale backend
+  effort** comparable to LLVM's own middle-end, not an incremental pass.
 
 ## Session (2026-11-24, branch `rakit-exp4`) — runtime probe (no pass-level win), x64 omit-FP blocker map
 
