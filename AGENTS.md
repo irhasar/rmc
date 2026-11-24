@@ -1,3 +1,56 @@
+## Session (2026-11-24, branch `rakit-exp6`) — M1 premise re-checked: reload cause is UNVERIFIED (diagnose first)
+
+A review corrected several overclaims about *why* residual loads survive.
+Corrected facts, recorded so the next step is a **diagnosis**, not a big
+alias-region build:
+
+- **The alias-analysis switch is dead code.** `enable_alias_analysis = true`
+  (`settings.rs:501`) is **never read**. The egraph — and the `AliasAnalysis` it
+  builds (`context.rs:389`) — runs whenever `opt_level != OptLevel::None`
+  (`context.rs:192-195`). So "the flag makes it ON" was wrong; it runs because we
+  optimize at all.
+- **What was actually measured (scoped, not generalized).** The block-local CSE
+  pass in `rakit-exp5` produced **byte-identical** binaries (PR #16). That
+  establishes no gain for **that** pass only: it keyed on an **identical SSA
+  address value**, and the alias lookup itself requires matching address values
+  (`alias_analysis.rs:1353-1392`). It does **not** show that all safe load CSE is
+  useless — a pass that proves **address equivalence** (two distinct
+  `block_addr`/`stack_addr`/`iadd` values denoting the same location) could find
+  matches the exact-Value lookup misses. So a CSE is **not ruled out**, but it is
+  also **not shown to help**; it must be justified by evidence (see diagnosis).
+- **But the cause of the *surviving* reloads is UNVERIFIED.** `process_inst`
+  (`alias_analysis.rs:1353-1389`) aliases a load only when a known value matches
+  the same `MemoryLoc` — same SSA `address`, `last_store`/memory state, extent —
+  *and* the def dominates; and `has_memory_fence_semantics`
+  (`alias_analysis.rs:93-105`) treats **Call/CallIndirect/TryCall** as fences
+  that block movement. Region tags are therefore **neither necessary nor
+  sufficient**; the blocker could be a differing SSA address, a memory-state
+  mismatch, dominance, or a call fence. The earlier bounds-check investigation
+  (REPORT.md:2790-2802) does **not** establish which requirement blocks the
+  length loads.
+- **The p9 reload attribution is UNVERIFIED.** The cited conclusion
+  (REPORT.md:1187-1196) does not analyze p9, and the hoisting experiment
+  (REPORT.md:2812-2827) concerns frontend-emitted header loads. Calling p9's
+  per-iteration reloads "regalloc spills of loop invariants" needs before/after
+  register-allocation evidence, which we do not have.
+- **A frontend-only alias-region change would not even cover stack accesses.**
+  `Pointer::load` / `Pointer::store` (`src/pointer.rs:109-131`) **discard the
+  caller's `flags`** for the `PointerBase::Stack` arm (they call
+  `stack_load`/`stack_store`), and those builders
+  (`vendor/rakit-codegen-meta/src/gen_inst.rs:1489-1528`) emit **fresh
+  `set_notrap()` flags**. Tagging load/store callers in `src/` leaves stack
+  accesses untagged; any flag-based plan must also thread flags through
+  `pointer.rs` (and the stack builders).
+
+**Revised next step — DIAGNOSE before building.** Instrument
+`process_inst`/`MemoryState` to log *why* a specific known reload is not
+eliminated (different SSA address? `last_store` mismatch? call fence?
+dominance?), e.g. the `Range::end` vs `v.len()` loads in p4 and the p9 header
+loads, and gather pre/post-regalloc evidence for p9. Only after isolating the
+actual blocker should we choose among alias-region propagation, an address-based
+CSE, or regalloc work. Do **not** implement a standalone load-CSE pass or a
+frontend-only alias-region change on the current evidence.
+
 ## Project kickoff (2026-11-24, branch `rakit-exp5`) — p4 loop autovectorizer (milestone plan)
 
 Started "opsi 2" (the big backend project) targeting `p4_simd` (M ~83 ms vs LLVM
