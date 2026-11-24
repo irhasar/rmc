@@ -12,12 +12,14 @@ use rakit_codegen::cursor::{Cursor, FuncCursor};
 use rakit_codegen::ir::condcodes::IntCC;
 use rakit_codegen::ir::{self, Block, Inst, InstBuilder, Opcode, Value};
 
-pub fn run(func: &mut ir::Function) {
+/// Returns whether a self-recursive linear recurrence was rewritten.
+pub fn run(func: &mut ir::Function) -> bool {
     if std::env::var_os("RAKIT_NO_REC_LOOP").is_some() {
-        return;
+        return false;
     }
-    let Some(p) = try_match(func) else { return };
+    let Some(p) = try_match(func) else { return false };
     rewrite(func, p);
+    true
 }
 
 struct Pat {
@@ -60,10 +62,15 @@ fn try_match(func: &ir::Function) -> Option<Pat> {
         return None;
     }
     let (call1, fr1, t1, c1, next1) = call_sub(func, rblk, n)?;
-    let (call2, fr2, t2, c2, next2) = call_sub(func, next1, n)?;
     // The two self-calls may use distinct FuncRefs (distinct sigs) that both
-    // resolve to this function; require both to be self-calls, not equality.
-    if !is_self(func, fr1) || !is_self(func, fr2) {
+    // resolve to this function; require each to be a self-call, not equality.
+    // Check the first before scanning the next arm: if `rblk` holds a
+    // non-self call the match is dead and scanning `next1` is wasted.
+    if !is_self(func, fr1) {
+        return None;
+    }
+    let (call2, fr2, t2, c2, next2) = call_sub(func, next1, n)?;
+    if !is_self(func, fr2) {
         return None;
     }
     let rargs = ret_args(func, next2)?;

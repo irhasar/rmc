@@ -1,3 +1,115 @@
+## Session (2026-11-24, branch `rakit-exp3`) — instrumentation + per-function guards (marginal), runtime walls re-confirmed
+
+- **Branch:** from `replace-main-with-cgclif-experiments` after PR #13 merged
+  (`f35f743`).
+- **Runtime exploration (disassembly-backed, all architectural):**
+  - `p8` (20 vs L 18): the lane transform already uses the efficient per-lane
+    scheme (forcing advanced by a constant `slope`, 1 imul/iter). The residual
+    gap is a **regalloc parallel-copy cycle** on the lane loop's 6 params: the
+    back edge ends in `mov %rdx,%r13; mov %r12,%rdx; mov %r10,%r12; mov
+    %r13,%r10; mov %rbx,%rcx` (a 3-cycle + 1), whereas LLVM's per-lane state
+    needs no shuffles. Factor sweep F=2/4/6/8 = 21/23/22/23 ms (F=2 best). Not
+    pass-fixable; it is register allocation.
+  - `p9` (33 vs 30): 85% `sinf`. LLVM hoists the GOT entry to `%r15` once
+    (`mov sinf@GOT,%r15`) then `call *%r15`; Rakit reloads `mov
+    sinf@GOT,%rax` **every iteration**. The GOT load is emitted by ISel at the
+    call site (post-CLIF), so Rakit's LICM cannot hoist it. Architectural.
+  - `p1` (101 vs 82): `f += sqrt(i)*0.5` is a serial f64 add chain; LLVM
+    pipelines the independent `sqrt`s by unrolling a **multi-block** body.
+  - `p3` (57 vs 37): `fib` is 71%. M matches LLVM's loop shape (1 call/iter) but
+    every call pays the **frame pointer** (`push rbp; mov rsp,rbp` + `mov
+    rbp,rsp; pop rbp`) and spill-to-stack callee saves instead of `push`; LLVM
+    omits the frame pointer (`push r14; push rbx; push rax`). This is the
+    documented x64 `preserve_frame_pointers` trap (naive fixes segfault via
+    `setup_area_size`).
+- **Landed (safe, byte-identical — all 15 bench binaries md5-match the prior
+  build; output unchanged):**
+  - `passtime`: new `REC_LOOP`/`SINCOS` slots (ACC 7→9) so those passes are now
+    timed and visible (`rec_loop=0.2ms sincos=0.4ms` on p2/h_mem cgu.1).
+  - `RecLoopPass`/`SincosPass` adapters: check their disable switch first, run
+    the pass inside the timer, and return the pass's **real** result.
+    `rec_loop::run`/`sincos::run` now return whether they rewrote / fused
+    anything. **No opcode pre-scan** for these two: `rec_loop::try_match` already
+    rejects non-recursive functions at the entry terminator (O(1)) and
+    `sincos::run` already does a single cheap walk, so a full `Call` scan in
+    front would be slower for call-free straight-line functions.
+  - `unroll::run`: skip `collapse_forwarders` and the loop `analyze` for
+    **single-block** functions (no second block to forward to; a loop needs a
+    back edge across blocks). `narrow_uint_fcvt` still runs. The
+    `RAKIT_UNROLL_DEBUG` IR dump now runs **before** `narrow_uint_fcvt`, so
+    single-block functions are still dumped and the conversion diagnostics
+    `narrow_uint_fcvt` prints have the function header above them.
+  - Review follow-ups: `rec_loop::try_match` now checks `is_self(fr1)` right
+    after the first `call_sub`, before scanning the second arm (logically
+    identical; `call_sub` reads `jump_target` first, so `return`-terminated
+    shapes bail O(1) with **no** instruction scan). `sincos::run` site discovery
+    iterates the layout directly instead of snapshotting blocks/insts into
+    `Vec`s (no per-function allocation, call-free ones included).
+- **Honest measurement:** these guards are **marginal**. A synthetic file with
+  **800** single-block leaf functions compiles 144/197 ms with the guards vs
+  145/198 ms without (~1 ms, within noise) — tiny functions are cheap per pass;
+  the pass cost lives in the few large multi-block functions (store_forward
+  ~9 ms is genuine work). The 15-program bench compile is unchanged.
+- **Conclusion:** safe compile micro-optimisation is exhausted; the remaining
+  runtime gaps need backend work (x64 omit-frame-pointer done correctly,
+  regalloc coalescing, a loop vectorizer, GOT-load hoisting) — each a
+  multi-session, correctness-critical change, not a pass-sized tweak.
+- **Verification:** `./y.sh build` exit 0; `bench/allaxes.sh` 45/45 `ok`;
+  `./y.sh test --sysroot rakit` → 65 suites / 25,368 passed / 0 failed.
+
+### Full all-axes matrix (`bench/allaxes.sh`, CREPS=3 RREPS=7)
+L = LLVM, U = cg_clif upstream, M = modified Rakit. Compile = wall / cpu ms /
+peak RSS MB / artifact bytes. Run = wall / cpu ms / peak RSS MB. All stdout
+matched LLVM. Run wall is contention-sensitive; compare with run cpu.
+
+| prog | bk | Cwall | Ccpu | Crss | size(B) | Rwall | Rcpu | Rrss |
+|------|----|------:|-----:|-----:|--------:|------:|-----:|-----:|
+| h_arith | L | 119 | 145 | 117.7 | 4617128 | 2 | 2 | 11.0 |
+| h_arith | U | 92 | 117 | 120.2 | 5839120 | 2 | 2 | 11.1 |
+| h_arith | M | 103 | 134 | 120.8 | 4078672 | 2 | 2 | 10.8 |
+| h_branch | L | 126 | 142 | 118.0 | 4616832 | 2 | 2 | 10.8 |
+| h_branch | U | 92 | 119 | 120.2 | 5837264 | 2 | 2 | 10.8 |
+| h_branch | M | 101 | 130 | 120.6 | 4077008 | 2 | 2 | 11.0 |
+| h_calls | L | 119 | 140 | 118.5 | 4616872 | 2 | 2 | 11.1 |
+| h_calls | U | 89 | 118 | 120.7 | 5837792 | 2 | 2 | 11.0 |
+| h_calls | M | 101 | 127 | 120.9 | 4077368 | 3 | 2 | 11.1 |
+| h_float | L | 127 | 150 | 116.9 | 4637984 | 2 | 2 | 11.1 |
+| h_float | U | 90 | 126 | 119.9 | 5861024 | 3 | 2 | 11.1 |
+| h_float | M | 106 | 139 | 119.9 | 4118168 | 2 | 2 | 11.1 |
+| h_mem | L | 265 | 428 | 137.4 | 4646848 | 3 | 3 | 11.0 |
+| h_mem | U | 140 | 189 | 136.2 | 5959856 | 9 | 9 | 11.1 |
+| h_mem | M | 174 | 240 | 137.4 | 4166120 | 5 | 4 | 11.1 |
+| h_simd | L | 142 | 167 | 124.0 | 4617704 | 2 | 2 | 11.1 |
+| h_simd | U | 99 | 128 | 125.7 | 5843736 | 4 | 3 | 11.1 |
+| h_simd | M | 111 | 141 | 126.4 | 4081096 | 3 | 2 | 11.0 |
+| p1_arith | L | 86 | 104 | 105.7 | 4635232 | 82 | 81 | 11.1 |
+| p1_arith | U | 79 | 101 | 108.8 | 5877944 | 108 | 108 | 11.0 |
+| p1_arith | M | 90 | 112 | 109.5 | 4146112 | 101 | 100 | 11.1 |
+| p2_mem | L | 244 | 378 | 133.9 | 4639888 | 17 | 16 | 11.0 |
+| p2_mem | U | 131 | 173 | 132.2 | 5936144 | 155 | 156 | 10.8 |
+| p2_mem | M | 160 | 220 | 133.5 | 4143368 | 48 | 48 | 10.8 |
+| p3_calls | L | 103 | 129 | 116.2 | 4612368 | 37 | 36 | 11.0 |
+| p3_calls | U | 86 | 114 | 117.6 | 5820136 | 116 | 115 | 10.8 |
+| p3_calls | M | 95 | 120 | 118.1 | 4067048 | 56 | 56 | 10.8 |
+| p4_simd | L | 108 | 129 | 116.6 | 4636096 | 56 | 56 | 48.2 |
+| p4_simd | U | 95 | 120 | 118.2 | 5892376 | 156 | 156 | 49.5 |
+| p4_simd | M | 106 | 129 | 118.7 | 4152736 | 84 | 83 | 48.8 |
+| p5_inline | L | 82 | 103 | 104.7 | 4609368 | 58 | 57 | 11.0 |
+| p5_inline | U | 79 | 102 | 107.5 | 5813704 | 892 | 891 | 11.1 |
+| p5_inline | M | 84 | 107 | 108.0 | 4059960 | 7 | 6 | 11.1 |
+| p6_scalar | L | 84 | 103 | 101.3 | 4609368 | 58 | 57 | 10.8 |
+| p6_scalar | U | 77 | 98 | 103.7 | 5813688 | 902 | 902 | 11.1 |
+| p6_scalar | M | 85 | 111 | 104.1 | 4059960 | 6 | 6 | 11.0 |
+| p7_branchy | L | 85 | 105 | 104.9 | 4609520 | 43 | 42 | 10.8 |
+| p7_branchy | U | 79 | 107 | 107.6 | 5813800 | 101 | 100 | 11.1 |
+| p7_branchy | M | 86 | 111 | 108.4 | 4060120 | 36 | 36 | 11.1 |
+| p8_minmax | L | 84 | 104 | 105.2 | 4609544 | 18 | 17 | 11.1 |
+| p8_minmax | U | 79 | 101 | 107.2 | 5813752 | 39 | 40 | 10.8 |
+| p8_minmax | M | 86 | 110 | 108.2 | 4060088 | 20 | 20 | 11.1 |
+| p9_u64f32 | L | 95 | 114 | 110.7 | 4635448 | 30 | 30 | 17.6 |
+| p9_u64f32 | U | 87 | 110 | 113.8 | 5886872 | 77 | 76 | 18.8 |
+| p9_u64f32 | M | 96 | 120 | 114.2 | 4149744 | 34 | 33 | 18.2 |
+
 ## Session (2026-11-24, branch `rakit-exp2`) — opcode pre-scans for cheap passes
 
 - **Branch:** created from `replace-main-with-cgclif-experiments` after PR #12

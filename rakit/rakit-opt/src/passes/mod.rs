@@ -33,10 +33,13 @@ impl Pass for RecLoopPass {
     }
 
     fn run(&mut self, pctx: &mut PassCtx<'_>) -> bool {
-        if std::env::var_os("RAKIT_NO_REC_LOOP").is_none() {
-            rec_loop::run(&mut pctx.ctx.func);
+        if std::env::var_os("RAKIT_NO_REC_LOOP").is_some() {
+            return false;
         }
-        true
+        // `rec_loop::try_match` already rejects non-recursive functions at the
+        // entry terminator (O(1)); a full opcode pre-scan here would be *slower*
+        // for call-free straight-line functions, so time it directly.
+        passtime::time(passtime::REC_LOOP, || rec_loop::run(&mut pctx.ctx.func))
     }
 }
 
@@ -150,11 +153,13 @@ impl Pass for SincosPass {
     }
 
     fn run(&mut self, pctx: &mut PassCtx<'_>) -> bool {
-        if std::env::var_os("RAKIT_NO_SINCOS").is_none()
-            && has_opcode(&pctx.ctx.func, Opcode::Call)
-        {
-            sincos::run(&mut *pctx.module, &mut pctx.ctx.func, pctx.analyses);
+        if std::env::var_os("RAKIT_NO_SINCOS").is_some() {
+            return false;
         }
-        true
+        // `sincos::run` already does one cheap walk to find sin/cos calls; a
+        // separate Call pre-scan would add a walk, so time it directly.
+        passtime::time(passtime::SINCOS, || {
+            sincos::run(&mut *pctx.module, &mut pctx.ctx.func, pctx.analyses)
+        })
     }
 }
