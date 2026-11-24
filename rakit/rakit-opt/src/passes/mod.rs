@@ -33,10 +33,18 @@ impl Pass for RecLoopPass {
     }
 
     fn run(&mut self, pctx: &mut PassCtx<'_>) -> bool {
-        if std::env::var_os("RAKIT_NO_REC_LOOP").is_none() {
-            rec_loop::run(&mut pctx.ctx.func);
+        if std::env::var_os("RAKIT_NO_REC_LOOP").is_some() {
+            return false;
         }
-        true
+        // rec_loop only matches a self-recursive call; skip the matcher (and its
+        // walk) on functions with no call at all.
+        passtime::time(passtime::REC_LOOP, || {
+            if has_opcode(&pctx.ctx.func, Opcode::Call) {
+                rec_loop::run(&mut pctx.ctx.func)
+            } else {
+                false
+            }
+        })
     }
 }
 
@@ -150,11 +158,16 @@ impl Pass for SincosPass {
     }
 
     fn run(&mut self, pctx: &mut PassCtx<'_>) -> bool {
-        if std::env::var_os("RAKIT_NO_SINCOS").is_none()
-            && has_opcode(&pctx.ctx.func, Opcode::Call)
-        {
-            sincos::run(&mut *pctx.module, &mut pctx.ctx.func, pctx.analyses);
+        if std::env::var_os("RAKIT_NO_SINCOS").is_some() {
+            return false;
         }
-        true
+        // sin/cos are calls; a function with no call cannot contain a pair.
+        passtime::time(passtime::SINCOS, || {
+            if has_opcode(&pctx.ctx.func, Opcode::Call) {
+                sincos::run(&mut *pctx.module, &mut pctx.ctx.func, pctx.analyses)
+            } else {
+                false
+            }
+        })
     }
 }

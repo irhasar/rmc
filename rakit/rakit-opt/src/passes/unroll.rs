@@ -380,11 +380,20 @@ pub fn run(func: &mut ir::Function, analyses: &mut crate::analyses::Analyses) {
     if factor < 2 {
         return;
     }
-    if crate::tunables::collapse_forwarders_enabled() {
+    // A single-block function cannot contain a forwarding block (there is no
+    // other block to jump to) nor a loop (a back edge needs a body block
+    // distinct from its header). Skip the forwarder collapse and the loop
+    // analysis for it; `narrow_uint_fcvt` below is loop-independent and still
+    // runs.
+    let multi_block = func.layout.blocks().nth(1).is_some();
+    if multi_block && crate::tunables::collapse_forwarders_enabled() {
         collapse_forwarders(func);
         analyses.invalidate();
     }
     narrow_uint_fcvt(func, analyses);
+    if !multi_block {
+        return;
+    }
     if std::env::var_os("RAKIT_UNROLL_DEBUG").is_some() {
         eprintln!("[unroll] func {:?} blocks={}", func.name, func.layout.blocks().count());
         for b in func.layout.blocks() {

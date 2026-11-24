@@ -10,13 +10,14 @@ use rakit_codegen::ir::{
 };
 use rakit_module::{Linkage, Module};
 
+/// Returns whether any `sin`/`cos` pair was fused into one `sincos` call.
 pub fn run(
     module: &mut dyn Module,
     func: &mut ir::Function,
     analyses: &mut crate::analyses::Analyses,
-) {
+) -> bool {
     if std::env::var_os("RAKIT_NO_SINCOS").is_some() {
-        return;
+        return false;
     }
     let ptr_ty = module.isa().pointer_type();
     let call_conv = func.signature.call_conv;
@@ -55,7 +56,7 @@ pub fn run(
         }
     }
     if sins.is_empty() || coss.is_empty() {
-        return;
+        return false;
     }
 
     let dom = analyses.domtree(func);
@@ -77,7 +78,7 @@ pub fn run(
         pairs.push((si, ci));
     }
     if pairs.is_empty() {
-        return;
+        return false;
     }
 
     // Declare `sincosf` and/or `sincos` separately: a f32 pair and a f64 pair in
@@ -100,6 +101,7 @@ pub fn run(
     let f64_ref = if need_f64 { declare(module, func, "sincos", ir::types::F64) } else { None };
     let func_ref_of = |ty: Type| if ty == ir::types::F64 { f64_ref } else { f32_ref };
 
+    let mut changed = false;
     for (si, ci) in pairs {
         let sin = &sins[si];
         let cos = &coss[ci];
@@ -130,7 +132,9 @@ pub fn run(
         func.dfg.detach_inst_results(cos.inst);
         func.dfg.change_to_alias(cos.result, c_val);
         func.layout.remove_inst(cos.inst);
+        changed = true;
     }
+    changed
 }
 
 /// Recover the declared name of a direct call's callee.

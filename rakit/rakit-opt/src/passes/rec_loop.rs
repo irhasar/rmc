@@ -12,12 +12,14 @@ use rakit_codegen::cursor::{Cursor, FuncCursor};
 use rakit_codegen::ir::condcodes::IntCC;
 use rakit_codegen::ir::{self, Block, Inst, InstBuilder, Opcode, Value};
 
-pub fn run(func: &mut ir::Function) {
+/// Returns whether a self-recursive linear recurrence was rewritten.
+pub fn run(func: &mut ir::Function) -> bool {
     if std::env::var_os("RAKIT_NO_REC_LOOP").is_some() {
-        return;
+        return false;
     }
-    let Some(p) = try_match(func) else { return };
+    let Some(p) = try_match(func) else { return false };
     rewrite(func, p);
+    true
 }
 
 struct Pat {

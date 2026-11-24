@@ -14,7 +14,7 @@ static ENABLED: OnceLock<bool> = OnceLock::new();
 
 /// Codegen runs on rustc's worker threads, so the totals have to be shared: a
 /// thread-local accumulator would be reset before [`report`] ever ran.
-static ACC: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+static ACC: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 
 pub const STORE_FORWARD: usize = 0;
 pub const UNROLL: usize = 1;
@@ -23,8 +23,10 @@ pub const COLLECT: usize = 3;
 pub const IF_CONVERT: usize = 4;
 pub const DIV_TEST: usize = 5;
 pub const ROTATE: usize = 6;
+pub const REC_LOOP: usize = 7;
+pub const SINCOS: usize = 8;
 
-const NAMES: [&str; 7] = [
+const NAMES: [&str; 9] = [
     "store_forward",
     "unroll",
     "inline",
@@ -32,6 +34,8 @@ const NAMES: [&str; 7] = [
     "if_convert",
     "div_test",
     "rotate",
+    "rec_loop",
+    "sincos",
 ];
 
 fn enabled() -> bool {
