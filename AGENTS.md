@@ -99,11 +99,14 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
   43.2 / kernel 73.5 / hash 4.7 ms.** So the **kernel gap ≈3.2x** (22.7->73.5),
   init is also **≈2.9x** slower in M (43.2 vs 14.9), hash is equal. These are
   direct per-phase timings, *not* a kernel sample subtracted from whole-process
-  runs. Phase boundaries: **`init` already includes allocation + fill of a,b,c;
-  `kernel` excludes the 3 warmup passes.** Process totals (`l3_iso` L 54.0 / M
-  138.8; `l3_bw` L 56.0 / M 141.4) exceed the phase sum by the **3 warmup passes
-  + free/teardown + startup + `println`**, so the ~2.57x *process* ratio mixes
-  init+kernel and is **not** the kernel-only gap. 960 MB / 22.7 ms ≈ **42
+  runs. Probe phase boundaries: **`init` includes allocation + fill of a,b,c;
+  `kernel` excludes the probe's 3 warmup passes.** The **fixtures `l3_iso`/`l3_bw`
+  have NO in-process warmup** — they run 20 passes directly — so their process
+  totals (`l3_iso` L 54.0 / M 138.8; `l3_bw` L 56.0 / M 141.4) = init + 20 passes
+  + hash + free/teardown/startup/`println`. The excess over the *probe's* phase
+  sum is free/teardown/startup/`println` (the probe's warmup is separate and is
+  NOT part of the fixtures). So the ~2.57x *process* ratio mixes init+kernel and
+  is **not** the kernel-only gap. 960 MB / 22.7 ms ≈ **42
   GB/s** achievable here (the earlier "~19 GB/s" was a process average). Older
   "66.7 vs 28.3" (init-conflated) and "49.9 vs 110.3" (last-element) are
   **historical**. A 4-wide vectorized M can approach L's ~22.7 ms kernel.
