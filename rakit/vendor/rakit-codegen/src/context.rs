@@ -205,6 +205,7 @@ impl Context {
                 self.compute_domtree();
             }
             if crate::vectorize::enabled()
+                && isa.name() == "x64"
                 && crate::vectorize::do_vectorize(&mut self.func)
             {
                 // The pass adds blocks and edges; the dominator tree used by

@@ -93,13 +93,30 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
     }
     let s0 = blocks[0].block(&dfg.value_lists);
     let s1 = blocks[1].block(&dfg.value_lists);
-    let (b, _e) = if jumps_to(func, s0, h) && !jumps_to(func, s1, h) {
-        (s0, s1)
-    } else if jumps_to(func, s1, h) && !jumps_to(func, s0, h) {
-        (s1, s0)
-    } else {
+    // The body must be the *true* edge of `i < n` (the loop runs while i < n).
+    // A body on the false edge means the loop runs while `i >= n`, which the
+    // vector gate `i+4 <= n` would invert.
+    if !(jumps_to(func, s0, h) && !jumps_to(func, s1, h)) {
         return None;
-    };
+    }
+    let b = s0;
+    // The scalar header runs once per iteration; the vector loop bypasses it for
+    // the vectorized prefix, so it must be effect-free (pure arithmetic + the
+    // comparison only).
+    for inst in func.layout.block_insts(h) {
+        if inst == term {
+            continue;
+        }
+        let op = dfg.insts[inst].opcode();
+        if op.is_call()
+            || op.can_load()
+            || op.can_store()
+            || op.can_trap()
+            || op.other_side_effects()
+        {
+            return None;
+        }
+    }
     if !dfg.block_params(b).is_empty() {
         return None;
     }
@@ -141,9 +158,10 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
     let nextv = bargs[0].as_value()?;
     let (nop, na, nb) = binary(dfg, nextv)?;
     if nop != Opcode::Iadd
-        || dfg.resolve_aliases(if iconst_i64(dfg, nb) == Some(1) { na } else { nb }) != i
+        || !((dfg.resolve_aliases(na) == i && iconst_i64(dfg, nb) == Some(1))
+            || (dfg.resolve_aliases(nb) == i && iconst_i64(dfg, na) == Some(1)))
     {
-        return None;
+        return None; // require exactly `i + 1` (reject strided / other updates)
     }
 
     let mut loads = Vec::new();
@@ -158,8 +176,14 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
         }
         if op.can_store() {
             stores.push(inst);
-        } else if op.can_load() {
+            continue;
+        }
+        if op.can_load() {
             loads.push(inst);
+            continue;
+        }
+        if op.can_trap() {
+            return None; // e.g. trapnz / division: the vector body would skip it
         }
     }
     if loads.len() != 2 || stores.len() != 1 {
@@ -168,7 +192,16 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
     let mut off: Option<Value> = None;
     let mut load_bases = Vec::new();
     for &inst in &loads {
-        let ir::InstructionData::Load { offset, .. } = dfg.insts[inst] else { return None };
+        let ir::InstructionData::Load { offset, flags, .. } = dfg.insts[inst] else {
+            return None;
+        };
+        if dfg.insts[inst].opcode() != Opcode::Load {
+            return None; // reject uload8/sload8/… (narrow accesses)
+        }
+        let fl = &func.dfg.mem_flags[flags];
+        if !fl.notrap() || fl.explicit_endianness().is_some() {
+            return None; // would lose trap or byte-order semantics
+        }
         if i32::from(offset) != 0 || dfg.value_type(dfg.first_result(inst)) != types::I32 {
             return None;
         }
@@ -182,7 +215,16 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
         load_bases.push(base);
     }
     let s = stores[0];
-    let ir::InstructionData::Store { offset, .. } = dfg.insts[s] else { return None };
+    let ir::InstructionData::Store { offset, flags, .. } = dfg.insts[s] else {
+        return None;
+    };
+    if dfg.insts[s].opcode() != Opcode::Store {
+        return None; // reject istore8/istore16 (narrow accesses)
+    }
+    let fl = &func.dfg.mem_flags[flags];
+    if !fl.notrap() || fl.explicit_endianness().is_some() {
+        return None;
+    }
     if i32::from(offset) != 0 {
         return None;
     }
@@ -347,17 +389,17 @@ fn base_and_off(dfg: &DataFlowGraph, addr: Value, i: Value) -> Option<(Value, Va
 
 fn scaled_of(dfg: &DataFlowGraph, v: Value, i: Value) -> Option<()> {
     let (op, a, b) = binary(dfg, v)?;
-    let (l, r) = (dfg.resolve_aliases(a), dfg.resolve_aliases(b));
-    let c = if l == i {
-        b
-    } else if r == i {
-        a
-    } else {
-        return None;
-    };
     match op {
-        Opcode::Ishl if iconst_i64(dfg, c) == Some(2) => Some(()),
-        Opcode::Imul if iconst_i64(dfg, c) == Some(4) => Some(()),
+        // `i << 2` only: the shifted value must be `i` and the amount 2, so a
+        // reversed `2 << i` is rejected.
+        Opcode::Ishl if dfg.resolve_aliases(a) == i && iconst_i64(dfg, b) == Some(2) => Some(()),
+        // `i * 4` is commutative.
+        Opcode::Imul
+            if (dfg.resolve_aliases(a) == i && iconst_i64(dfg, b) == Some(4))
+                || (dfg.resolve_aliases(b) == i && iconst_i64(dfg, a) == Some(4)) =>
+        {
+            Some(())
+        }
         _ => None,
     }
 }

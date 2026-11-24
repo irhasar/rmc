@@ -176,6 +176,19 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
       (bounds-check multi-block) and M3.3 remain.
     - Suite: 65 suites / 25,368 passed / 0 failed. `allaxes` 15 progs all `ok`
       with no runtime regression on p1–p9/h_*.
+    - **Soundness hardening (review fixes):** exact unit stride (`i+1` only, both
+      operand orders); body must be the **true** edge of `i<n` (a false-edge body
+      inverts the `i+4<=n` gate); header must be **effect-free** (pure arith +
+      compare only — no load/store/call/trap, since the vector loop bypasses it);
+      exact `Load`/`Store` opcodes (reject `uload8`/`istore8`/… narrow accesses);
+      require scalar mem flags `notrap` **and no explicit endianness** (else
+      reject, to avoid losing trap/byte-order semantics); `scaled_of` accepts only
+      `i<<2` (not `2<<i`) and commutative `i*4`; body rejects `can_trap`
+      (`trapnz`/div) since the vector body would skip it; pass gated to
+      `isa.name()=="x64"` (baseline RISC-V cannot lower `I32X4`). Regression
+      `bench/tests/t_vectorize.rs` (+ `regressions.sh` `check`) covers
+      unit/strided/zero-trip/overlap/in-place/tail/u8. Removed the committed
+      `rustc-ice-*.txt` dumps and gitignored them.
 
 ## Session (2026-11-24, branch `rakit-exp7`) — p9 reloads are real, but NOT soundly hoistable with the existing flags (alias tags don't move loads)
 

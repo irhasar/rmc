@@ -57,6 +57,7 @@ check t_loop_call_args $'1\n3\n10\n32\n99\n301\n908\n2730\nacc=8197'
 check t_loop_side_effect '2016 64'
 check t_pmulhu '0 0 0 0 65534 32767 0 1'
 check t_rec_loop_effects '55 true true'
+check t_vectorize $'unit 12776226417588255163\nstrided2 12092896667980768107\nzero 11722458728514271619\noverlap 3027892629945128661\ninplace 12776226417588255163\ntail 6121779849389533154\nu8 2907005038580616411'
 
 if [ "$fail" -eq 0 ]; then
     echo "[regression] all fixtures passed"
