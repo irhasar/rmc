@@ -1,3 +1,141 @@
+## Session (2026-11-24, branch `rakit-exp4`) — runtime probe (no pass-level win), x64 omit-FP blocker map
+
+- **Branch:** from `replace-main-with-cgclif-experiments` after PR #14 merged
+  (`7ffa4b6`).
+- **`p1_arith` — full all-axes (matrix below):** run wall/cpu = LLVM **81/81**,
+  cg_clif upstream **108/107**, Rakit **101/101** ms. Rakit **beats upstream**
+  and loses to LLVM. **Knob A/B is supplementary (not an L/U/M comparison):**
+  disabling a single pass barely moves it — `RAKIT_NO_IFCONV` 101/101,
+  `RAKIT_NO_DIVTEST` 105/105, `RAKIT_NO_STORE_FWD` 103/103, `RAKIT_NO_LANES`
+  102/101, `RAKIT_NO_SINCOS` 101/101 (default 103/101). So the residual is
+  **codegen, not a pass**: Rakit keeps constants as memory operands
+  (`imul 0xf2(%rip)`, `cmp 0xe6(%rip)`, `mulsd 0xd7(%rip)`, `movabs $0x43e0...`
+  reloaded each iteration) where LLVM hoists them once to registers, and the
+  saturating `f as u64` is a **branchy** multi-`jmp` sequence vs LLVM's
+  two-`cvttsd2si` branchless form (matches the earlier negative result:
+  branchless `emit` regressed because the constants are materialised after
+  LICM).
+- **`p2_mem` cross-block budget is not the limiter:** full row L 17/16,
+  U 157/157, M 47/49 ms; `RAKIT_SF_CBE_MAX=1e9` gives the same M 49/48 as the
+  default 16384. `cross_block_entry` is already an RPO single sweep with an
+  early-meet bail.
+- **No RSS axis to win (from the matrix):** run peak RSS ties across backends
+  (p2 11.1/11.1/10.8 MB, p1 11.1/10.8/11.1 MB); compile RSS is M ~ U and
+  slightly above L (p1 106.0/108.8/109.2 MB).
+- **x64 omit-frame-pointer blocker map (NOT attempted; all must be fixed
+  together or it miscompiles — two earlier naive attempts segfaulted):**
+  - `vendor/rakit-codegen/src/isa/x64/abi.rs:955` — `let setup_area_size = 16`
+    is **hardcoded** (`// RBP, return address`); must be 8 with no frame
+    pointer.
+  - `isa/x64/abi.rs:538-568` `gen_prologue_frame_setup` unconditionally emits
+    `push %rbp; mov %rsp,%rbp` (+ `Unwind::PushFrameRegs`); `:571-588`
+    `gen_epilogue_frame_restore` unconditionally emits `mov %rbp,%rsp; pop
+    %rbp`.
+  - **Incoming stack arguments are RBP-relative — ordinary calls, not just
+    `return_call`:** `isa/x64/inst/external.rs:338-356` lowers
+    `SyntheticAmode::IncomingArg { offset }` to an `Amode::ImmReg` with
+    `base: Gpr::RBP` and `simm32 = -offset`, whereas local
+    `SyntheticAmode::SlotOffset` uses `base: Gpr::RSP`. So **any callee whose
+    arguments spill to the stack (e.g. >6 register args, or any stack-passed
+    arg) reads them via RBP**; omitting the frame pointer breaks such
+    **ordinary calls**, not only `return_call`. This is **fixable by mirroring
+    RISC-V**, which already lowers `AMode::IncomingArg` **SP-relative** from the
+    frame layout (`isa/riscv64/inst/args.rs:124-149`:
+    `sp_offset = tail_args_size + setup_area_size + clobber_size +
+    fixed_frame_storage_size + outgoing_args_size`, then `sp_offset - off`).
+    The earlier claim that "RSP moves within a function" is **wrong for
+    clobbers/slots**: `isa/x64/abi.rs:714-729` (`gen_clobber_save`) reserves
+    `fixed_frame_storage_size + clobber_size + outgoing_args_size` **once in the
+    prologue** with a single `sub rsp`, then stores clobbers at fixed RSP
+    offsets, so those SP offsets are constant. RSP is only adjusted
+    transiently for outgoing call args and for the `tail_args_size` growth of a
+    `return_call` — both folded into the RISC-V formula above.
+  - `isa/x64/abi.rs:673` `gen_clobber_save` additionally does rbp-relative
+    surgery when a `return_call` grows the incoming-arg area.
+  - `isa/x64/inst/emit.rs:1893` `emit_return_call_common_sequence` **asserts**
+    `preserve_frame_pointers()` — `return_call` needs FP (latent ICE if
+    default-on and tail calls are emitted).
+  - `verifier/mod.rs:660` rejects `get_frame_pointer`/`get_return_address`
+    without FP (backtrace machinery).
+  - `rbp` is callee-save (`is_callee_save_systemv`) and its *only* save today is
+    the prologue push, so omit-FP must guarantee regalloc never allocates `rbp`
+    (or save it via `gen_clobber_save`).
+  - s390x/riscv64 already gate `setup_area_size`/prologue on
+    `flags.preserve_frame_pointers()` (`isa/s390x/abi.rs:761,789,973`,
+    `isa/riscv64/abi.rs:664`); x64 never implemented it. On x64 the extra piece
+    is the SP-relative incoming-arg lowering above (RISC-V's is the template);
+    the remaining gates are the `return_call` FP assert and the
+    `get_frame_pointer` verifier.
+- **Landed (safe, byte-identical):** the unroller's remaining per-function env
+  reads (`RAKIT_UNROLL_DEBUG`, `RAKIT_LANE_DEBUG`, `RAKIT_NO_NARROW_FCVT`,
+  `RAKIT_NO_LANES`) now go through cached `OnceLock` tunables, completing the
+  "cache every knob in `tunables.rs`" discipline and removing global
+  `std::env` map locks from the hottest per-function pass. **Neutral** on
+  measurement (p2 knob A/B 164/228 vs 172/236 ms, noise; synthetic 800-function
+  file 157/210 vs 157/213). The M-vs-U compile gap in the matrix (p2 compile M
+  159/216 vs U 124/166) is the documented price of the extra passes, not this
+  change.
+- **Conclusion:** every remaining runtime gap (p1 codegen constants + branchy
+  cast, p2 hash/sort codegen, p3 frame-pointer/call overhead, p4 vectorizer,
+  p8 regalloc parallel-copy cycle, p9 libcall GOT reload) needs vendored
+  backend work; safe pass-level micro-optimisation is exhausted.
+- **Verification:** `./y.sh build` exit 0; 15/15 bench binaries md5-identical to
+  the PR #14 build; `./y.sh test --sysroot rakit` -> 65 suites / 25,368 passed /
+  0 failed; `bench/allaxes.sh` 45/45 rows `ok` (stdout matches LLVM).
+
+### Full all-axes matrix (`bench/allaxes.sh`, CREPS=3 RREPS=7) — this build
+L = LLVM, U = cg_clif upstream, M = modified Rakit. Compile = wall / cpu ms /
+peak RSS MB / artifact bytes. Run = wall / cpu ms / peak RSS MB. All stdout
+matched LLVM. Run wall is contention-sensitive; compare with run cpu.
+
+| prog | bk | Cwall | Ccpu | Crss | size(B) | Rwall | Rcpu | Rrss |
+|------|----|------:|-----:|-----:|--------:|------:|-----:|-----:|
+| h_arith | L | 117 | 141 | 117.6 | 4617128 | 2 | 2 | 10.8 |
+| h_arith | U | 88 | 115 | 120.0 | 5839120 | 2 | 2 | 11.1 |
+| h_arith | M | 100 | 129 | 120.6 | 4078672 | 2 | 2 | 11.0 |
+| h_branch | L | 118 | 143 | 118.1 | 4616832 | 2 | 2 | 11.0 |
+| h_branch | U | 88 | 116 | 120.3 | 5837264 | 2 | 2 | 10.9 |
+| h_branch | M | 103 | 135 | 120.4 | 4077008 | 2 | 2 | 11.0 |
+| h_calls | L | 116 | 139 | 118.5 | 4616872 | 2 | 2 | 11.0 |
+| h_calls | U | 88 | 115 | 120.7 | 5837792 | 2 | 2 | 11.0 |
+| h_calls | M | 102 | 131 | 120.9 | 4077368 | 2 | 2 | 11.0 |
+| h_float | L | 126 | 149 | 117.2 | 4637984 | 2 | 2 | 10.8 |
+| h_float | U | 91 | 119 | 119.8 | 5861024 | 3 | 2 | 11.0 |
+| h_float | M | 104 | 132 | 120.1 | 4118168 | 2 | 2 | 11.1 |
+| h_mem | L | 260 | 419 | 137.8 | 4646848 | 3 | 3 | 10.8 |
+| h_mem | U | 130 | 179 | 135.8 | 5959856 | 9 | 9 | 11.1 |
+| h_mem | M | 170 | 245 | 137.1 | 4166120 | 5 | 4 | 10.8 |
+| h_simd | L | 140 | 163 | 124.1 | 4617704 | 2 | 2 | 11.0 |
+| h_simd | U | 98 | 127 | 125.9 | 5843736 | 4 | 3 | 11.0 |
+| h_simd | M | 112 | 142 | 126.0 | 4081096 | 2 | 2 | 11.0 |
+| p1_arith | L | 91 | 112 | 106.0 | 4635232 | 81 | 81 | 11.1 |
+| p1_arith | U | 78 | 101 | 108.8 | 5877944 | 108 | 107 | 10.8 |
+| p1_arith | M | 87 | 111 | 109.2 | 4146112 | 101 | 101 | 11.1 |
+| p2_mem | L | 244 | 373 | 132.9 | 4639888 | 17 | 16 | 11.1 |
+| p2_mem | U | 124 | 166 | 132.0 | 5936144 | 157 | 157 | 11.1 |
+| p2_mem | M | 159 | 216 | 133.0 | 4143368 | 47 | 49 | 10.8 |
+| p3_calls | L | 98 | 119 | 116.0 | 4612368 | 37 | 36 | 11.0 |
+| p3_calls | U | 87 | 112 | 117.5 | 5820136 | 117 | 117 | 11.0 |
+| p3_calls | M | 103 | 123 | 118.1 | 4067048 | 55 | 55 | 11.1 |
+| p4_simd | L | 106 | 125 | 116.4 | 4636096 | 56 | 56 | 48.2 |
+| p4_simd | U | 92 | 115 | 118.2 | 5892376 | 157 | 156 | 49.5 |
+| p4_simd | M | 104 | 129 | 118.8 | 4152736 | 84 | 83 | 48.8 |
+| p5_inline | L | 82 | 104 | 104.8 | 4609368 | 58 | 57 | 11.1 |
+| p5_inline | U | 77 | 100 | 107.3 | 5813704 | 895 | 894 | 10.8 |
+| p5_inline | M | 83 | 108 | 108.0 | 4059960 | 6 | 6 | 11.0 |
+| p6_scalar | L | 81 | 99 | 101.3 | 4609368 | 58 | 57 | 11.1 |
+| p6_scalar | U | 75 | 97 | 103.6 | 5813688 | 904 | 905 | 11.0 |
+| p6_scalar | M | 82 | 104 | 104.1 | 4059960 | 6 | 6 | 11.0 |
+| p7_branchy | L | 83 | 101 | 105.2 | 4609520 | 43 | 43 | 11.0 |
+| p7_branchy | U | 77 | 100 | 107.6 | 5813800 | 100 | 100 | 10.7 |
+| p7_branchy | M | 87 | 111 | 108.1 | 4060120 | 35 | 35 | 10.8 |
+| p8_minmax | L | 84 | 101 | 105.1 | 4609544 | 18 | 17 | 11.0 |
+| p8_minmax | U | 78 | 100 | 107.3 | 5813752 | 38 | 38 | 11.1 |
+| p8_minmax | M | 85 | 107 | 107.9 | 4060088 | 20 | 20 | 10.8 |
+| p9_u64f32 | L | 95 | 114 | 110.8 | 4635448 | 30 | 30 | 17.8 |
+| p9_u64f32 | U | 86 | 109 | 113.7 | 5886872 | 76 | 76 | 18.8 |
+| p9_u64f32 | M | 97 | 120 | 114.2 | 4149744 | 34 | 34 | 18.2 |
+
 ## Session (2026-11-24, branch `rakit-exp3`) — instrumentation + per-function guards (marginal), runtime walls re-confirmed
 
 - **Branch:** from `replace-main-with-cgclif-experiments` after PR #13 merged

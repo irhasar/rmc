@@ -111,7 +111,7 @@ fn collapse_forwarders(func: &mut ir::Function) {
             // learned by retrying, and re-finding it would loop forever.
             break;
         }
-        if std::env::var_os("RAKIT_UNROLL_DEBUG").is_some() {
+        if crate::tunables::unroll_debug() {
             eprintln!("[unroll]   collapsed pred={pred:?} latch={latch:?}");
         }
         ctx.removed(pred, latch, target);
@@ -394,7 +394,7 @@ pub fn run(func: &mut ir::Function, analyses: &mut crate::analyses::Analyses) {
     // (which return below without a loop analysis) still get a dump, and so the
     // conversion diagnostics `narrow_uint_fcvt` prints have the function header
     // above them.
-    if std::env::var_os("RAKIT_UNROLL_DEBUG").is_some() {
+    if crate::tunables::unroll_debug() {
         eprintln!("[unroll] func {:?} blocks={}", func.name, func.layout.blocks().count());
         for b in func.layout.blocks() {
             let params: Vec<String> =
@@ -424,7 +424,7 @@ pub fn run(func: &mut ir::Function, analyses: &mut crate::analyses::Analyses) {
     }
     let plan = analyze(func);
     let Some(plan) = plan else {
-        if std::env::var_os("RAKIT_UNROLL_DEBUG").is_some() {
+        if crate::tunables::unroll_debug() {
             eprintln!("[unroll] -> REJECTED by analyze");
         }
         return;
@@ -444,7 +444,7 @@ pub fn run(func: &mut ir::Function, analyses: &mut crate::analyses::Analyses) {
 /// (e.g. the `i < N` test of a `for i in 0..N` loop). Dynamic or huge bounds are
 /// left untouched.
 fn narrow_uint_fcvt(func: &mut ir::Function, analyses: &mut crate::analyses::Analyses) {
-    if std::env::var_os("RAKIT_NO_NARROW_FCVT").is_some() {
+    if crate::tunables::no_narrow_fcvt() {
         return;
     }
     let targets: Vec<(Inst, Value)> = {
@@ -464,7 +464,7 @@ fn narrow_uint_fcvt(func: &mut ir::Function, analyses: &mut crate::analyses::Ana
         return;
     }
     let dom = analyses.domtree(func);
-    let dbg = std::env::var_os("RAKIT_UNROLL_DEBUG").is_some();
+    let dbg = crate::tunables::unroll_debug();
     let mut changed = 0;
     for (inst, x) in targets {
         let bound = upper_bound(func, &dom, inst, x).or_else(|| local_bound(func, x));
@@ -604,7 +604,7 @@ fn defined_in(func: &ir::Function, v: Value, blocks: &[Block]) -> bool {
 fn analyze(func: &ir::Function) -> Option<Plan> {
     let dfg = &func.dfg;
     let layout = &func.layout;
-    let dbg = std::env::var_os("RAKIT_UNROLL_DEBUG").is_some();
+    let dbg = crate::tunables::unroll_debug();
 
     for body in layout.blocks() {
         let Some(term) = layout.last_inst(body) else { continue };
@@ -1376,7 +1376,7 @@ fn detect_lane(func: &ir::Function, plan: &Plan, forms: &[Option<Affine>]) -> Op
 }
 
 fn lane_enabled() -> bool {
-    std::env::var_os("RAKIT_NO_LANES").is_none()
+    crate::tunables::lanes_enabled()
 }
 
 /// Rewrite an `a = a*C + (i|1)` loop with a min/max reduction into `F`
@@ -1416,7 +1416,7 @@ fn apply_lanes(func: &mut ir::Function, plan: &Plan, li: &LaneInfo) -> bool {
     } else {
         return false;
     };
-    let dbg = std::env::var_os("RAKIT_LANE_DEBUG").is_some();
+    let dbg = crate::tunables::lane_debug();
     if dbg {
         let arms: Vec<String> = match &func.dfg.insts[brif] {
             ir::InstructionData::Brif { blocks, .. } => blocks
@@ -1672,7 +1672,7 @@ fn apply(func: &mut ir::Function, plan: &Plan, factor: u64) {
     // dependency chain. Duplicating the body cannot achieve that.
     if let Some(forms) = analyze_affine(func, plan) {
         let pure_body = !body_has_observable_effect(func, plan);
-        if std::env::var_os("RAKIT_LANE_DEBUG").is_some() {
+        if crate::tunables::lane_debug() {
             match detect_lane(func, plan, &forms) {
                 Some(li) => eprintln!(
                     "[lane] MATCH iv={} a={} mn={} C={} bound={} bound%4={}",
