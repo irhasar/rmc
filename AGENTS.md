@@ -26,12 +26,13 @@
   fire), so the IR is unchanged. The disable switches (`RAKIT_NO_DIVTEST`,
   `RAKIT_NO_IFCONV`) are checked **before** the scan, so a disabled pass costs
   nothing; and the pre-scan runs **inside** the `passtime::time` region so the
-  reported per-pass time includes the scan. A prefilter rejection now returns
-  `false` from the adapter (the closure's result) instead of `true`, so the
-  `Pass::run` "did the function change" contract is truthful; and
-  `passtime::enabled()` memoises `RAKIT_PASS_TIME` in a `OnceLock`, so the extra
-  `time()` calls for skipped functions do not re-read the environment in a
-  normal build.
+  reported per-pass time includes the scan. The adapters return the optimizer's
+  own result: `div_test::run` and `if_convert::run` now return whether they
+  actually rewrote (so a function with no `urem` candidate or no convertible
+  diamond yields `false`), and a prefilter rejection also returns `false` — so
+  `Pass::run`'s "did the function change" answer is truthful. `passtime::enabled()`
+  memoises `RAKIT_PASS_TIME` in a `OnceLock`, so the extra `time()` calls for
+  skipped functions do not re-read the environment in a normal build.
   - **Byte-identical:** all 15 bench programs md5-match the pre-change build.
   - **A/B compile (median, reps=15, same session):** `p2_mem` 158→**155** wall
     (cpu 217→217), `h_mem` 168→**165** (238→233), `p4_simd` 107→**105**

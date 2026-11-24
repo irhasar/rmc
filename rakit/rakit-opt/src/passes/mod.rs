@@ -70,12 +70,12 @@ impl Pass for DivTestPass {
             return false;
         }
         // The pre-scan is inside the timer so the reported time includes it, and
-        // the closure's result is the pass result: a rejected function did not
-        // change, so report `false`.
+        // the closure's result is the pass result: `div_test::run` reports
+        // whether it rewrote anything, so a function with no candidate or a
+        // rejected function both yield `false`.
         passtime::time(passtime::DIV_TEST, || {
             if has_opcode(&pctx.ctx.func, Opcode::Urem) {
-                div_test::run(&mut pctx.ctx.func);
-                true
+                div_test::run(&mut pctx.ctx.func)
             } else {
                 false
             }
@@ -97,14 +97,13 @@ impl Pass for IfConvertPass {
         // A two-way diamond needs a head, two arms and a join (>=3 blocks) and a
         // `brif` head; skip otherwise. The block-count check and the opcode scan
         // are inside the timer so the reported time includes them, and the
-        // closure's result is the pass result (a rejected function did not
-        // change).
+        // closure's result is the pass result (`if_convert::run` reports whether
+        // it converted a diamond).
         passtime::time(passtime::IF_CONVERT, || {
             if pctx.ctx.func.layout.blocks().nth(2).is_some()
                 && has_opcode(&pctx.ctx.func, Opcode::Brif)
             {
-                if_convert::run(&mut pctx.ctx.func, pctx.analyses);
-                true
+                if_convert::run(&mut pctx.ctx.func, pctx.analyses)
             } else {
                 false
             }
