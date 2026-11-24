@@ -813,6 +813,10 @@ fn codegen_regular_intrinsic_call<'tcx>(
                             fx.bcx.switch_to_block(exit);
                             fx.bcx.seal_block(body);
                             fx.bcx.seal_block(exit);
+                            // `write_cvalue` attaches its assignment comment to the
+                            // block's last instruction; an empty exit block panics
+                            // when IR comments are on (`--emit=llvm-ir`).
+                            fx.bcx.ins().nop();
                         }
                         CValue::by_ref(slot, inner_layout)
                     }

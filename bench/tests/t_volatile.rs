@@ -87,8 +87,31 @@ pub unsafe extern "C" fn vol512_discard(p: *const Big512) {
 #[no_mangle]
 pub unsafe extern "C" fn vol512_use(p: *const Big512, out: *mut u64) {
     let v: Big512 = core::ptr::read_volatile(p);
-    *out.add(0) = v.0[0];
-    *out.add(1) = v.0[63];
+    // Fold every word: a skipped interior read changes the result.
+    let mut h = 1469598103934665603u64;
+    for &x in v.0.iter() {
+        h = (h ^ x).wrapping_mul(1099511628211);
+    }
+    *out = h;
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Five(pub u64, pub u64, pub u64, pub u64, pub u64);
+
+// The source is a local stack slot whose stores the optimizer can see; the
+// volatile read must still be issued (store forwarding must not delete it).
+#[inline(never)]
+#[no_mangle]
+pub unsafe extern "C" fn vol_stack_discard(seed: u64) {
+    let local = Five(seed, seed ^ 1, seed ^ 2, seed ^ 3, seed ^ 4);
+    let _ = core::ptr::read_volatile(&raw const local);
+}
+#[inline(never)]
+#[no_mangle]
+pub unsafe extern "C" fn vol_stack_use(seed: u64, out: *mut u64) {
+    let local = Five(seed, seed ^ 1, seed ^ 2, seed ^ 3, seed ^ 4);
+    let v = core::ptr::read_volatile(&raw const local);
+    *out = v.0 ^ v.1 ^ v.2 ^ v.3 ^ v.4;
 }
 #[inline(never)]
 #[no_mangle]
@@ -178,8 +201,14 @@ fn main() {
     let bigp = &big as *const Big512;
     let d: unsafe extern "C" fn(*const Big512) = std::hint::black_box(vol512_discard);
     unsafe { d(bigp) };
-    let mut o3 = [0u64; 2];
+    let mut o3 = [0u64; 1];
     let u: unsafe extern "C" fn(*const Big512, *mut u64) = std::hint::black_box(vol512_use);
     unsafe { u(bigp, o3.as_mut_ptr()) };
-    println!("v512 {:x} {:x}", o3[0], o3[1]);
+    println!("v512 {:x}", o3[0]);
+    let d: unsafe extern "C" fn(u64) = std::hint::black_box(vol_stack_discard);
+    unsafe { d(0x1234) };
+    let mut o4 = 0u64;
+    let u: unsafe extern "C" fn(u64, *mut u64) = std::hint::black_box(vol_stack_use);
+    unsafe { u(0x1234, &mut o4) };
+    println!("vstk {:x}", o4);
 }

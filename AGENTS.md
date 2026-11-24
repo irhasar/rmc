@@ -362,6 +362,46 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
     two-source `a[i] += b[i]` -> `paddd` (guard still emitted for `b`), f32
     `a[i] *= 2.0` -> `mulps`. New `t_vectorize_inplace`
     (n=1000/999/17/15/1/0); regressions asserts the four ops.
+  - **M4.12 LANDED: IR-comment panic, store forwarding of volatile reads.**
+    (a) `--emit=llvm-ir` panicked: the counted volatile loop left an empty exit
+    block and `write_cvalue_maybe_transmute` unwraps the block's last
+    instruction to attach its comment. Emit a `nop` in the exit block. A/B
+    checked: removing it panics at `value_and_place.rs:549`.
+    (b) `store_forward` deleted volatile reads of a **stack** value: private
+    slot facts survived a `fence` and a trapping load was forwarded like any
+    other. Now a `Fence` clears the fact map and loads without `notrap` are
+    never forwarded (`func.dfg.mem_flags[flags].notrap()`). A/B checked: without
+    the guard `vol_stack_discard` issues **0** loads instead of 5.
+    (c) `vol512_use` now folds a checksum over all 64 words, so a skipped
+    interior word changes the result; new `vol_stack_discard`/`vol_stack_use`
+    (local `Five` tuple struct + `read_volatile(&raw const local)`) cover the
+    forwarding case, and `regressions.sh` gates on `--emit=llvm-ir` not
+    panicking and on 5 stack source loads.
+    **Full all-axes matrix** (CREPS=2 RREPS=7; compile = wall ms / cpu ms /
+    peak RSS MB / bytes, run = wall ms / cpu ms / peak RSS MB):
+
+    | prog | C L | C U | C M | R L | R U | R M |
+    |---|---|---|---|---|---|---|
+    | h_arith | 118/143/118.2/4617128 | 95/122/119.2/5839120 | 106/134/120.3/4079232 | 2/2/11.0 | 2/2/11.1 | 2/2/11.0 |
+    | h_branch | 118/144/118.3/4616832 | 95/124/119.5/5837264 | 107/136/120.5/4077568 | 2/2/11.1 | 2/2/11.0 | 2/2/10.9 |
+    | h_calls | 118/144/118.9/4616872 | 92/120/119.6/5837792 | 105/135/120.7/4077928 | 2/2/11.0 | 2/2/11.0 | 2/2/11.0 |
+    | h_float | 134/156/119.0/4637984 | 91/119/118.7/5861024 | 112/138/119.4/4118728 | 2/2/11.1 | 3/2/10.7 | 2/2/11.0 |
+    | h_mem | 269/435/138.4/4646856 | 137/189/134.8/5959856 | 176/246/137.0/4166856 | 3/3/11.0 | 10/9/11.0 | 5/4/10.8 |
+    | h_simd | 145/171/124.2/4617704 | 108/133/124.7/5843736 | 117/146/125.9/4081656 | 2/2/11.0 | 4/4/11.1 | 3/2/11.0 |
+    | p1_arith | 87/106/106.0/4635232 | 82/106/108.0/5877944 | 91/115/109.4/4146656 | 82/82/11.1 | 109/108/10.8 | 103/103/11.1 |
+    | p2_mem | 257/390/134.0/4639896 | 130/175/130.8/5936144 | 164/223/132.7/4144024 | 17/16/11.1 | 160/159/11.1 | 49/49/10.8 |
+    | p3_calls | 101/124/116.1/4612368 | 88/116/116.5/5820136 | 100/128/118.0/4067592 | 37/37/10.8 | 117/117/11.0 | 58/58/11.1 |
+    | p4_simd | 108/129/116.7/4636096 | 98/122/117.0/5892376 | 111/137/118.5/4153280 | 56/56/48.2 | 157/157/49.4 | 85/85/48.8 |
+    | p5_inline | 84/106/105.0/4609368 | 77/101/106.9/5813704 | 88/113/107.7/4060504 | 58/57/11.0 | 895/895/11.1 | 7/6/10.8 |
+    | p6_scalar | 83/101/101.4/4609368 | 79/101/103.1/5813688 | 93/113/104.2/4060504 | 58/58/11.1 | 904/903/10.8 | 7/6/10.9 |
+    | p7_branchy | 86/104/105.4/4609520 | 80/102/106.7/5813800 | 90/113/107.7/4060664 | 43/43/11.1 | 101/100/11.1 | 36/35/10.8 |
+    | p8_minmax | 85/105/105.5/4609544 | 83/106/106.8/5813752 | 92/116/107.7/4060648 | 18/18/11.0 | 39/39/10.8 | 21/20/10.8 |
+    | p9_u64f32 | 96/117/111.3/4635448 | 89/112/112.8/5886872 | 103/128/114.0/4150304 | 31/31/17.8 | 77/76/18.8 | 35/34/18.2 |
+    | **TOTAL** | 1889/2475/1738.4/69350216 | 1424/1848/1745.1/87847208 | 1655/2121/1763.7/61506144 | 413/411/209.4 | 2582/2575/210.8 | 417/410/209.0 |
+
+    M vs L: compile **0.88x**, size **-11.3%**, run **1.01x**; M vs U: compile
+    1.16x, size -30.0%, run **0.16x**. Suite 65/25368/0; regressions green;
+    allaxes 15/15 ok, no INVALID.
   - **M4.11 LANDED: no library copy reads a volatile source.**
     (a) `emit_small_memory_copy` falls back to `memcpy` above four chunks, and
     `memcpy` may use overlapping loads — a 40-byte volatile read of five

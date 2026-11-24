@@ -365,7 +365,14 @@ fn forward_block(
         let opcode = func.dfg.insts[inst].opcode();
 
         if clobbers_memory(opcode) {
-            avail.retain(|&(b, _), _| matches!(b, Base::Slot(_)));
+            if opcode == ir::Opcode::Fence {
+                // A fence orders the accesses around it, and `volatile_load`
+                // lowers to fence + trapping loads: a value stored before it
+                // must not be forwarded into a load after it.
+                avail.clear();
+            } else {
+                avail.retain(|&(b, _), _| matches!(b, Base::Slot(_)));
+            }
             continue;
         }
         if opcode.can_store() {
@@ -375,6 +382,15 @@ fn forward_block(
                 record_store(func, inst, value, addr, &mut avail, private, ptr_bases, loaded);
             }
         } else if opcode.can_load() {
+            // A trapping load is the volatile read `volatile_load` emits;
+            // forwarding a private stack store into it would delete the read.
+            let flags = match &func.dfg.insts[inst] {
+                ir::InstructionData::Load { flags, .. } => *flags,
+                _ => continue,
+            };
+            if !func.dfg.mem_flags[flags].notrap() {
+                continue;
+            }
             let addr = func.dfg.insts[inst].arguments(&func.dfg.value_lists).first().copied();
             let Some(addr) = addr else { continue };
             let Some(key) = mem_key(func, inst, addr) else { continue };
