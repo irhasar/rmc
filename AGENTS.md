@@ -5,12 +5,13 @@
   targets the **compile axis**, where M still loses to upstream U on `p2`/`h_mem`
   because the custom passes run on every function. Runtime and size are unchanged
   (full matrix below).
-- **Pass manager honours the change flag** (`pass.rs`): `PassManager::run` used to
-  call `analyses.invalidate()` after *every* pass regardless of the return value.
-  It now invalidates only when `run` returns `true`, so a pass that reports "no
-  change" keeps the cached CFG/dominator tree. Every other pass still returns
-  `true`, so their behaviour is unchanged; the new structural guards are the only
-  passes that return `false`.
+- **What the guards save (and don't):** only pass *execution*. The pipeline is
+  `RecLoop, StoreForward, DivTest, IfConvert, Unroll, Rotate, Sincos`, and
+  `DivTest`/`Unroll` always report a change, so `PassManager::run` has already
+  cleared the analysis cache right before `IfConvert`/`Rotate`. A guard that skips
+  those passes therefore preserves no cached CFG — `invalidate()` stays
+  unconditional; the saving is not rebuilding the CFG / walking bodies inside the
+  skipped pass.
 - **Structural pass guards** (`passes/mod.rs`): `if_convert` skips functions with
   fewer than 3 blocks (a two-way diamond needs `then_block != else_block`, i.e.
   head + two distinct arms) and `rotate` skips single-block functions (no distinct
