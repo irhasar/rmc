@@ -819,39 +819,51 @@ fn apply(func: &mut Function, p: Plan) {
         cur.ins().jump(g, &[]);
     }
 
-    {
-        let mut cur = FuncCursor::new(func).at_bottom(g);
-        let size = cur.ins().iconst(types::I64, p.lanes.size() as i64);
-        let n = match p.n {
-            Bound::Const(c) => cur.ins().iconst(types::I64, c),
-            Bound::Runtime(v) => v,
-        };
-        let lbytes = cur.ins().imul(n, size);
-        let pc = p.base_c;
-        let mut srcs: Vec<Value> = Vec::new();
+    // An in-place update (`dst` base == a source base) touches the same address
+    // for each index, so it needs no overlap guard.
+    let pc_res = p.base_c;
+    let mut srcs: Vec<Value> = Vec::new();
+    if p.base_a != pc_res {
         srcs.push(p.base_a);
-        if let Rhs::Mem(bb) = p.rhs {
+    }
+    if let Rhs::Mem(bb) = p.rhs {
+        if func.dfg.resolve_aliases(bb) != pc_res {
             srcs.push(bb);
         }
-        let mut ov = None;
-        for src in srcs {
-            let d1 = cur.ins().isub(pc, src);
-            let o1 = cur.ins().icmp(IntCC::UnsignedLessThan, d1, lbytes);
-            let d2 = cur.ins().isub(src, pc);
-            let o2 = cur.ins().icmp(IntCC::UnsignedLessThan, d2, lbytes);
-            let o = cur.ins().bor(o1, o2);
-            ov = Some(match ov {
-                Some(prev) => cur.ins().bor(prev, o),
-                None => o,
-            });
+    }
+    {
+        let mut cur = FuncCursor::new(func).at_bottom(g);
+        if srcs.is_empty() {
+            // In-place: no other buffer can overlap this one.
+            cur.ins().jump(vh, &[p.init.into()]);
+        } else {
+            let size = cur.ins().iconst(types::I64, p.lanes.size() as i64);
+            let n = match p.n {
+                Bound::Const(c) => cur.ins().iconst(types::I64, c),
+                Bound::Runtime(v) => v,
+            };
+            let lbytes = cur.ins().imul(n, size);
+            let pc = p.base_c;
+            let mut ov = None;
+            for src in srcs {
+                let d1 = cur.ins().isub(pc, src);
+                let o1 = cur.ins().icmp(IntCC::UnsignedLessThan, d1, lbytes);
+                let d2 = cur.ins().isub(src, pc);
+                let o2 = cur.ins().icmp(IntCC::UnsignedLessThan, d2, lbytes);
+                let o = cur.ins().bor(o1, o2);
+                ov = Some(match ov {
+                    Some(prev) => cur.ins().bor(prev, o),
+                    None => o,
+                });
+            }
+            let ov = ov.unwrap();
+            // `n*size` is only a faithful span when n < u64::MAX/size; for a
+            // larger runtime n the multiply wraps, so fall back to scalar.
+            let lim = cur.ins().iconst(types::I64, (u64::MAX / p.lanes.size()) as i64);
+            let big = cur.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, n, lim);
+            let ov = cur.ins().bor(ov, big);
+            cur.ins().brif(ov, h, &[p.init.into()], vh, &[p.init.into()]);
         }
-        let ov = ov.unwrap();
-        // `n*size` is only a faithful span when n < u64::MAX/size; for a larger
-        // runtime n the multiply wraps, so fall back to scalar (treat as overlap).
-        let lim = cur.ins().iconst(types::I64, (u64::MAX / p.lanes.size()) as i64);
-        let big = cur.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, n, lim);
-        let ov = cur.ins().bor(ov, big);
-        cur.ins().brif(ov, h, &[p.init.into()], vh, &[p.init.into()]);
     }
 
     {

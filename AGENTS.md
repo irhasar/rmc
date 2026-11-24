@@ -355,6 +355,13 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
     `s` vectorizes: u32 → `pslld`/`psrld`/`psrad`, u64 → `psllq`. New
     `t_vectorize_shift_var` (s = 0/3/31/7/5/2, incl. width-1 masking);
     regressions asserts the four ops.
+  - **M4.5 LANDED: in-place map vectorization.** When the destination base equals
+    every source base (same index expression, already required by the matcher),
+    the overlap guard is skipped: `srcs.is_empty()` jumps straight to the vector
+    header. Unlocks `a[i] = a[i] OP ...`: u32 add -> `paddd`, xor -> `pxor`,
+    two-source `a[i] += b[i]` -> `paddd` (guard still emitted for `b`), f32
+    `a[i] *= 2.0` -> `mulps`. New `t_vectorize_inplace`
+    (n=1000/999/17/15/1/0); regressions asserts the four ops.
   - **Slice loops (bounds checks): not vectorized.** `for i in 0..n { c[i]=a[i]+b[i] }`
     lowers every access with a bounds `icmp`+`brif` to a cold `call panic; trap`
     block, i.e. a multi-block body *with internal control flow*. Vectorizing it
