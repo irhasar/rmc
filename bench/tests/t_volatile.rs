@@ -46,10 +46,15 @@ pub struct Wrap {
     pub blob: Blob12,
 }
 
-// Large aggregate: the volatile copy must use a library call, not per-chunk
-// load/store expansion.
+// Large aggregate: the read must use a counted loop of explicit loads, never a
+// library copy (which could read the source twice).
 #[repr(C)]
 pub struct Big512(pub [u64; 64]);
+
+// Five read-to-clear registers: a copy that overlaps its loads would read
+// offsets 8..24 twice.
+#[repr(C)]
+pub struct Big40(pub [u64; 5]);
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -57,6 +62,21 @@ pub struct Blob12 {
     a: u32,
     b: u32,
     c: u32,
+}
+#[inline(never)]
+#[no_mangle]
+pub unsafe extern "C" fn vol40_discard(p: *const Big40) {
+    let _ = core::ptr::read_volatile(p);
+}
+#[inline(never)]
+#[no_mangle]
+pub unsafe extern "C" fn vol40_use(p: *const Big40, out: *mut u64) {
+    let v: Big40 = core::ptr::read_volatile(p);
+    *out.add(0) = v.0[0];
+    *out.add(1) = v.0[1];
+    *out.add(2) = v.0[2];
+    *out.add(3) = v.0[3];
+    *out.add(4) = v.0[4];
 }
 #[inline(never)]
 #[no_mangle]
@@ -140,6 +160,20 @@ fn main() {
     let u: unsafe extern "C" fn(*const Blob12, *mut u32) = std::hint::black_box(vol12_use);
     unsafe { u(bp, o2.as_mut_ptr()) };
     println!("v12 {} {} {}", o2[0], o2[1], o2[2]);
+    let b40 = Big40([
+        0x1111111111111111,
+        0x2222222222222222,
+        0x3333333333333333,
+        0x4444444444444444,
+        0x5555555555555555,
+    ]);
+    let b40p = &b40 as *const Big40;
+    let d: unsafe extern "C" fn(*const Big40) = std::hint::black_box(vol40_discard);
+    unsafe { d(b40p) };
+    let mut o40 = [0u64; 5];
+    let u: unsafe extern "C" fn(*const Big40, *mut u64) = std::hint::black_box(vol40_use);
+    unsafe { u(b40p, o40.as_mut_ptr()) };
+    println!("v40 {}", ck(&o40));
     let big = Big512(core::array::from_fn(|i| (i as u64).wrapping_mul(0x9e3779b97f4a7c15)));
     let bigp = &big as *const Big512;
     let d: unsafe extern "C" fn(*const Big512) = std::hint::black_box(vol512_discard);

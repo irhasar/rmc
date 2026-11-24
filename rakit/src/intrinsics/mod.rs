@@ -747,13 +747,12 @@ fn codegen_regular_intrinsic_call<'tcx>(
                 // into a local slot in chunks the target can lower. The loads
                 // stay trapping, so an unused result still performs the read.
                 _ => {
-                    // No single load above 128 bits. Copy into a local slot with
-                    // an alignment-aware copy: chunk sizes stay within the
+                    // No single load above 128 bits, and the source must never be
+                    // read by an ordinary copy: `memcpy` may use overlapping
+                    // loads, which reads a read-to-clear source twice. Emit
+                    // explicit non-overlapping trapping loads, sized to the
                     // source's guaranteed alignment (an i64 load would be
-                    // misaligned for a 4-byte-aligned aggregate) and large
-                    // values use a library call instead of unbounded expansion.
-                    // The flags keep the source loads trapping, so an unused
-                    // result still performs the read.
+                    // misaligned for a 4-byte-aligned aggregate).
                     let align = if matches!(intrinsic, sym::unaligned_volatile_load) {
                         1
                     } else {
@@ -763,18 +762,58 @@ fn codegen_regular_intrinsic_call<'tcx>(
                         CValue::by_ref(Pointer::new(ptr_val), inner_layout)
                     } else {
                         let align = align.min(size as u32);
+                        let (ty, chunk) = match align.min(8) {
+                            8 => (types::I64, 8i64),
+                            4 => (types::I32, 4i64),
+                            2 => (types::I16, 2i64),
+                            _ => (types::I8, 1i64),
+                        };
                         let slot = fx.create_stack_slot(size as u32, align);
-                        let dst = slot.get_addr(fx);
-                        fx.bcx.emit_small_memory_copy(
-                            fx.target_config,
-                            dst,
-                            ptr_val,
-                            size as u64,
-                            align as u8,
-                            align as u8,
-                            true,
-                            MemFlagsData::new(),
-                        );
+                        let chunks = size / chunk;
+                        // A counted loop keeps a large read from expanding
+                        // without bound while still issuing every load.
+                        const UNROLLED_MAX: i64 = 32;
+                        if chunks <= UNROLLED_MAX {
+                            for k in 0..chunks {
+                                let off = (k * chunk) as i32;
+                                let v = Pointer::new(ptr_val)
+                                    .offset(fx, Offset32::new(off))
+                                    .load(fx, ty, MemFlagsData::new());
+                                slot.offset_i64(fx, k * chunk).store(
+                                    fx,
+                                    v,
+                                    MemFlagsData::new().with_notrap(),
+                                );
+                            }
+                        } else {
+                            let dst_base = slot.get_addr(fx);
+                            let body = fx.bcx.create_block();
+                            let exit = fx.bcx.create_block();
+                            let zero = fx.bcx.ins().iconst(types::I64, 0);
+                            fx.bcx.ins().jump(body, &[zero.into()]);
+                            fx.bcx.switch_to_block(body);
+                            let i = fx.bcx.append_block_param(body, types::I64);
+                            let off = fx.bcx.ins().imul_imm(i, chunk);
+                            let src = fx.bcx.ins().iadd(ptr_val, off);
+                            let v =
+                                fx.bcx
+                                    .ins()
+                                    .load(ty, MemFlagsData::new(), src, Offset32::new(0));
+                            let dst = fx.bcx.ins().iadd(dst_base, off);
+                            fx.bcx.ins().store(
+                                MemFlagsData::new().with_notrap(),
+                                v,
+                                dst,
+                                Offset32::new(0),
+                            );
+                            let next = fx.bcx.ins().iadd_imm(i, 1);
+                            let more =
+                                fx.bcx.ins().icmp_imm_s(IntCC::UnsignedLessThan, next, chunks);
+                            fx.bcx.ins().brif(more, body, &[next.into()], exit, &[]);
+                            fx.bcx.switch_to_block(exit);
+                            fx.bcx.seal_block(body);
+                            fx.bcx.seal_block(exit);
+                        }
                         CValue::by_ref(slot, inner_layout)
                     }
                 }

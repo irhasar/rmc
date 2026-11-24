@@ -362,6 +362,49 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
     two-source `a[i] += b[i]` -> `paddd` (guard still emitted for `b`), f32
     `a[i] *= 2.0` -> `mulps`. New `t_vectorize_inplace`
     (n=1000/999/17/15/1/0); regressions asserts the four ops.
+  - **M4.11 LANDED: no library copy reads a volatile source.**
+    (a) `emit_small_memory_copy` falls back to `memcpy` above four chunks, and
+    `memcpy` may use overlapping loads — a 40-byte volatile read of five
+    read-to-clear registers was read twice at offsets 8..24. The wide path now
+    emits its own loads: unrolled explicit trapping loads when there are <= 32
+    chunks, otherwise a counted loop of the same (one trapping load + one store
+    per iteration, sealed blocks). Ordinary copies may still move the finished
+    temporary. Verified: `vol40_discard` issues exactly **5** 8-byte loads (was
+    a `memcpy`), `vol512_discard` one load in a 64-iteration loop, `vol12` three
+    4-byte loads, `vol256` four 8-byte loads, `vol_discard_u8` one.
+    (b) Chunk size is `min(8, source ABI alignment)` (`1` for
+    `unaligned_volatile_load`), so a 4-byte-aligned aggregate never gets an
+    `i64` load; `t_volatile` covers a `Blob12` at offset 4 inside a `repr(C)`
+    wrapper.
+    (c) `regressions.sh` counts source loads from the first argument register
+    only (`mov…(%rdi…),`, so `%rip`/GOT and stack traffic are excluded) and
+    requires the exact count, plus `mfence` and no SIMD in each case.
+
+    **Full all-axes matrix** (CREPS=2 RREPS=7; compile = wall ms / cpu ms /
+    peak RSS MB / bytes, run = wall ms / cpu ms / peak RSS MB):
+
+    | prog | C L | C U | C M | R L | R U | R M |
+    |---|---|---|---|---|---|---|
+    | h_arith | 122/148/118.3/4617128 | 95/125/119.5/5839120 | 108/138/120.1/4078224 | 2/2/11.0 | 2/2/11.0 | 2/2/11.0 |
+    | h_branch | 122/148/118.5/4616832 | 96/127/119.5/5837264 | 108/138/120.4/4076568 | 2/2/11.0 | 2/2/11.1 | 2/2/11.1 |
+    | h_calls | 129/152/119.0/4616872 | 97/128/119.7/5837792 | 110/140/120.5/4076928 | 2/2/10.8 | 3/2/10.8 | 3/2/11.0 |
+    | h_float | 136/161/117.4/4637984 | 97/126/118.7/5861024 | 112/141/119.8/4117728 | 2/2/10.8 | 3/3/11.0 | 3/2/11.1 |
+    | h_mem | 286/463/138.4/4646856 | 146/200/134.8/5959856 | 189/264/136.9/4165648 | 4/3/11.1 | 10/10/11.1 | 5/4/11.1 |
+    | h_simd | 147/174/124.4/4617704 | 102/132/124.7/5843736 | 122/152/126.0/4080656 | 2/2/10.8 | 4/4/11.0 | 3/2/11.0 |
+    | p1_arith | 90/110/106.1/4635232 | 84/107/108.0/5877944 | 94/118/109.2/4145648 | 82/82/10.8 | 109/108/11.0 | 102/101/11.0 |
+    | p2_mem | 256/392/134.3/4639896 | 140/187/131.4/5936144 | 169/228/133.3/4142864 | 18/17/10.8 | 161/159/11.0 | 50/51/11.0 |
+    | p3_calls | 108/131/116.1/4612368 | 90/118/116.8/5820136 | 107/135/118.2/4066592 | 38/38/10.8 | 117/116/10.7 | 58/58/10.8 |
+    | p4_simd | 113/134/117.0/4636096 | 97/123/117.1/5892376 | 119/144/118.7/4152280 | 57/56/48.2 | 158/157/49.5 | 84/83/48.8 |
+    | p5_inline | 84/105/105.5/4609368 | 81/106/106.9/5813704 | 90/115/107.7/4059504 | 58/57/10.8 | 896/895/11.0 | 7/7/11.0 |
+    | p6_scalar | 91/109/101.7/4609368 | 83/106/103.0/5813688 | 92/114/104.2/4059504 | 58/57/11.0 | 904/904/10.8 | 7/6/11.1 |
+    | p7_branchy | 86/105/105.5/4609520 | 82/105/106.8/5813800 | 90/113/108.0/4059664 | 43/43/11.0 | 104/103/11.1 | 36/35/11.0 |
+    | p8_minmax | 86/106/105.5/4609544 | 86/108/106.8/5813752 | 94/117/108.0/4059648 | 18/18/11.1 | 40/40/11.1 | 21/20/11.0 |
+    | p9_u64f32 | 98/118/111.1/4635448 | 94/119/112.9/5886872 | 104/128/114.2/4149304 | 31/30/17.8 | 77/76/18.8 | 35/34/18.2 |
+    | **TOTAL** | 1954/2556/1738.8/69350216 | 1470/1917/1746.6/87847208 | 1708/2185/1765.2/61490760 | 417/411/207.8 | 2590/2581/211.0 | 418/409/210.2 |
+
+    M vs L: compile **0.87x**, size **-11.3%**, run **1.00x**; M vs U: compile
+    1.16x, size -30.0%, run **0.16x**. Suite 65/25368/0; regressions green;
+    allaxes 15/15 ok, no INVALID.
   - **M4.10 LANDED: volatile chunk alignment + per-program matrix.**
     (a) Chunking a wide volatile read by 8 bytes issued a misaligned `i64` load
     for a 4-byte-aligned aggregate (faults where misaligned loads are not
