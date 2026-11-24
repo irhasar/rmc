@@ -142,6 +142,20 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
      universal gate above. Only then is p4 unlocked safely.
   3. **M3.3** generalize ops (xor/add first), then integrate `addr_base`/private-slot.
 - Not implemented in code yet; recorded so the multi-session effort is grounded.
+  - **Blocker found (2026-11-24, branch `rakit-exp10`):** a `rakit-opt` CLIF pass
+    runs **before** the backend egraph. `base.rs:212` runs the pipeline; the
+    egraph + LICM run later inside `Context::compile` (`context.rs:195-203`), and
+    the `.opt.rakit` dump is written **after** compile (`base.rs:273`). At
+    pipeline time the L3 inner loop is **pre-SSA** — `[vecblock] block3
+    nparams=0 term=Jump`, induction in a stack slot — while the `block3(v7:i64)`
+    phi form exists **only post-egraph**. So the planned rakit-opt vectorizer
+    cannot match the loop (verified: pass runs on 73 fns, 0 matches; output stays
+    correct because it never fires). **Corrected plan:** implement M3.1 as a
+    **post-egraph** pass in the vendored `rakit-codegen`, next to LICM
+    (`context.rs:203`), where the SSA loop is present. The WIP pass in
+    `rakit-opt/src/passes/vectorize.rs` (strict shape match + runtime
+    disjointness guard + `I32X4` body + reuse original loop as scalar tail) is
+    written but **unwired** from the pipeline until moved to the post-egraph hook.
 
 ## Session (2026-11-24, branch `rakit-exp7`) — p9 reloads are real, but NOT soundly hoistable with the existing flags (alias tags don't move loads)
 
