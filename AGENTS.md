@@ -362,6 +362,38 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
     two-source `a[i] += b[i]` -> `paddd` (guard still emitted for `b`), f32
     `a[i] *= 2.0` -> `mulps`. New `t_vectorize_inplace`
     (n=1000/999/17/15/1/0); regressions asserts the four ops.
+  - **M4.7 LANDED: correctness hardening (code-review findings).**
+    (a) Vector headers (map and reduction) now require `nxt > i` *and*
+    `nxt <= bound`, so a start near `u64::MAX` (`usize::MAX` with `n = 3`) can no
+    longer wrap into a "fits" test and touch memory the scalar loop never reads.
+    (b) `header_is_pure` is shared by both matchers: a reduction whose header
+    stores/loads/calls keeps its side effects (previously skipped for the whole
+    vector prefix).
+    (c) Shift counts are scalar (`y` is the scalar-only `iB` operand): `apply`
+    passes `iconst(lane)`/the scalar value instead of a splat, the two
+    `splat`-shaped `mask_xmm_shift` ISLE rules are deleted, and
+    `RAKIT_VEC_VERIFY=1` runs the Cranelift verifier after vectorizing (the old
+    IR was rejected by the verifier even though x64 lowered it).
+    (d) Volatile: rakit's IR has no volatile bit, so `volatile_load`/`_store`
+    now emit `fence` (mfence) — ordering for volatile, and the vectorizer
+    rejects the block, so byte/word volatile loops are never widened.
+    (e) Power-of-two multipliers: `x*8` already lowers to `ishl` (vectorized);
+    `x*2` becomes `x + x`, now recognized as `Rhs::Double` (`paddd`).
+    Tests: new `t_vectorize_guards` (sum_ctr, vol_loop, mul2, mul8),
+    `t_vectorize_start` gained the `usize::MAX`/`n=3` wrap case, the shift
+    fixtures use non-zero inputs (so a skipped store at `n=1` shows) and
+    runtime counts 32/33/63/100. `regressions.sh` adds u16 bitwise opcode
+    asserts, moves the panic-message check outside the `objdump` guard, asserts
+    guards stay scalar and pow2 maps use `paddd`/`pslld`, and compiles the shift
+    fixture with `RAKIT_VEC_VERIFY=1`.
+    Gate: suite 65/25368/0; allaxes 15/15 ok, no invalid. Full matrix
+    (CREPS=2 RREPS=7): run total **410 ms vs LLVM 414 (0.99x)**, compile
+    **1589 vs 1847 ms (0.86x)**, size **61.5 vs 69.4 MB (-11.3%)**; p2_mem
+    50->48 ms, p8 21->20 ms, p7 36->35 ms.
+    Still open (perf/test gaps, no correctness impact): overlap coverage for
+    `constops`/`scalemul`/`inplace_add2`, non-zero-start overlap span uses
+    `[0,n)`, scalar broadcast re-splatted per chunk, `body_chain` scans preds
+    before checking the terminator, and mixed-width shift counts.
   - **M4.6 LANDED: bounds-checked slice loops.** `body_chain_checked` follows the
     `brif (icmp i, len)` checks rustc emits for indexing (the other edge must be
     a trapping block) and records each length; `apply` builds

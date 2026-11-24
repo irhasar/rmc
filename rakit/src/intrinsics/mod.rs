@@ -713,8 +713,10 @@ fn codegen_regular_intrinsic_call<'tcx>(
         sym::volatile_load | sym::unaligned_volatile_load => {
             intrinsic_args!(fx, args => (ptr); intrinsic);
 
-            // Rakit treats loads as volatile by default
-            // FIXME correctly handle unaligned_volatile_load
+            // Rakit has no volatile bit in its IR, so a `fence` both provides the
+            // ordering volatile requires and keeps the vectorizer from widening
+            // these accesses (it rejects blocks with side effects).
+            let _ = fx.bcx.ins().fence();
             let inner_layout = fx.layout_of(ptr.layout().ty.builtin_deref(true).unwrap());
             let val = CValue::by_ref(Pointer::new(ptr.load_scalar(fx)), inner_layout);
             ret.write_cvalue(fx, val);
@@ -723,10 +725,10 @@ fn codegen_regular_intrinsic_call<'tcx>(
             intrinsic_args!(fx, args => (ptr, val); intrinsic);
             let ptr = ptr.load_scalar(fx);
 
-            // Rakit treats stores as volatile by default
-            // FIXME correctly handle unaligned_volatile_store
-            // FIXME actually do nontemporal stores if requested (but do not just emit MOVNT on x86;
-            // see the LLVM backend for details)
+            // See `volatile_load`: a fence blocks reordering and vectorization.
+            if matches!(intrinsic, sym::volatile_store | sym::unaligned_volatile_store) {
+                let _ = fx.bcx.ins().fence();
+            }
             let dest = CPlace::for_ptr(Pointer::new(ptr), val.layout());
             dest.write_cvalue(fx, val);
         }

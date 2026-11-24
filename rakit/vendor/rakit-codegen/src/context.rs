@@ -208,6 +208,11 @@ impl Context {
                 && isa.name() == "x64"
                 && crate::vectorize::do_vectorize(&mut self.func)
             {
+                #[cfg(feature = "std")]
+                if std::env::var_os("RAKIT_VEC_VERIFY").is_some() {
+                    crate::verifier::verify_function(&self.func, isa)
+                        .expect("vectorized function fails verification");
+                }
                 // The pass adds blocks and edges; the dominator tree used by
                 // block ordering must see them.
                 self.compute_cfg();

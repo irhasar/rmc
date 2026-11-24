@@ -818,15 +818,6 @@
       (gpr_to_reg (x64_and $I64 (lo_gpr amt) (RegMemImm.Imm (shift_mask ty)))))
 (rule 1 (mask_xmm_shift ty (iconst _ n))
       (RegMemImm.Imm (shift_amount_masked ty n)))
-;; Vector shift amounts arrive as a splat of a constant lane; use the same
-;; immediate path. (The generic rule below calls `lo_gpr`, which only works for
-;; scalar integer values and panics on an XMM/vector amount.)
-(rule 2 (mask_xmm_shift ty (splat _ (iconst _ n)))
-      (RegMemImm.Imm (shift_amount_masked ty n)))
-;; Uniform runtime amount: splat of a scalar value. Use the scalar lane as the
-;; count (masked like the scalar path), still avoiding `lo_gpr` on the vector.
-(rule 1 (mask_xmm_shift ty (splat _ x))
-      (gpr_to_reg (x64_and $I64 (lo_gpr x) (RegMemImm.Imm (shift_mask ty)))))
 
 ;;;; Rules for `sshr` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 

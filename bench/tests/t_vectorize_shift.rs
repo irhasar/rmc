@@ -54,7 +54,7 @@ type F64 = unsafe extern "C" fn(*const u64, *mut u64, usize);
 fn main() {
     for &raw in &[1000usize, 999, 17, 15, 1, 0] {
         let n = std::hint::black_box(raw);
-        let a: Vec<u32> = (0..n).map(|i| (i as u32).wrapping_mul(2654435761)).collect();
+        let a: Vec<u32> = (0..n).map(|i| (i as u32).wrapping_mul(2654435761).wrapping_add(0x9e37_79b9)).collect();
         let mut o = vec![0u32; n];
         let fs: [F32; 2] = [u32shl, u32shr];
         let mut h1 = [0u64; 3];
@@ -62,12 +62,12 @@ fn main() {
             unsafe { f(a.as_ptr(), o.as_mut_ptr(), n) };
             h1[k] = ck(&o.iter().map(|x| *x as u64).collect::<Vec<_>>());
         }
-        let s: Vec<i32> = (0..n).map(|i| (i as i32).wrapping_mul(-1640531535)).collect();
+        let s: Vec<i32> = (0..n).map(|i| (i as i32).wrapping_mul(-1640531535).wrapping_add(0x1234_5678)).collect();
         let mut os = vec![0i32; n];
         let g: FI32 = i32sar;
         unsafe { g(s.as_ptr(), os.as_mut_ptr(), n) };
         h1[2] = ck(&os.iter().map(|x| *x as i64 as u64).collect::<Vec<_>>());
-        let b: Vec<u64> = (0..n).map(|i| (i as u64).wrapping_mul(0x9E3779B97F4A7C15)).collect();
+        let b: Vec<u64> = (0..n).map(|i| (i as u64).wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(0xdead_beef)).collect();
         let mut ob = vec![0u64; n];
         let hs: [F64; 2] = [u64shl, u64shr];
         let mut h2 = [0u64; 2];

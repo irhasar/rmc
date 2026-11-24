@@ -31,8 +31,8 @@ use crate::cursor::{Cursor, FuncCursor};
 use crate::ir::condcodes::IntCC;
 use crate::ir::immediates::{Ieee32, Ieee64, Offset32};
 use crate::ir::{
-    self, Block, DataFlowGraph, Function, InstBuilder, Layout, MemFlagsData, Opcode, StackSlotData,
-    StackSlotKind, Value, ValueDef, types,
+    self, Block, DataFlowGraph, Function, Inst, InstBuilder, Layout, MemFlagsData, Opcode,
+    StackSlotData, StackSlotKind, Value, ValueDef, types,
 };
 
 /// Whether the pass is enabled at runtime (`RAKIT_NO_VECTORIZE` disables it).
@@ -168,6 +168,8 @@ enum Rhs {
     FConst { bits: u64, is_f32: bool },
     /// A loop-invariant scalar broadcast to every lane (`c[i] = a[i] OP s`).
     Scalar(Value),
+    /// `x + x`: the egraph's form of `x * 2` for a single-source map.
+    Double,
 }
 
 struct Plan {
@@ -238,22 +240,8 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
         }
         Bound::Runtime(nv)
     };
-    // The scalar header runs once per iteration; the vector loop bypasses it for
-    // the vectorized prefix, so it must be effect-free (pure arithmetic + the
-    // comparison only).
-    for inst in func.layout.block_insts(h) {
-        if inst == term {
-            continue;
-        }
-        let op = dfg.insts[inst].opcode();
-        if op.is_call()
-            || op.can_load()
-            || op.can_store()
-            || op.can_trap()
-            || op.other_side_effects()
-        {
-            return None;
-        }
+    if !header_is_pure(func, h, term) {
+        return None;
     }
     if !dfg.block_params(b).is_empty() {
         return None;
@@ -485,7 +473,12 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
         if !load_on_left && !is_commutative(op) {
             return None; // reject `K - a` / `K / a`
         }
-        let cval = if let Some(ci) = iconst_i64(dfg, c) {
+        let cval = if dfg.resolve_aliases(lhs) == r0 && dfg.resolve_aliases(rhs) == r0 {
+            if op != Opcode::Iadd {
+                return None;
+            }
+            Rhs::Double
+        } else if let Some(ci) = iconst_i64(dfg, c) {
             Rhs::IntConst(ci)
         } else if let Some((bits, is_f32)) = fconst_bits(dfg, c) {
             Rhs::FConst { bits, is_f32 }
@@ -501,6 +494,7 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
             (Rhs::FConst { is_f32, .. }, Lanes::F32) if *is_f32 => {}
             (Rhs::FConst { is_f32, .. }, Lanes::F64) if !*is_f32 => {}
             (Rhs::Scalar(_), _) => {} // already checked == elem_ty
+            (Rhs::Double, Lanes::U32 | Lanes::I64 | Lanes::U8 | Lanes::U16) => {}
             _ => return None,
         }
         (load_bases[0], cval)
@@ -595,6 +589,9 @@ fn match_reduction(func: &Function, h: Block) -> Option<RPlan> {
     let (shift, size) = (lanes.shift(), lanes.size() as i64);
 
     let hterm = func.layout.last_inst(h)?;
+    if !header_is_pure(func, h, hterm) {
+        return None;
+    }
     let ir::InstructionData::Brif { arg, blocks, .. } = dfg.insts[hterm] else {
         return None;
     };
@@ -782,7 +779,9 @@ fn apply_reduction(func: &mut Function, p: RPlan) {
             Bound::Const(c) => cur.ins().iconst(types::I64, c),
             Bound::Runtime(v) => v,
         };
-        let cond = cur.ins().icmp(IntCC::UnsignedLessThanOrEqual, nxt, n);
+        let no_wrap = cur.ins().icmp(IntCC::UnsignedGreaterThan, nxt, vh_i);
+        let fits = cur.ins().icmp(IntCC::UnsignedLessThanOrEqual, nxt, n);
+        let cond = cur.ins().band(no_wrap, fits);
         cur.ins().brif(cond, vb, &[vh_i.into(), vh_a.into()], red, &[vh_i.into(), vh_a.into()]);
     }
     {
@@ -908,7 +907,12 @@ fn apply(func: &mut Function, p: Plan) {
         let step = cur.ins().iconst(types::I64, p.lanes.per_vec());
         let nxt = cur.ins().iadd(vh_i, step);
         let n = vbound.unwrap();
-        let cond = cur.ins().icmp(IntCC::UnsignedLessThanOrEqual, nxt, n);
+        // `nxt` wraps for a start near u64::MAX (e.g. `usize::MAX` with a small
+        // n), which would falsely satisfy `nxt <= n`; require a non-wrapping
+        // increment as well as a complete vector.
+        let no_wrap = cur.ins().icmp(IntCC::UnsignedGreaterThan, nxt, vh_i);
+        let fits = cur.ins().icmp(IntCC::UnsignedLessThanOrEqual, nxt, n);
+        let cond = cur.ins().band(no_wrap, fits);
         cur.ins().brif(cond, vb, &[vh_i.into()], h, &[vh_i.into()]);
     }
 
@@ -920,7 +924,16 @@ fn apply(func: &mut Function, p: Plan) {
         let flags = MemFlagsData::new().with_notrap();
         let addr_a = cur.ins().iadd(p.base_a, off);
         let va = cur.ins().load(vt, flags, addr_a, Offset32::new(0));
-        let other = match p.rhs {
+        let other = if matches!(p.op, Opcode::Ishl | Opcode::Ushr | Opcode::Sshr) {
+            // Shift counts are scalar-only (`iB` operand); the x64 lowering
+            // masks them exactly like the scalar path.
+            match p.rhs {
+                Rhs::IntConst(c) => cur.ins().iconst(p.lanes.scalar(), c),
+                Rhs::Scalar(v) => v,
+                _ => unreachable!("matcher restricts shift counts"),
+            }
+        } else {
+            match p.rhs {
             Rhs::Mem(bb) => {
                 let addr_b = cur.ins().iadd(bb, off);
                 cur.ins().load(vt, flags, addr_b, Offset32::new(0))
@@ -938,6 +951,8 @@ fn apply(func: &mut Function, p: Plan) {
                 cur.ins().splat(vt, fc)
             }
             Rhs::Scalar(v) => cur.ins().splat(vt, v),
+            Rhs::Double => va,
+            }
         };
         let combined = match p.op {
             Opcode::Bxor => cur.ins().bxor(va, other),
@@ -1193,6 +1208,26 @@ fn check_len(dfg: &DataFlowGraph, cond: Value, i: Value) -> Option<(Value, bool)
     } else {
         None
     }
+}
+
+/// The header may be re-run once per iteration in the scalar loop; the vector
+/// prefix skips those executions, so the header must be effect-free.
+fn header_is_pure(func: &Function, h: Block, term: Inst) -> bool {
+    for inst in func.layout.block_insts(h) {
+        if inst == term {
+            continue;
+        }
+        let op = func.dfg.insts[inst].opcode();
+        if op.is_call()
+            || op.can_load()
+            || op.can_store()
+            || op.can_trap()
+            || op.other_side_effects()
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn is_panic_block(func: &Function, b: Block) -> bool {
