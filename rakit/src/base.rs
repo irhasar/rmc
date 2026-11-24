@@ -96,11 +96,8 @@ pub(crate) fn codegen_fn<'tcx>(
     // Read before `module` moves into the struct below. Cached here because
     // `isa_flags()` allocates and the rounding intrinsics consult it per call
     // site.
-    let has_sse41 = module
-        .isa()
-        .isa_flags()
-        .iter()
-        .any(|f| f.name == "has_sse41" && f.as_bool() == Some(true));
+    let has_sse41 =
+        module.isa().isa_flags().iter().any(|f| f.name == "has_sse41" && f.as_bool() == Some(true));
 
     let mut fx = FunctionCx {
         module,
@@ -182,7 +179,7 @@ pub(crate) fn compile_fn(
 
     // Inline small callees that live in the same codegen unit before optimizing. Rakit only
     // provides the mechanics; the heuristic lives in `crate::inliner`.
-    if !bodies.is_empty() {
+    if !bodies.is_empty() && std::env::var_os("RAKIT_NO_CODEGEN_INLINE").is_none() {
         let inliner =
             crate::inliner::CguInliner::new(bodies, codegened_func.func_id.as_u32(), &context.func);
         if let Err(err) = crate::passtime::time(crate::passtime::INLINE, || context.inline(inliner))
@@ -191,38 +188,22 @@ pub(crate) fn compile_fn(
         }
     }
 
-    // Forward stack-slot stores into the loads that read them back, and drop
-    // stores nothing reads. rakit materialises aggregates through stack slots,
-    // and Rakit keeps those round-trips because the slot is not `readonly`.
-    // This must run before `unroll`, whose affine analysis rejects any loop that
-    // still touches memory.
-    // Rewrite self-recursive linear recurrences (fib-shaped) into loops.
-    crate::rec_loop::run(&mut context.func);
-
-    crate::passtime::time(crate::passtime::STORE_FORWARD, || {
-        crate::store_forward::run(&mut context.func, module.isa().endianness())
-    });
-
-    // Fold `x % C == 0` into a multiply-compare before Rakit strength-reduces
-    // the remainder: the remainder itself is dead once only its zero-ness is
-    // tested. Running before `if_convert` lets the resulting comparison join the
-    // same diamond collapse as any other condition.
-    crate::passtime::time(crate::passtime::DIV_TEST, || crate::div_test::run(&mut context.func));
-
-    // Collapse short two-way diamonds into a `select` (a `cmove`) so a
-    // data-dependent branch cannot mispredict. Running before `unroll` also
-    // turns a loop whose body holds such a branch into the single block the
-    // unroller accepts.
-    crate::passtime::time(crate::passtime::IF_CONVERT, || {
-        crate::if_convert::run(&mut context.func)
-    });
-
-    // Widen canonical counted loops so their carried dependency chains are
-    // shortened. Rakit has no unrolling pass of its own.
-    crate::passtime::time(crate::passtime::UNROLL, || crate::unroll::run(&mut context.func));
-
-    // Fuse `sin(x)` + `cos(x)` of the same argument into one `sincos` libcall.
-    crate::sincos::run(module, &mut context.func);
+    // Run Rakit's codegen IR optimization pipeline. The pass manager owns the order
+    // and the shared analysis cache; each pass is independent of the others.
+    // `rec_loop` and `store_forward` must precede `unroll`, whose affine
+    // analysis rejects any loop that still contains a call or touches memory.
+    let mut pipeline = rakit_opt::PassManager::new();
+    pipeline
+        .push(Box::new(rakit_opt::RecLoopPass))
+        .push(Box::new(rakit_opt::StoreForwardPass))
+        .push(Box::new(rakit_opt::DivTestPass))
+        .push(Box::new(rakit_opt::IfConvertPass))
+        .push(Box::new(rakit_opt::UnrollPass))
+        .push(Box::new(rakit_opt::SincosPass));
+    let mut analyses = rakit_opt::Analyses::new();
+    let mut pctx =
+        rakit_opt::PassCtx { ctx: &mut *context, module: &mut *module, analyses: &mut analyses };
+    pipeline.run(&mut pctx);
 
     #[cfg(false)]
     let _rakit_guard = {
@@ -560,7 +541,10 @@ fn codegen_fn_body(fx: &mut FunctionCx<'_, '_, '_>, start_block: Block) {
                     // (i128/f128 bit patterns) has to keep the jump table.
                     const SMALL_SWITCH: usize = 8;
                     let narrow = fx.bcx.func.dfg.value_type(discr).bits() <= 64;
-                    if narrow && targets.iter().count() <= SMALL_SWITCH {
+                    if narrow
+                        && targets.iter().count() <= SMALL_SWITCH
+                        && std::env::var_os("RAKIT_NO_SMALL_SWITCH").is_none()
+                    {
                         let cases: Vec<_> =
                             targets.iter().map(|(v, b)| (v, fx.get_block(b))).collect();
                         if let Some((last, init)) = cases.split_last() {
@@ -951,7 +935,9 @@ fn codegen_stmt<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, cur_block: Block, stmt:
                         .monomorphize(times)
                         .try_to_target_usize(fx.tcx)
                         .expect("expected monomorphic const in codegen");
-                    let byte = crate::tunables::repeat_memset().then(|| bytewise_repeat_value(fx, operand)).flatten();
+                    let byte = crate::tunables::repeat_memset()
+                        .then(|| bytewise_repeat_value(fx, operand))
+                        .flatten();
                     let operand = codegen_operand(fx, operand);
                     if operand.layout().size.bytes() == 0 {
                         // Do nothing for ZST's

@@ -31,7 +31,75 @@ kualitas codegen, bukan semantik.
 `rakit/vendor/` (paket `rakit-codegen`, `rakit-frontend`, `rakit-object`,
 dan seterusnya), sehingga tidak ada lagi dependensi ke paket eksternal bernama
 lama. Sebaliknya, `cg_clif_upstream/` sengaja **tidak diubah** — tetap cg_clif
-asli dengan Cranelift asli, sebagai baseline pembanding.
+asli dengan backend upstream, sebagai baseline pembanding.
+
+## Arsitektur
+
+```
+rustc MIR
+  └─ rakit/src          frontend MIR → CLIF
+        └─ rakit-opt    pass manager + analisis bersama + pass first-party
+              rec_loop → store_forward → div_test → if_convert
+              → unroll (reassoc/LCG) → sincos
+        └─ rakit-codegen  CLIF → ISel (ISLE) → regalloc2 → machin
+        └─ rakit-object   emisi objek
+```
+
+`rakit-opt` adalah crate terpisah (`rakit/rakit-opt/`) yang memiliki
+`PassManager` dan `Analyses`: CFG, dominator tree, dan loop forest dihitung
+sekali lalu dipakai bersama, dan di-invalidasi otomatis setiap kali sebuah pass
+mengubah fungsi. Setiap optimisasi adalah implementasi trait `Pass`, sehingga
+urutan pipeline terpusat di satu tempat (bukan rangkaian pemanggilan ad-hoc di
+`base.rs`). Inliner tetap dijalankan lebih dulu karena memakai
+`Context::inline`, di luar pipeline `rakit-opt`.
+
+### Tidak ada IR mid-level terpisah
+
+Rakit **tidak** memakai crate IR mid-level terpisah. `rakit-ir` dan jembatan
+CLIF↔RIR sudah dihapus. Alasannya terukur: round-trip RIR tidak memberi
+keuntungan pada benchmark mana pun, dan `simplify` RIR mengubah bentuk `fib`
+sampai pass CLIF `rec_loop` tidak lagi mengenali pola rekursi→loop. Pada
+`p3_calls`, RIR aktif menghasilkan **93,8 ms**, sedangkan tanpa RIR **56,8 ms**;
+dengan `RAKIT_NO_RIR_SIMPLIFY=1` waktunya kembali ke **59,6 ms**. p1/p2/p4–p9
+netral. Bridge RIR juga menambah ~2.600 LOC, membuang debug location, dan
+menduplikasi pass yang sudah dimiliki `rakit-opt` serta `rakit-codegen`.
+
+Arsitektur produksi sekarang:
+
+```
+rustc MIR
+  └─ rakit/src          frontend MIR → CLIF
+        └─ rakit-opt    pass manager + analisis bersama + pass first-party
+              rec_loop → store_forward → div_test → if_convert
+              → unroll (reassoc/LCG) → sincos
+        └─ rakit-codegen  CLIF → ISel (ISLE) → regalloc2 → machine code
+        └─ rakit-object   emisi objek
+```
+
+`rakit-opt` tetap menjadi lapisan optimisasi produksi. Pass yang dimilikinya
+tidak diduplikasi di tempat lain:
+
+- `rec_loop`: rekursi linear → loop, hanya jika blok yang dihapus bebas efek.
+- `store_forward`: forwarding store→load dan dead-store elimination untuk stack
+  slot privat, termasuk lintas blok.
+- `div_test`: `x % C == 0` → multiply/compare.
+- `if_convert`: diamond dua arah → `select`/`cmove` dengan cost model.
+- `unroll`: affine reassociation dan lane transform untuk loop konstan.
+- `sincos`: fusi `sin`/`cos` dengan argumen sama.
+- `inliner`: heuristik inline per-CGU di atas mekanisme `Context::inline`.
+- `pass.rs` / `analyses.rs` / `passtime.rs`: pass manager, cache CFG/dominator/
+  loop yang dipakai `if_convert`/`sincos`/`unroll`/`store_forward`, dan timing
+  opsional.
+
+Pass generik seperti egraph, constant propagation, LICM, dan pemilihan instruksi
+tetap dimiliki `rakit-codegen`; `rakit-opt` hanya menambahkan transformasi yang
+tidak ada di sana. Inliner dijalankan lebih dulu karena memakai
+`Context::inline`, di luar pipeline `rakit-opt`.
+
+Knob debugging yang tersisa: `RAKIT_NO_STORE_FWD`, `RAKIT_NO_DIVTEST`,
+`RAKIT_NO_IFCONV`, `RAKIT_NO_REC_LOOP`, `RAKIT_NO_SINCOS`,
+`RAKIT_NO_COLLAPSE`, `RAKIT_UNROLL`, `RAKIT_PARTIAL`, `RAKIT_INLINE_*`, dan
+`RAKIT_PASS_TIME=1`.
 
 ## Build
 
@@ -94,11 +162,12 @@ modifikasi justru **≈8× lebih cepat dari LLVM** (7 ms vs 58 ms).
 - **Compile.** Biaya tambahan fork berasal dari pass, **bukan** dari patch
   vendor: dengan semua pass dimatikan, fork 3212 ms vs upstream 3208 ms.
 
-Modifikasi utama ada di `rakit/src/`: `inliner.rs` (inlining bertingkat
-dengan tier leaf), `if_convert.rs` (diamond → `select`/`cmove`),
+Modifikasi utama ada di `rakit/rakit-opt/src/passes/`: `inliner.rs` (inlining
+bertingkat dengan tier leaf), `if_convert.rs` (diamond → `select`/`cmove`),
 `store_forward.rs` (store-to-load forwarding + dead-store elimination),
-`unroll.rs` (pelebaran loop counted), dan `driver/aot.rs`. Rincian lengkap,
-termasuk lever yang diuji dan terbukti netral, ada di `REPORT.md`.
+`unroll.rs` (pelebaran loop counted), dan `rec_loop.rs` (rekursi → loop).
+Rincian lengkap, termasuk lever yang diuji dan terbukti netral, ada di
+`REPORT.md`.
 
 ## Reproduksi
 
@@ -123,4 +192,4 @@ Kode di repo ini dilisensikan **Apache-2.0**; lihat `LICENSE`.
 pendistribusian, termasuk untuk keperluan komersial, dengan kewajiban
 mempertahankan notice lisensi dan mencantumkan perubahan. Daftar perubahan
 terhadap pustaka Rakit ada di `REPORT.md` §2 dan §8; `cg_clif_upstream/` tetap
-memakai Cranelift asli.
+memakai backend upstream.

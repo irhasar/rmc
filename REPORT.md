@@ -2604,35 +2604,12 @@ Sapuan pada `p8` (ms): faktor 2 = 31.4, **3 = 29.1**, 4 = 33.5, 6 = 39.3,
 memburuk karena O(faktor²) perkalian koefisien di `pre[k]` (bukan karena nilai
 atom — cache nilai atom diuji dan **netral**, jadi dibuang).
 
-### 21.4 Hasil (matriks 3-arah penuh, `bench/allaxes.sh`, CREPS=3 RREPS=7)
+### 21.4 Hasil
 
-Runtime (wall ms) M vs L, sebelum → sesudah sesi ini:
-
-| prog | M sebelum | M sesudah | LLVM | U |
-|------|----------:|----------:|-----:|---:|
-| p7_branchy | 40.3 | **36** | 45 | 100 |
-| p8_minmax  | 35.0 | **29** | 18 | 38 |
-
-Matriks lengkap sesi ini (C = compile wall ms, R = run wall ms, size = byte):
-
-| prog | C L/U/M | R L/U/M | size L/U/M |
-|------|---------|---------|------------|
-| p1 | 86/82/78 | 82/108/100 | 4.63/5.88/4.13 MB |
-| p2 | 247/125/146 | 16/155/52 | 4.64/5.94/4.14 MB |
-| p3 | 99/86/86 | 36/116/94 | 4.61/5.82/4.06 MB |
-| p4 | 107/92/98 | 56/156/99 | 4.64/5.89/4.14 MB |
-| p5 | 83/76/84 | 58/893/**6** | 4.61/5.81/4.05 MB |
-| p6 | 82/76/75 | 58/902/**6** | 4.61/5.81/4.05 MB |
-| p7 | 84/77/76 | 45/100/**36** | 4.61/5.81/4.05 MB |
-| p8 | 84/79/80 | 18/38/**29** | 4.61/5.81/4.05 MB |
-| p9 | 94/86/87 | 30/76/34 | 4.64/5.89/4.13 MB |
-
-M unggul dari LLVM pada: waktu compile (semua kecuali p4/p5 sedikit lebih
-lambat; p2 1.7× lebih cepat), ukuran (≈12% lebih kecil di semua prog), dan
-runtime `p5`/`p6` (≈10× lebih cepat), `p7` (36 vs 45). `p9` hampir seri
-(34 vs 30). Kalah runtime di `p1`/`p2`/`p3`/`p4`/`p8` — semuanya karena
-keterbatasan arsitektural (tanpa vectorizer, tanpa inliner lintas-CGU, tanpa
-tail-recursion elimination, struktur lane).
+Angka runtime sesi ini hanya dipakai untuk delta faktor (p7 40.3→36 ms,
+p8 35.0→29 ms); angka itu bukan perbandingan backend karena tidak disertai
+CPU, peak RSS, dan ukuran byte untuk run yang sama. Matriks 3-arah lengkap
+terbaru ada di §29.
 
 ### 21.5 Verifikasi
 
@@ -2938,3 +2915,443 @@ Menang kecil di 2/3, netral di stdnum, **compile ~netral**. Berbeda dengan
 crate nyata lalu dibuang. Hot-callee menargetkan callee yang di-inline berulang
 (bukan menaikkan lantai semua caller), jadi biaya compile-nya kecil dan
 **bukan overfitting ke p2_mem**. Knob `RAKIT_NO_HOT_INLINE` untuk bisect.
+
+## 29. Audit regresi RIR (2026-11-23)
+
+Benchmark penuh `bench/allaxes.sh` (CREPS=3, RREPS=7) mengungkap dua regresi
+besar pada jalur RIR default:
+
+- **`rec_loop` RIR** masih memancarkan **dua** panggilan diri per iterasi
+  (panggilan kedua hasilnya mati). `p3_calls` menjadi **7.731 ms**; setelah
+  ditulis ulang menjadi satu panggilan per iterasi (seperti pass codegen),
+  menjadi **57 ms** dan keluaran tetap identik dengan LLVM.
+- **`unroll` RIR** menduplikasi badan loop tetapi tidak melakukan reassociation
+  affine, sehingga menghalangi unroller codegen yang sudah dioptimalkan.
+  `p5_inline`/`p6_scalar` menjadi **358/401 ms**. Pass ini sekarang **opt-in**
+  (`RAKIT_RIR_UNROLL=1`); default codegen unroller kembali aktif dan keduanya
+  menjadi **7 ms**.
+
+Matriks 3-arah terakhir (`bench/allaxes.sh`, CREPS=3, RREPS=7; C = compile,
+R = run; wall/CPU dalam ms, RSS dalam MB, size dalam byte):
+
+| prog | bk | Cwall | Ccpu | Crss | size | Rwall | Rcpu | Rrss |
+|------|----|------:|-----:|-----:|-----:|------:|-----:|-----:|
+| p1_arith | L | 84 | 103 | 105.5 | 4,635,232 | 81 | 81 | 10.5 |
+| p1_arith | U | 81 | 105 | 107.9 | 5,877,944 | 109 | 108 | 10.6 |
+| p1_arith | M | 80 | 103 | 109.8 | 4,146,240 | 102 | 101 | 10.3 |
+| p2_mem | L | 241 | 371 | 133.5 | 4,639,888 | 16 | 16 | 10.5 |
+| p2_mem | U | 128 | 172 | 130.8 | 5,936,144 | 157 | 159 | 10.5 |
+| p2_mem | M | 160 | 223 | 133.2 | 4,143,704 | 49 | 49 | 10.6 |
+| p3_calls | L | 99 | 121 | 116.1 | 4,612,368 | 37 | 38 | 10.3 |
+| p3_calls | U | 86 | 112 | 116.4 | 5,820,136 | 117 | 117 | 10.3 |
+| p3_calls | M | 90 | 117 | 118.3 | 4,067,168 | 59 | 59 | 10.3 |
+| p4_simd | L | 111 | 132 | 116.6 | 4,636,096 | 56 | 56 | 48.2 |
+| p4_simd | U | 92 | 115 | 117.1 | 5,892,376 | 157 | 157 | 49.4 |
+| p4_simd | M | 105 | 129 | 119.1 | 4,152,832 | 83 | 83 | 48.8 |
+| p5_inline | L | 82 | 103 | 104.8 | 4,609,368 | 58 | 57 | 10.3 |
+| p5_inline | U | 76 | 99 | 106.5 | 5,813,704 | 893 | 893 | 10.5 |
+| p5_inline | M | 78 | 102 | 108.5 | 4,060,088 | 6 | 6 | 10.5 |
+| p6_scalar | L | 83 | 99 | 101.4 | 4,609,368 | 58 | 57 | 10.3 |
+| p6_scalar | U | 76 | 96 | 103.0 | 5,813,688 | 903 | 901 | 10.6 |
+| p6_scalar | M | 77 | 98 | 104.7 | 4,060,088 | 6 | 6 | 10.5 |
+| p7_branchy | L | 85 | 104 | 104.9 | 4,609,520 | 43 | 42 | 10.4 |
+| p7_branchy | U | 79 | 100 | 106.6 | 5,813,800 | 101 | 101 | 10.6 |
+| p7_branchy | M | 81 | 104 | 108.6 | 4,060,248 | 35 | 35 | 10.6 |
+| p8_minmax | L | 84 | 104 | 105.1 | 4,609,544 | 21 | 20 | 10.3 |
+| p8_minmax | U | 78 | 100 | 106.5 | 5,813,752 | 38 | 39 | 10.5 |
+| p8_minmax | M | 78 | 101 | 108.4 | 4,060,216 | 21 | 20 | 10.3 |
+| p9_u64f32 | L | 100 | 117 | 111.0 | 4,635,448 | 31 | 31 | 17.8 |
+| p9_u64f32 | U | 89 | 113 | 112.5 | 5,886,872 | 76 | 76 | 18.8 |
+| p9_u64f32 | M | 93 | 117 | 114.7 | 4,149,856 | 33 | 32 | 18.2 |
+
+Dibanding matriks §21.4: runtime `p3` 94→59, `p4` 99→83, `p8` 29→21;
+`p2` 52→49, `p7` 36→35; `p1`/`p9` dalam ±1 ms; `p5`/`p6` 6→6 ms.
+Ukuran artefak M lebih kecil dari L dan U pada semua program (4.06–4.15 MB vs
+L 4.61–4.64 MB, U 5.81–5.94 MB). Compile absolut berubah sedikit karena noise
+mesin, tetapi dengan anggaran RIR CGU besar `p2` M 160 ms (U 128, L 241);
+`p5`/`p6` M 78/77 ms, mendekati U (76/76) dan lebih cepat dari L (82/83).
+Runtime `p2` M 49 ms, ~3.2× lebih cepat dari U (157 ms).
+
+### 29.1 Anggaran RIR untuk CGU besar (p2/p5 compile)
+
+Audit p2 menunjukkan RIR round-trip menghabiskan **27,6 ms** untuk 142 fungsi
+(import 5,1 ms, pipeline 19,4 ms, export 3,1 ms), sedangkan p5 hanya 8 fungsi
+(0,8 ms). Biaya itu per fungsi dan tidak sebanding dengan manfaatnya pada body
+besar yang loop panasnya sudah ditangani pass codegen.
+
+Aturan baru di `RirPass`: bila CGU punya **>64 fungsi** yang eligible RIR,
+hanya fungsi dengan **≤50 instruksi CLIF** yang di-round-trip. CGU kecil (p3,
+p5, p6) tidak terkena batas ini. Knob: `RAKIT_RIR_LARGE_CGU`,
+`RAKIT_RIR_LARGE_MAX_INSTS`, dan override global `RAKIT_RIR_MAX_INSTS`.
+
+Hasil pada p2 (3 compile / 7 run): compile **194 → 173 ms** dan runtime
+**53 → 50 ms**; p7 compile **100 → 88 ms**, p8 **100 → 84 ms**, p9
+**111 → 100 ms**; p5 tidak berubah karena CGU-nya kecil. Pada matriks penuh
+p5 compile menjadi **86 ms** (LLVM 92, upstream 87), jadi keluhan p5 compile
+hilang setelah run diulang pada build yang sama.
+
+Eksperimen yang **ditolak** (diukur, bukan diasumsikan):
+- Menunda `optimize()` sampai akhir pipeline: compile p2 **+6 ms**, runtime
+  **+3 ms** — pass berikutnya kehilangan cleanup yang dibutuhkan.
+- Hanya mengekspor bila pass struktural berubah (bukan simplify/opt saja):
+  runtime p2 sedikit membaik tetapi compile p5/p8/p9 memburuk 5–15 ms.
+- Mematikan `licm`, `if_convert`, atau `div_test` RIR: compile justru naik
+  karena output RIR lebih besar; tidak ada keuntungan runtime.
+- Verifikasi import/export bukan penyebab: mematikannya tidak mengubah waktu
+  p2/p5 secara terukur.
+- Melewati RIR sepenuhnya di CGU besar (`RAKIT_RIR_LARGE_MAX_INSTS=0`):
+  compile p2 180 vs 181 ms, runtime 52,8 vs 51,1 ms — tidak ada manfaat.
+- A/B pass codegen p2: `RAKIT_NO_STORE_FWD=1` compile 185/run 75 ms;
+  `RAKIT_NO_CODEGEN_INLINE=1` 170/112 ms; `RAKIT_INLINE_GROWTH=10` 174/54 ms
+  vs default 183/51 ms. Jadi sisa gap compile p2 ada di pass codegen/inliner,
+  bukan RIR; memotongnya merusak runtime.
+- p5: default 89 ms; mematikan store-forward 91, codegen inline 92,
+  if-convert 93, div-test 91, unroll 93 ms. Tidak ada pass yang bisa dimatikan
+  tanpa memperlambat compile; p5 sudah setara U pada matriks penuh.
+
+Verifikasi: seluruh keluaran p1–p9 byte-identik dengan LLVM; `./y.sh test`
+65 suite `ok`, 0 failure; `rakit-ir` dan `rakit-opt` lulus; `bench/regressions.sh`
+(dijalankan default oleh `bench/allaxes.sh`) memeriksa argumen call dan efek
+samping loop pada kedua backend; test regresi
+`rakit-ir/tests/rec_loop.rs` memastikan hanya satu self-call per iterasi.
+
+### 29.2 Audit correctness hasil review (2026-11-23)
+
+Semua temuan review ditindaklanjuti. Perubahan yang mendarat:
+
+- **Affine unroll tidak lagi melewati efek samping.** `body_has_observable_effect`
+  menolak reassociation penuh dan lane lowering bila badan loop berisi call,
+  load/store, trap, atau opcode berefek lain; partial/clone unrolling tetap
+  tersedia karena setiap clone mengeksekusi badan. Regresi:
+  `bench/tests/t_loop_side_effect.rs` (64 call `tick()`), keluaran L dan M
+  identik `2016 64`.
+- **RIR unroll tidak memakai nilai header yang basi.** `header_supported`
+  menolak badan yang membaca hasil header yang bergantung pada induksi, dan
+  menolak header dengan efek samping. Test:
+  `header_value_used_by_body_is_not_reused_stale` (sebelumnya 8, sekarang 12).
+- **Entry kondisional tidak overshoot.** `initial_iv` mensyaratkan tepat satu
+  edge preheader `Jump`; edge `Brif`/try-call ke header ditolak. Test:
+  `conditional_second_entry_does_not_overshoot`.
+- **Interpreter**: `Sextend` ke I128 memakai lebar sumber; `FcvtFromInt/Uint`
+  menangani sumber sempit bertanda dan payload I128 penuh; `FcvtToInt/Uint`
+  memotong ke arah nol, memeriksa range tujuan, dan menolak NaN/overflow;
+  operasi pointer memakai semantik integer bertanda; `Iconst` Ptr menghasilkan
+  `Val::P`. Test baru `rakit-ir/tests/interp.rs` (6 kasus).
+- **Anggaran RIR CGU** menghitung fungsi eligible lewat preflight bridge
+  (`rir::is_supported`), bukan panjang cache inliner yang sudah difilter ukuran.
+  `RAKIT_RIR_FORCE=1` kini juga melewati batas ukuran untuk validasi.
+- **Debug info**: fungsi dengan `base_srcloc` tidak di-export ulang oleh RIR,
+  sehingga line table/stepping tidak hilang saat export belum membawa srcloc.
+- **Verifier** menolak use live dari nilai yang hanya didefinisikan di blok
+  unreachable; test `rakit-ir/tests/verify.rs`.
+- **Matcher RIR** melanjutkan scan setelah header loop yang tidak memenuhi
+  syarat, sehingga loop konstan berikutnya tetap bisa di-unroll.
+- **Test `rec_loop`** memakai decrement berbeda (c1=1, c2=2) dan memeriksa
+  operand call serta induksi, bukan hanya jumlah call.
+- **LICM RIR** menghitung predecessors/dominator/loop sekali per pemanggilan;
+  hanya peta definisi yang di-refresh setiap ronde.
+- **Indirect call non-System V** diterima bila semua parameter ABI normal dan
+  convention dapat di-encode RIR; test round-trip `CallConv::Fast`.
+- **Matriks benchmark** §29 sekarang memuat wall, CPU, peak RSS, dan ukuran
+  artefak dalam byte untuk setiap backend dan program. Matriks parsial lama di
+  §21.4 dihapus dan diganti rujukan ke §29.
+- **Clone badan loop tidak lagi berbagi operand call.** `clone_body` memanggil
+  `InstructionData::deep_clone` sebelum `map_values`, sehingga daftar argumen
+  milik call asli tidak ditimpa oleh clone pertama. Regresi:
+  `bench/tests/t_loop_call_args.rs`; urutan argumen L dan M identik
+  (`1,3,10,32,99,301,908,2730`).
+- **Preflight RIR menolak opcode yang tidak di-import.** `unsupported_reason`
+  sekarang default menolak bentuk instruksi tak dikenal; `Fence` (NullAry
+  non-Nop) tidak lagi dihitung eligible. Test `fence_is_not_rir_eligible`.
+- **Nop di header tidak memblokir RIR unroll.** Placeholder DCE diterima oleh
+  `pure_header_inst`; test `dead_nop_in_header_does_not_block_unrolling`.
+- **Back-edge RIR diperiksa.** `header_supported` sekarang memeriksa operand
+  jump back-edge, bukan hanya instruksi badan. Update header yang berubah tidak
+  lagi dipakai ulang oleh clone; test
+  `back_edge_header_update_is_not_reused_stale` (tanpa unroll = 4, bukan 2).
+- **Preflight RIR punya jalur positif.** Binary yang didukung, `select`,
+  `return`, dan `TryCall`/`TryCallIndirect` (termasuk signature exception
+  table) sekarang dihitung eligible; test
+  `preflight_accepts_supported_binary_select_and_return` dan assertion baru di
+  `try_call_roundtrip`. Ini mencegah unit besar salah dianggap kecil.
+- **Regresi punya automation.** `bench/tests/t_loop_call_args.rs` dan
+  `t_loop_side_effect.rs` sekarang melakukan `assert` internal; skrip
+  `bench/regressions.sh` mengompilasi/menjalankan keduanya dengan LLVM dan
+  Rakit lalu membandingkan output. `bench/allaxes.sh` menjalankannya secara
+  default (`SKIP_REGRESSIONS=1` untuk melewati).
+- **Clone back-edge tidak menggandakan salinan argumen.** `clone_body` hanya
+  menyalin branch table/exception table; `deep_clone` sudah menyalin
+  `Jump`/`Brif`.
+- **FuncAddr memakai pemeriksaan external yang sama dengan import.** Helper
+  `external_data` dipakai oleh `external_index` dan preflight `FuncAddr`,
+  sehingga wrapper yang mengembalikan pointer skalar tetapi signature targetnya
+  memakai vektor tidak lagi dihitung eligible. Test
+  `func_addr_with_vector_signature_is_rejected`.
+- **Branch table/exception table di-clone sebelum di-remap.** `clone_body`
+  membuat salinan `JumpTableData`/`ExceptionTableData` baru dan mengganti index
+  pada instruksi clone; entri tabel sumber tidak lagi ikut berubah.
+- **Regression gate tidak bisa jatuh ke LLVM.** `bench/regressions.sh`
+  menambahkan `--target` eksplisit, menghapus `RAKIT_HOST_LLVM` untuk backend
+  Rakit, dan menolak binary Rakit yang byte-identik dengan LLVM.
+
+### 29.3 Audit eksternal PR 9–11 (2026-11-23)
+
+Audit eksternal menemukan tiga kelas masalah yang tidak tertangkap review
+sebelumnya. Yang bisa diperbaiki tanpa mengubah arah proyek sudah mendarat:
+
+- **Crash LICM pada header multi-entry (DIPERBAIKI).** `ensure_preheader`
+  dulu memecah satu sisi `idom → header` walaupun header punya entry kedua dari
+  luar loop; nilai yang di-hoist tidak terdefinisi di jalur itu. Sekarang
+  preheader hanya dibuat bila header punya paling banyak satu predecessor di
+  luar loop. Regresi
+  `licm::tests::licm_does_not_split_a_multi_entry_loop_header` memeriksa tidak
+  ada blok preheader baru dan SSA dominance tetap terjaga. `serde_json 1.0.154`
+  + `regex` kini dikompilasi tanpa `RAKIT_NO_LICM=1`; jalur u64 berjalan, tetapi
+  serialisasi `f64` masih abort karena `pmulhu.w` belum didukung.
+- **Intrinsik SSE2 `pmulhu.w` (DIPERBAIKI).** Lowering baru di
+  `src/intrinsics/llvm_x86.rs` menghitung high 16 bit dari perkalian unsigned
+  16x16 per lane (`uextend → imul → ushr 16 → ireduce`), untuk SSE2 dan AVX2.
+  `serde_json 1.0.154` yang menyerialisasi `f64` kini berjalan; sebelumnya abort
+  dengan `llvm.x86.sse2.pmulhu.w is not yet supported`. Regresi
+  `bench/tests/t_pmulhu.rs` mencakup lane nol, overflow, dan nilai tinggi.
+- **Jembatan RIR membuang `MemFlags` (DIPERBAIKI).** `RIR Inst::Load/Store`
+  sekarang membawa `MemFlags(u16)`; bridge mengekspor `MemFlagsData::bits()` dan
+  mengimpor `MemFlagsData::from_bits()`. Pass RIR yang tidak memahami flag tetap
+  meneruskannya. Alias-region tidak termasuk bit dan sengaja dilepas (lebih
+  konservatif, aman). Test `memory_flags_roundtrip` memeriksa round-trip
+  `trusted + readonly + can_move`.
+- **Transformasi ganda dan biaya RIR (DIPERBAIKI).** rec_loop, inliner,
+  div_test, if_convert, dan sincos versi RIR kini **opt-in**; implementasi CLIF
+  yang memiliki cost model menjadi pemilik default. `RAKIT_RIR_DUPLICATE=1`
+  mengaktifkan semuanya untuk eksperimen, atau pilih satu dengan
+  `RAKIT_RIR_{REC_LOOP,INLINE,DIVTEST,IFCONV,SINCOS}=1`. Ini menghapus regresi
+  `forloops` akibat if_convert RIR dan kerja pass ganda.
+- **Custom backend aktif secara default (DIPERBAIKI).** `RirSelector` +
+  regalloc sekarang hanya berjalan dengan `RAKIT_CUSTOM_BACKEND=1`; default
+  tidak mengalokasikan atau membuang hasilnya. `RAKIT_NO_CUSTOM_BACKEND` tetap
+  menang.
+- **Benchmark tune tanpa input runtime (DIPERBAIKI).** `bench/progs/h_*.rs` berisi
+  enam program held-out yang membaca trip count/seed dari argv, dan `bench/heldout.sh`
+  melaporkan matriks compile/run lengkap serta membandingkan output dengan LLVM.
+- **Atribusi backend asal.** Audit meminta nama dan NOTICE backend asal
+  dikembalikan. Itu bertentangan dengan permintaan rebrand sebelumnya
+  (“tidak ada referensi backend asal”); perlu keputusan eksplisit pemilik repo
+  sebelum diubah.
+
+
+### 29.4 Implementasi lanjutan audit (2026-11-23)
+
+> **Superseded:** seluruh jalur RIR di bawah ini sudah dihapus di §30.
+
+Lima item audit dikerjakan dan diverifikasi:
+
+1. **`pmulhu.w`.** Lowering SSE2/AVX2 ditambahkan. `t_pmulhu` menghasilkan
+   `0 0 0 0 65534 32767 0 1` identik dengan LLVM; program serde_json `f64`
+   (setelah `cargo clean`, karena rlib lama tidak di-rebuild saat `.so` berubah)
+   mencetak `{"a":1.5,"b":"x"} 1.5 123`.
+2. **`MemFlags` RIR.** Tipe baru `rakit_ir::MemFlags`, method builder
+   `load_with_flags`/`store_with_flags`, bit accessor di
+   `MemFlagsData`/`MachMemFlags`, dan flags di `MachInst::Load/Store`.
+3. **Custom backend.** Gate default berubah menjadi opt-in; tidak ada biaya
+   isel/regalloc saat validasi tidak diminta.
+4. **Pass ganda.** Lima pass RIR duplikat dinonaktifkan secara default; RIR
+   tetap menjalankan simplify/opt/mem_forward/SROA/GVN/LICM yang tidak punya
+   padanan CLIF langsung. `forloops` tidak lagi melewati if_convert RIR.
+5. **Held-out.** `bench/heldout.sh` + `bench/progs/h_*.rs`; input runtime
+   `n:seed`, output harus sama dengan LLVM, dan semua sumbu compile/run dicatat.
+
+Verifikasi: `./y.sh test --sysroot rakit` → 65 suite `ok`, 0 failed;
+`rakit-codegen` 202 unit test lulus; `bench/regressions.sh` lulus;
+`bench/heldout.sh` lulus untuk enam program. Test `rakit-opt --lib` 26 lulus.
+
+## 30. Penghapusan `rakit-ir` dan jalur RIR (2026-11-23)
+
+`rakit-ir` dan jembatan `rakit-opt/src/rir.rs` dihapus dari jalur produksi.
+`rakit-opt` **tidak** dihapus: crate itu tetap memiliki pass manager, analysis
+cache, dan pass first-party yang menghasilkan kemenangan performa.
+
+### 30.1 Bukti sebelum penghapusan
+
+Perbandingan pada build yang sama, `opt-level=3`, median 7–9 run:
+
+| Program | RIR aktif | `RAKIT_NO_RIR=1` | `RAKIT_NO_RIR_SIMPLIFY=1` |
+|---|---:|---:|---:|
+| `p3_calls` | 93,8 ms | **56,8 ms** | 59,6 ms |
+| `p4_simd` | 85,3 ms | 86,0 ms | 85,0 ms |
+| `p7_branchy` | 34,9 ms | 35,0 ms | 35,1 ms |
+
+`RAKIT_NO_RIR_OPT`, `NO_RIR_MEM`, `NO_RIR_SROA`, `NO_RIR_GVN`, dan `NO_RIR_LICM`
+tidak mengubah p3; hanya `NO_RIR_SIMPLIFY` yang memulihkan performa. Artinya
+`simplify` RIR mengubah bentuk `fib` sampai pass CLIF `rec_loop` tidak lagi
+mengenali pola rekursi→loop. Pass RIR lain netral, sehingga seluruh round-trip
+hanya menambah biaya dan permukaan bug.
+
+### 30.2 Yang dihapus
+
+- crate `rakit-ir/`: IR SSA, builder, verifier, interpreter, seluruh pass RIR,
+  backend mainan (`isel`, `regalloc`, `mach`, `exec`), dan test-nya;
+- `rakit-opt/src/rir.rs` (bridge import/export);
+- `RirPass`, `rir_bodies`, `rir_eligible`, `set_rir_eligible`;
+- seluruh tunable `RAKIT_RIR_*`, `RAKIT_NO_RIR*`, dan `RAKIT_CUSTOM_BACKEND`;
+- field `crate_name`/`user_crate` yang hanya dipakai RIR;
+- dependency `rakit-ir` dari `rakit-opt/Cargo.toml` dan `Cargo.lock`.
+
+### 30.3 Yang dipertahankan
+
+`rakit-opt` tetap berisi `rec_loop`, `store_forward`, `div_test`, `if_convert`,
+`unroll`, `sincos`, `inliner`, `pass.rs`, `analyses.rs`, dan `passtime.rs`.
+Pass generik (egraph, constant propagation, LICM, ISel, regalloc) tetap dimiliki
+`rakit-codegen`. Tidak ada pass first-party yang diduplikasi.
+
+### 30.4 Verifikasi
+
+- `./y.sh build` → exit 0 (backend + sysroot).
+- Full suite `./y.sh test --sysroot rakit` → **65 suite, 25.368 test lulus,
+  0 gagal**.
+- `rakit-codegen` 202 unit test lulus; `rakit-opt` 2 unit test lulus; root
+  backend 0 test.
+- `bench/regressions.sh` → `all fixtures passed`.
+- `bench/heldout.sh` (`CREPS=1 RREPS=3`, input `10000:7 50000:11`) → semua
+  output identik dengan LLVM.
+- `p3_calls` tanpa RIR: 59,3 ms (median 9 run), output identik dengan LLVM.
+- `bench/allaxes.sh` (`CREPS=1 RREPS=5`) setelah penghapusan:
+
+| prog | bk | Cwall | Ccpu | Crss | size | Rwall | Rcpu | Rrss |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| p1_arith | L | 86 | 106 | 105,7 | 4.635.232 | 82 | 82 | 10,8 |
+| p1_arith | U | 80 | 104 | 109,0 | 5.877.944 | 109 | 108 | 10,8 |
+| p1_arith | M | 81 | 104 | 109,3 | 4.146.112 | 101 | 101 | 10,8 |
+| p2_mem | L | 247 | 374 | 133,6 | 4.639.888 | 16 | 16 | 10,7 |
+| p2_mem | U | 146 | 193 | 131,9 | 5.936.144 | 156 | 155 | 10,7 |
+| p2_mem | M | 153 | 211 | 132,9 | 4.143.368 | 49 | 50 | 10,5 |
+| p3_calls | L | 100 | 122 | 115,9 | 4.612.368 | 38 | 37 | 10,5 |
+| p3_calls | U | 87 | 113 | 117,5 | 5.820.136 | 117 | 117 | 10,8 |
+| p3_calls | M | 91 | 118 | 118,0 | 4.067.032 | 59 | 58 | 10,7 |
+| p4_simd | L | 113 | 134 | 116,7 | 4.636.096 | 57 | 57 | 48,2 |
+| p4_simd | U | 96 | 120 | 118,3 | 5.892.376 | 161 | 160 | 49,5 |
+| p4_simd | M | 102 | 126 | 118,7 | 4.152.736 | 86 | 84 | 48,8 |
+| p5_inline | L | 138 | 108 | 105,3 | 4.609.368 | 58 | 58 | 10,5 |
+| p5_inline | U | 78 | 101 | 107,5 | 5.813.704 | 898 | 898 | 10,7 |
+| p5_inline | M | 77 | 102 | 108,0 | 4.059.960 | 7 | 6 | 10,8 |
+| p6_scalar | L | 85 | 103 | 101,2 | 4.609.368 | 58 | 58 | 10,7 |
+| p6_scalar | U | 78 | 99 | 103,5 | 5.813.688 | 906 | 906 | 10,7 |
+| p6_scalar | M | 77 | 99 | 104,3 | 4.059.960 | 6 | 6 | 10,7 |
+| p7_branchy | L | 85 | 104 | 104,9 | 4.609.520 | 43 | 42 | 10,5 |
+| p7_branchy | U | 78 | 100 | 107,5 | 5.813.800 | 101 | 100 | 10,8 |
+| p7_branchy | M | 79 | 102 | 107,8 | 4.060.120 | 35 | 35 | 10,5 |
+| p8_minmax | L | 86 | 105 | 104,9 | 4.609.544 | 18 | 17 | 10,5 |
+| p8_minmax | U | 79 | 100 | 107,3 | 5.813.752 | 38 | 39 | 10,7 |
+| p8_minmax | M | 80 | 103 | 107,9 | 4.060.088 | 24 | 22 | 10,7 |
+| p9_u64f32 | L | 96 | 115 | 110,6 | 4.635.448 | 31 | 30 | 17,8 |
+| p9_u64f32 | U | 85 | 108 | 114,0 | 5.886.872 | 76 | 76 | 18,9 |
+| p9_u64f32 | M | 89 | 113 | 114,3 | 4.149.744 | 34 | 33 | 18,2 |
+
+Waktu dalam ms, RSS dalam MB, size dalam byte. p8 diukur ulang 15 run: M
+20,4 ms (min 20,0), LLVM 17,9 ms; angka 24 ms di tabel adalah satu run
+`allaxes` yang lebih berisik. Semua output program identik dengan LLVM.
+
+## 31. Audit lanjutan: keamanan rec_loop, cache analisis, dan harness (2026-11-23)
+
+### 31.1 `rec_loop` tidak boleh menghapus efek di blok basis
+
+Laporan "Recursion lowering drops base-case writes" terbukti: `try_match`
+hanya memeriksa nilai `return` blok basis, bukan instruksi yang dijalankan.
+`rewrite` menghapus lima blok lama, jadi store ke static di blok basis ikut
+hilang. Matcher sekarang memanggil `deleted_blocks_are_safe`: selain dua call
+rekursif yang diganti, blok yang dihapus tidak boleh berisi call lain, load,
+store, instruksi yang bisa trap, atau efek samping lain; nilai yang dipakai di
+luar region juga menolak transformasi. Fixture
+`bench/tests/t_rec_loop_effects.rs` (`fib` dengan dua tulis static) menghasilkan
+`55 false false` saat guard dimatikan dan `55 true true` setelah guard aktif.
+
+### 31.2 Cache analisis benar-benar dipakai
+
+Sebelumnya `Analyses` tidak pernah dibaca pass produksi; `if_convert` bahkan
+membangun CFG baru pada setiap percobaan rewrite. Sekarang `if_convert`,
+`sincos`, `unroll` (untuk `narrow_uint_fcvt`), dan `store_forward` memakai
+`PassCtx::analyses` untuk CFG/dominator tree. Cache diinvalidasi setelah setiap
+rewrite `if_convert`, setelah `collapse_forwarders`, dan oleh pass manager
+setelah setiap pass, sehingga tidak ada analisis basi.
+
+### 31.3 Harness held-out
+
+- Program held-out dipindah ke `bench/progs/h_*.rs` agar `allaxes.sh` otomatis
+  menemukannya; tanpa argv mereka memakai input default kecil.
+- Backend `M` dijalankan dengan `env -u RAKIT_HOST_LLVM`, dan ketiga backend
+  mendapat `--target <host>` eksplisit. Tanpa ini, variabel lingkungan bisa
+  membuat kolom "Rakit" sebenarnya LLVM.
+- Status validasi dicatat per backend per input. Output mismatch atau run
+  validasi gagal tidak lagi diberi baris timing `ok`; barisnya menjadi
+  `INVALID`. Kegagalan run saat pengukuran juga men-set exit code harness.
+- `measure.py` mengembalikan exit tidak nol bila **salah satu** repetisi atau
+  warmup gagal, bukan hanya repetisi terakhir.
+- `h_branch` sekarang membandingkan sebelum update dan skala `threshold` kecil
+  ke nibble atas, sehingga lengan `else`/minimal dan `if` bergantian ribuan
+  kali; output default identik untuk L/U/M.
+
+### 31.4 Verifikasi
+
+- `./y.sh build` → exit 0.
+- `./y.sh test --sysroot rakit` → **65 suite, 25.368 test lulus, 0 gagal**.
+- `bench/regressions.sh` → `all fixtures passed` (termasuk fixture baru).
+- `bench/heldout.sh` dengan `10000:7 50000:11 200000:13` → semua output
+  identik dengan LLVM untuk enam program.
+- `bench/allaxes.sh` (`CREPS=1 RREPS=2`) → 15 program (9 p + 6 h), semua
+  compile/run berhasil; tidak ada output mismatch.
+
+## 32. Audit ketiga: validasi all-axes, input ketat, status alat ukur (2026-11-24)
+
+### 32.1 Validasi output di `allaxes.sh`
+
+`bench/validate.sh` sekarang menjadi langkah validasi bersama untuk
+`allaxes.sh` dan `heldout.sh`. Untuk setiap program, `L` dijalankan dengan
+argumen yang sama seperti saat pengukuran dan outputnya disimpan; `U` dan `M`
+wajib keluar dengan status 0 dan stdout+stderr identik dengan referensi `L`.
+Saat pengukuran, `measure.py --expect REF` memeriksa output setiap warmup,
+setiap repetisi yang diukur, dan satu run verifikasi pasca-pengukuran. Repetisi
+timed tidak boleh dibuang ke `/dev/null`: mismatch dengan exit 0 hanya pada
+repetisi timed tidak akan terlihat oleh warmup maupun run verifikasi akhir.
+Capture hanya menulis output normal workload; perbandingan dilakukan setelah
+`wait4`, dan run verifikasi tidak masuk ke `runs`, median, maupun RSS. Baris
+runtime hanya dicetak setelah semua validasi lulus.
+Kegagalan compile/run/mismatch menghasilkan `COMPILE_FAIL`, `RUN_FAIL`,
+`OUTPUT_MISMATCH`, atau `INVALID`; baris `COMPILE_FAIL` tetap menampilkan
+compile wall/CPU/RSS dengan ukuran `-`, sedangkan baris runtime gagal tidak
+menampilkan angka runtime. Harness keluar dengan status tidak nol.
+
+Contoh yang diuji: program sementara yang mencetak nama executable menghasilkan
+`OUTPUT_MISMATCH` untuk U/M dan `rc=1`; program yang `exit 7` menghasilkan
+`RUN_FAIL` untuk L, `INVALID` untuk U/M, dan `rc=1`.
+
+### 32.2 Argumen held-out yang tidak valid ditolak
+
+Keenam program `h_*.rs` memakai helper `arg<T>(index, fallback)`: default hanya
+dipakai jika argumen tidak ada. Argumen yang ada tetapi gagal di-parse
+mencetak `invalid argument <n>: <nilai> (expected <tipe>)` dan keluar dengan
+status 2. Dengan `INPUTS=100:65536`, `h_simd` (seed `u16`) sekarang gagal
+validasi; sebelumnya diam-diam memakai seed 7.
+
+### 32.3 `h_branch` dan status CLI `measure.py`
+
+`h_branch` memetakan `threshold & 0xF` ke nibble atas sebelum dibandingkan.
+Untuk input default 7/11/13, kedua lengan bergantian (≈5.000/21.000/60.000
+transisi pada 10.000/50.000/200.000 iterasi), bukan hanya sekali.
+
+`bench/measure.py` kini memanggil `sys.exit(1)` bila ada warmup/repetisi yang
+gagal atau outputnya tidak cocok dengan `--expect`, sehingga status kegagalan
+terlihat oleh shell maupun harness, bukan hanya sebagai field JSON. Saat
+`--expect` diberikan dan hasilnya tidak valid, ringkasan teks tidak dicetak;
+hanya diagnostik `OUTPUT MISMATCH`/`RUN FAIL` di stderr. Output `--json` tetap
+memuat `exit`, `output_ok`, dan `valid` untuk harness.
+
+### 32.4 Verifikasi
+
+- `./y.sh build` → exit 0.
+- `./y.sh test --sysroot rakit` → **65 suite, 25.368 test lulus, 0 gagal**
+  (tidak ada perubahan kode compiler pada putaran ini).
+- `bench/regressions.sh` → `all fixtures passed`.
+- `bench/allaxes.sh` dengan `h_branch`/`h_simd` → validasi lulus, semua output
+  identik dengan LLVM.
+- Kasus negatif allaxes (mismatch output, drift output antar-run, `exit 7`,
+  compile error) dan heldout (`INPUTS=100:65536`) semuanya keluar `rc=1` tanpa
+  baris timing palsu. Baris `COMPILE_FAIL` tetap memuat compile wall/CPU/RSS.

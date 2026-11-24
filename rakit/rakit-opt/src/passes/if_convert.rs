@@ -19,9 +19,10 @@
 //! to the same join, carry no block parameters, and define no value that escapes
 //! them.
 
+use std::collections::{HashMap as FxHashMap, HashSet as FxHashSet};
+
 use rakit_codegen::cursor::{Cursor, FuncCursor};
 use rakit_codegen::ir::{self, Block, Inst, InstBuilder, InstructionData, Opcode, Value};
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 
 /// Cap on the number of instructions an arm may contain. Short arms are the
 /// ones that pay off as a `cmove`; a long arm would rather keep its branch.
@@ -176,9 +177,7 @@ fn arm_values_are_dead_outside(
                         return false;
                     }
                 }
-                for call in func
-                    .dfg
-                    .insts[inst]
+                for call in func.dfg.insts[inst]
                     .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
                 {
                     for arg in call.args(&func.dfg.value_lists) {
@@ -193,18 +192,20 @@ fn arm_values_are_dead_outside(
     true
 }
 
-pub(crate) fn run(func: &mut ir::Function) {
+pub fn run(func: &mut ir::Function, analyses: &mut crate::analyses::Analyses) {
     if !crate::tunables::if_convert_enabled() {
         return;
     }
     // Convert to a fixed point: one rewrite can expose another.
-    while convert_one(func) {}
+    while convert_one(func, analyses) {
+        analyses.invalidate();
+    }
 }
 
 /// Find and rewrite a single convertible diamond, returning whether it changed
 /// the function.
-fn convert_one(func: &mut ir::Function) -> bool {
-    let cfg = rakit_codegen::flowgraph::ControlFlowGraph::with_function(func);
+fn convert_one(func: &mut ir::Function, analyses: &mut crate::analyses::Analyses) -> bool {
+    let cfg = analyses.cfg(func);
     let blocks: Vec<Block> = func.layout.blocks().collect();
 
     for &head in &blocks {
@@ -260,7 +261,14 @@ fn convert_one(func: &mut ir::Function) -> bool {
 
 /// Move the arms' pure instructions into the head, replace the `brif` with a
 /// `select` feeding a `jump` to the join, and drop the now-empty arms.
-fn rewrite(func: &mut ir::Function, brif: Inst, cond: Value, then_arm: &Arm, else_arm: &Arm, join: Block) {
+fn rewrite(
+    func: &mut ir::Function,
+    brif: Inst,
+    cond: Value,
+    then_arm: &Arm,
+    else_arm: &Arm,
+    join: Block,
+) {
     // Values defined by the arms' instructions. Aliases of these values are
     // common (rakit emits `v6 -> v2` chains), and a cloned instruction that
     // reads such an alias must be redirected to the clone too, or it would keep
@@ -295,15 +303,10 @@ fn rewrite(func: &mut ir::Function, brif: Inst, cond: Value, then_arm: &Arm, els
                 let mut value_lists = std::mem::take(&mut func.dfg.value_lists);
                 let mut jump_tables = std::mem::take(&mut func.dfg.jump_tables);
                 let mut exception_tables = std::mem::take(&mut func.dfg.exception_tables);
-                data.map_values(
-                    &mut value_lists,
-                    &mut jump_tables,
-                    &mut exception_tables,
-                    |v| {
-                        let r = *alias_target.get(&v).unwrap_or(&v);
-                        *map.get(&r).unwrap_or(&v)
-                    },
-                );
+                data.map_values(&mut value_lists, &mut jump_tables, &mut exception_tables, |v| {
+                    let r = *alias_target.get(&v).unwrap_or(&v);
+                    *map.get(&r).unwrap_or(&v)
+                });
                 func.dfg.value_lists = value_lists;
                 func.dfg.jump_tables = jump_tables;
                 func.dfg.exception_tables = exception_tables;

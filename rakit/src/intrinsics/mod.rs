@@ -287,6 +287,9 @@ fn fconst(fx: &mut FunctionCx<'_, '_, '_>, rakit_ty: Type, v: f64) -> Value {
 /// magnitude test and pass through unchanged, which is what truncation returns
 /// for them.
 fn trunc_via_int(fx: &mut FunctionCx<'_, '_, '_>, x: Value, rakit_ty: Type, bits: u32) -> Value {
+    if std::env::var_os("RAKIT_NO_TRUNC_INT").is_some() {
+        return fx.bcx.ins().trunc(x);
+    }
     let int_ty = if bits == 52 { types::I64 } else { types::I32 };
     let int_part = fx.bcx.ins().fcvt_to_sint_sat(int_ty, x);
     let back = fx.bcx.ins().fcvt_from_sint(rakit_ty, int_part);

@@ -67,28 +67,23 @@ mod debuginfo;
 mod discriminant;
 mod driver;
 mod global_asm;
-mod div_test;
-mod if_convert;
 mod inline_asm;
-mod inliner;
 mod intrinsics;
 mod linkage;
 mod main_shim;
 mod num;
 mod optimize;
-mod passtime;
 mod pointer;
 mod pretty_rakit;
-mod rec_loop;
-mod sincos;
-mod store_forward;
 mod toolchain;
-mod tunables;
-mod unroll;
 mod unsize;
 mod unwind_module;
 mod value_and_place;
 mod vtable;
+
+// Rakit optimization layer (its own crate).
+pub(crate) use rakit_opt::passes::{inliner, unroll};
+pub(crate) use rakit_opt::{passtime, tunables};
 
 mod prelude {
     pub(crate) use rakit_codegen::Context;

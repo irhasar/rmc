@@ -16,24 +16,35 @@ fn main() {
     );
 
     let passed_args = std::env::args_os().skip(1).collect::<Vec<_>>();
-    let mut args = vec![];
-    if !cfg!(support_panic_unwind) {
-        args.push(OsString::from("-Cpanic=abort"));
-        args.push(OsString::from("-Zpanic-abort-tests"));
-    }
-    if let Some(name) = option_env!("BUILTIN_BACKEND") {
-        args.push(OsString::from(format!("-Zcodegen-backend={name}")))
-    } else {
-        let mut codegen_backend_arg = OsString::from("-Zcodegen-backend=");
-        codegen_backend_arg.push(rakit_dylib_path);
-        args.push(codegen_backend_arg);
-    }
-    if !passed_args
+    // Cargo omits `--target` for host artifacts (build scripts, proc macros
+    // and their dependency graph).  The test driver asks for host LLVM there:
+    // a proc macro is loaded into rustc itself, so a target-backend bug becomes
+    // a compiler crash.  Direct `rustc-rakit` invocations without `--target`
+    // still use the Rakit backend.
+    let host_build = !passed_args
         .iter()
-        .any(|arg| arg == "--sysroot" || arg.to_str().is_some_and(|s| s.starts_with("--sysroot=")))
-    {
-        args.push(OsString::from("--sysroot"));
-        args.push(OsString::from(sysroot.to_str().unwrap()));
+        .any(|arg| arg == "--target" || arg.to_str().is_some_and(|s| s.starts_with("--target=")));
+    let host_llvm = host_build && env::var_os("RAKIT_HOST_LLVM").is_some();
+    let mut args = vec![];
+    if !host_llvm {
+        if !cfg!(support_panic_unwind) {
+            args.push(OsString::from("-Cpanic=abort"));
+            args.push(OsString::from("-Zpanic-abort-tests"));
+        }
+        if let Some(name) = option_env!("BUILTIN_BACKEND") {
+            args.push(OsString::from(format!("-Zcodegen-backend={name}")))
+        } else {
+            let mut codegen_backend_arg = OsString::from("-Zcodegen-backend=");
+            codegen_backend_arg.push(rakit_dylib_path);
+            args.push(codegen_backend_arg);
+        }
+        if !passed_args
+            .iter()
+            .any(|arg| arg == "--sysroot" || arg.to_str().is_some_and(|s| s.starts_with("--sysroot=")))
+        {
+            args.push(OsString::from("--sysroot"));
+            args.push(OsString::from(sysroot.to_str().unwrap()));
+        }
     }
     if passed_args.is_empty() {
         // Don't pass any arguments when the user didn't pass any arguments

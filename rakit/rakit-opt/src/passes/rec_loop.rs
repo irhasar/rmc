@@ -9,9 +9,10 @@
 //! The rewrite is only applied when every piece matches exactly (self-call,
 //! identity base, `+` of the two call results), so it is conservative.
 use rakit_codegen::cursor::{Cursor, FuncCursor};
-use rakit_codegen::ir::{self, condcodes::IntCC, Block, Inst, InstBuilder, Opcode, Value};
+use rakit_codegen::ir::condcodes::IntCC;
+use rakit_codegen::ir::{self, Block, Inst, InstBuilder, Opcode, Value};
 
-pub(crate) fn run(func: &mut ir::Function) {
+pub fn run(func: &mut ir::Function) {
     if std::env::var_os("RAKIT_NO_REC_LOOP").is_some() {
         return;
     }
@@ -41,7 +42,8 @@ fn try_match(func: &ir::Function) -> Option<Pat> {
         return None;
     }
     let h = jump_target(func, entry)?;
-    let ir::InstructionData::Brif { arg: cond, blocks, .. } = dfg.insts[func.layout.last_inst(h)?]
+    let ir::InstructionData::Brif { arg: cond, blocks, .. } =
+        dfg.insts[func.layout.last_inst(h)?]
     else {
         return None;
     };
@@ -57,8 +59,8 @@ fn try_match(func: &ir::Function) -> Option<Pat> {
     if bargs.len() != 1 || dfg.resolve_aliases(bargs[0]) != n {
         return None;
     }
-    let (fr1, t1, c1, next1) = call_sub(func, rblk, n)?;
-    let (fr2, t2, c2, next2) = call_sub(func, next1, n)?;
+    let (call1, fr1, t1, c1, next1) = call_sub(func, rblk, n)?;
+    let (call2, fr2, t2, c2, next2) = call_sub(func, next1, n)?;
     // The two self-calls may use distinct FuncRefs (distinct sigs) that both
     // resolve to this function; require both to be self-calls, not equality.
     if !is_self(func, fr1) || !is_self(func, fr2) {
@@ -70,7 +72,8 @@ fn try_match(func: &ir::Function) -> Option<Pat> {
     }
     let sum = dfg.resolve_aliases(rargs[0]);
     let ir::ValueDef::Result(si, _) = dfg.value_def(sum) else { return None };
-    let ir::InstructionData::Binary { opcode: Opcode::Iadd, args: sargs, .. } = dfg.insts[si] else {
+    let ir::InstructionData::Binary { opcode: Opcode::Iadd, args: sargs, .. } = dfg.insts[si]
+    else {
         return None;
     };
     let (sa, sb) = (dfg.resolve_aliases(sargs[0]), dfg.resolve_aliases(sargs[1]));
@@ -83,7 +86,71 @@ fn try_match(func: &ir::Function) -> Option<Pat> {
     if old_blocks.len() != 5 {
         return None;
     }
+    // `rewrite` deletes every one of these blocks. Anything in them other than
+    // the two recursive calls is dropped, so a base-case store or any other
+    // observable effect must veto the transform.
+    if !deleted_blocks_are_safe(func, &old_blocks, &[call1, call2]) {
+        return None;
+    }
     Some(Pat { entry, n, base, c1, c2, func_ref: fr1, old_blocks })
+}
+
+/// `rewrite` removes every block in `blocks`. Reject the match if one of them
+/// does anything observable besides the two recursive calls it replaces: a
+/// store, another call, a trapping operation, or a value used outside the
+/// removed region.
+fn deleted_blocks_are_safe(func: &ir::Function, blocks: &[Block], calls: &[Inst]) -> bool {
+    for &block in blocks {
+        for inst in func.layout.block_insts(block) {
+            if calls.contains(&inst) {
+                continue;
+            }
+            let op = func.dfg.insts[inst].opcode();
+            if op == Opcode::Nop || op.is_branch() || op.is_return() || op.is_terminator() {
+                continue;
+            }
+            if op.is_call()
+                || op.can_load()
+                || op.can_store()
+                || op.can_trap()
+                || op.other_side_effects()
+            {
+                return false;
+            }
+            for &result in func.dfg.inst_results(inst) {
+                if result_used_outside(func, result, blocks) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+fn result_used_outside(func: &ir::Function, value: Value, blocks: &[Block]) -> bool {
+    let value = func.dfg.resolve_aliases(value);
+    for block in func.layout.blocks() {
+        if blocks.contains(&block) {
+            continue;
+        }
+        for inst in func.layout.block_insts(block) {
+            for arg in func.dfg.insts[inst].arguments(&func.dfg.value_lists) {
+                if func.dfg.resolve_aliases(*arg) == value {
+                    return true;
+                }
+            }
+            for call in func.dfg.insts[inst]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            {
+                for arg in call.args(&func.dfg.value_lists) {
+                    if arg.as_value().map(|a| func.dfg.resolve_aliases(a)) == Some(value) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 fn rewrite(func: &mut ir::Function, p: Pat) {
@@ -149,7 +216,8 @@ fn is_self(func: &ir::Function, fr: ir::FuncRef) -> bool {
 }
 
 fn jump_target(func: &ir::Function, block: Block) -> Option<Block> {
-    let ir::InstructionData::Jump { destination, .. } = func.dfg.insts[func.layout.last_inst(block)?]
+    let ir::InstructionData::Jump { destination, .. } =
+        func.dfg.insts[func.layout.last_inst(block)?]
     else {
         return None;
     };
@@ -166,7 +234,11 @@ fn ret_args<'a>(func: &'a ir::Function, block: Block) -> Option<&'a [Value]> {
 }
 
 /// Match a block that holds exactly one `call F(n - c)` and then jumps on.
-fn call_sub(func: &ir::Function, block: Block, n: Value) -> Option<(ir::FuncRef, Value, i64, Block)> {
+fn call_sub(
+    func: &ir::Function,
+    block: Block,
+    n: Value,
+) -> Option<(Inst, ir::FuncRef, Value, i64, Block)> {
     let next = jump_target(func, block)?;
     let mut found = None;
     for inst in func.layout.block_insts(block) {
@@ -178,7 +250,7 @@ fn call_sub(func: &ir::Function, block: Block, n: Value) -> Option<(ir::FuncRef,
         let a = func.dfg.resolve_aliases(args[0]);
         let Some(c) = sub_const(&func.dfg, a, n) else { continue };
         let res = *func.dfg.inst_results(inst).first()?;
-        found = Some((func_ref, res, c, next));
+        found = Some((inst, func_ref, res, c, next));
     }
     found
 }

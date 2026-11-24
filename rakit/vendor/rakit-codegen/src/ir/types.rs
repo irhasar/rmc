@@ -34,6 +34,16 @@ pub const INVALID: Type = Type(0);
 include!(concat!(env!("OUT_DIR"), "/types.rs"));
 
 impl Type {
+    /// Reconstruct a type from its raw 16-bit encoding.
+    pub const fn from_bits(bits: u32) -> Self {
+        Self(bits as u16)
+    }
+
+    /// Return the raw 16-bit type encoding.
+    pub const fn as_u32(self) -> u32 {
+        self.0 as u32
+    }
+
     /// Get the lane type of this SIMD vector type.
     ///
     /// A lane type is the same as a SIMD vector type with one lane, so it returns itself.

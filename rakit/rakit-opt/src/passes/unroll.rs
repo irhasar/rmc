@@ -22,14 +22,15 @@
 //! carried chain and measured slower, so it is off unless `RAKIT_UNROLL_CLONE`
 //! is set.
 
+use std::collections::{HashMap as FxHashMap, HashSet as FxHashSet};
+
 use rakit_codegen::cursor::{Cursor, FuncCursor};
-use rakit_codegen::ir::{
-    self, condcodes::IntCC, immediates::Imm64, Block, Inst, InstBuilder, Opcode, Value,
-};
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rakit_codegen::ir::condcodes::IntCC;
+use rakit_codegen::ir::immediates::Imm64;
+use rakit_codegen::ir::{self, Block, Inst, InstBuilder, Opcode, Value};
 
 /// Number of loop iterations folded into one guarded step.
-pub(crate) const UNROLL_FACTOR: u64 = 128;
+pub const UNROLL_FACTOR: u64 = 128;
 
 /// Upper bound on the induction step we are willing to scale, so that the
 /// arithmetic stays well clear of the type's range.
@@ -44,12 +45,12 @@ const MAX_LAST: u64 = 1 << 62;
 /// Widest step the partial-reassociation path will clone. Each iteration costs a
 /// body copy, and the win saturates once the multiply chain is broken, so a small
 /// factor is enough.
-pub(crate) const PARTIAL_FACTOR: u64 = 6;
+pub const PARTIAL_FACTOR: u64 = 6;
 
 /// Partial factor for a loop whose forcing term is a recomputable atom (`i | 1`).
 /// Rebuilding each atom per step costs O(factor^2) multiplies, so a large factor
 /// is counter-productive; 2 keeps every multiply shallow and independent.
-pub(crate) const ATOM_FACTOR: u64 = 3;
+pub const ATOM_FACTOR: u64 = 3;
 
 /// Shrink `factor` until `delta * (factor - 1)` cannot overflow, and report the
 /// largest usable factor (>= 2), or `None` when even two iterations overflow.
@@ -248,9 +249,7 @@ impl Forwarders {
             // The latch's parameters must not escape: substituting them with the
             // predecessor's arguments is only sound on this path, so if any other
             // block reads them the block cannot be removed.
-            if self.has_non_value_arg.contains(&latch)
-                || self.params_escape(func, latch)
-            {
+            if self.has_non_value_arg.contains(&latch) || self.params_escape(func, latch) {
                 continue;
             }
             return Some((pred, latch, target));
@@ -358,10 +357,8 @@ fn thread_forwarder(func: &mut ir::Function, pred: Block, latch: Block) -> bool 
     match &mut func.dfg.insts[pred_term] {
         ir::InstructionData::Jump { destination, .. } => *destination = new_call,
         ir::InstructionData::Brif { blocks, .. } => {
-            let idx = blocks
-                .iter()
-                .position(|b| b.block(&pool) == latch)
-                .expect("pred jumps to latch");
+            let idx =
+                blocks.iter().position(|b| b.block(&pool) == latch).expect("pred jumps to latch");
             blocks[idx] = new_call;
         }
         _ => unreachable!("successor edge must be a jump or brif"),
@@ -378,15 +375,16 @@ fn thread_forwarder(func: &mut ir::Function, pred: Block, latch: Block) -> bool 
     true
 }
 
-pub(crate) fn run(func: &mut ir::Function) {
+pub fn run(func: &mut ir::Function, analyses: &mut crate::analyses::Analyses) {
     let factor = unroll_factor();
     if factor < 2 {
         return;
     }
-    if super::tunables::collapse_forwarders_enabled() {
+    if crate::tunables::collapse_forwarders_enabled() {
         collapse_forwarders(func);
+        analyses.invalidate();
     }
-    narrow_uint_fcvt(func);
+    narrow_uint_fcvt(func, analyses);
     if std::env::var_os("RAKIT_UNROLL_DEBUG").is_some() {
         eprintln!("[unroll] func {:?} blocks={}", func.name, func.layout.blocks().count());
         for b in func.layout.blocks() {
@@ -432,7 +430,7 @@ pub(crate) fn run(func: &mut ir::Function) {
 /// upper-bound compare that guards the conversion's block on the dominator path
 /// (e.g. the `i < N` test of a `for i in 0..N` loop). Dynamic or huge bounds are
 /// left untouched.
-fn narrow_uint_fcvt(func: &mut ir::Function) {
+fn narrow_uint_fcvt(func: &mut ir::Function, analyses: &mut crate::analyses::Analyses) {
     if std::env::var_os("RAKIT_NO_NARROW_FCVT").is_some() {
         return;
     }
@@ -452,9 +450,7 @@ fn narrow_uint_fcvt(func: &mut ir::Function) {
     if targets.is_empty() {
         return;
     }
-    let cfg = rakit_codegen::flowgraph::ControlFlowGraph::with_function(func);
-    let mut dom = rakit_codegen::dominator_tree::DominatorTree::new();
-    dom.compute(func, &cfg);
+    let dom = analyses.domtree(func);
     let dbg = std::env::var_os("RAKIT_UNROLL_DEBUG").is_some();
     let mut changed = 0;
     for (inst, x) in targets {
@@ -515,9 +511,7 @@ fn upper_bound(
                         if dom.dominates(taken, block, &func.layout)
                             && !dom.dominates(nottaken, block, &func.layout)
                         {
-                            if let Some(c) =
-                                upper_bound_from_icmp(func, cc, args[0], args[1], x)
-                            {
+                            if let Some(c) = upper_bound_from_icmp(func, cc, args[0], args[1], x) {
                                 return Some(c);
                             }
                         }
@@ -530,7 +524,13 @@ fn upper_bound(
     None
 }
 
-fn upper_bound_from_icmp(func: &ir::Function, cc: IntCC, a: Value, b: Value, x: Value) -> Option<u64> {
+fn upper_bound_from_icmp(
+    func: &ir::Function,
+    cc: IntCC,
+    a: Value,
+    b: Value,
+    x: Value,
+) -> Option<u64> {
     let a = func.dfg.resolve_aliases(a);
     let b = func.dfg.resolve_aliases(b);
     // `x < C` / `x <= C` (x on the left).
@@ -565,11 +565,13 @@ fn successors(func: &ir::Function, block: Block) -> Vec<Block> {
     out
 }
 
-pub(crate) fn const_of(func: &ir::Function, v: Value) -> Option<u64> {
+pub fn const_of(func: &ir::Function, v: Value) -> Option<u64> {
     let v = func.dfg.resolve_aliases(v);
     let ir::ValueDef::Result(inst, 0) = func.dfg.value_def(v) else { return None };
     match func.dfg.insts[inst] {
-        ir::InstructionData::UnaryImm { opcode: Opcode::Iconst, imm, .. } => Some(imm.bits() as u64),
+        ir::InstructionData::UnaryImm { opcode: Opcode::Iconst, imm, .. } => {
+            Some(imm.bits() as u64)
+        }
         _ => None,
     }
 }
@@ -615,7 +617,9 @@ fn analyze(func: &ir::Function) -> Option<Plan> {
             );
         }
         if blocks[0].block(&dfg.value_lists) != body {
-            if dbg { eprintln!("[unroll]     X: then-arm is not body"); }
+            if dbg {
+                eprintln!("[unroll]     X: then-arm is not body");
+            }
             continue;
         }
 
@@ -624,7 +628,9 @@ fn analyze(func: &ir::Function) -> Option<Plan> {
         let back_edges =
             loop_blocks.iter().filter(|&&b| successors(func, b).contains(&header)).count();
         if back_edges != 1 {
-            if dbg { eprintln!("[unroll]     X: back_edges={back_edges}"); }
+            if dbg {
+                eprintln!("[unroll]     X: back_edges={back_edges}");
+            }
             continue;
         }
 
@@ -632,19 +638,28 @@ fn analyze(func: &ir::Function) -> Option<Plan> {
         // parameter on one side and a loop-invariant value on the other.
         let cond = dfg.resolve_aliases(cond);
         let ir::ValueDef::Result(icmp_inst, 0) = dfg.value_def(cond) else {
-            if dbg { eprintln!("[unroll]     X: cond not an inst result"); }
+            if dbg {
+                eprintln!("[unroll]     X: cond not an inst result");
+            }
             continue;
         };
         let ir::InstructionData::IntCompare { cond: cc, args, opcode: _ } = dfg.insts[icmp_inst]
         else {
-            if dbg { eprintln!("[unroll]     X: cond not icmp: {:?}", dfg.insts[icmp_inst].opcode()); }
+            if dbg {
+                eprintln!("[unroll]     X: cond not icmp: {:?}", dfg.insts[icmp_inst].opcode());
+            }
             continue;
         };
         // Only increasing loops, so the wide step cannot overshoot the bound.
         let iv_left = match cc {
             IntCC::UnsignedLessThan | IntCC::UnsignedLessThanOrEqual => true,
             IntCC::UnsignedGreaterThan | IntCC::UnsignedGreaterThanOrEqual => false,
-            _ => { if dbg { eprintln!("[unroll]     X: cc={cc:?}"); } continue },
+            _ => {
+                if dbg {
+                    eprintln!("[unroll]     X: cc={cc:?}");
+                }
+                continue;
+            }
         };
         let (lhs, rhs) = (args[0], args[1]);
 
@@ -653,10 +668,20 @@ fn analyze(func: &ir::Function) -> Option<Plan> {
             _ => None,
         };
         let (iv_idx, iv, bound) = if iv_left {
-            let Some(i) = param_of(lhs) else { if dbg { eprintln!("[unroll]     X: lhs not header param"); } continue };
+            let Some(i) = param_of(lhs) else {
+                if dbg {
+                    eprintln!("[unroll]     X: lhs not header param");
+                }
+                continue;
+            };
             (i, lhs, rhs)
         } else {
-            let Some(i) = param_of(rhs) else { if dbg { eprintln!("[unroll]     X: rhs not header param"); } continue };
+            let Some(i) = param_of(rhs) else {
+                if dbg {
+                    eprintln!("[unroll]     X: rhs not header param");
+                }
+                continue;
+            };
             (i, rhs, lhs)
         };
         // The bound must be loop-invariant. A value defined inside the loop is
@@ -664,7 +689,9 @@ fn analyze(func: &ir::Function) -> Option<Plan> {
         // the header for a literal trip count.
         let loop_blocks = [header, body];
         if const_of(func, bound).is_none() && defined_in(func, bound, &loop_blocks) {
-            if dbg { eprintln!("[unroll]     X: bound not invariant"); }
+            if dbg {
+                eprintln!("[unroll]     X: bound not invariant");
+            }
             continue;
         }
 
@@ -676,26 +703,47 @@ fn analyze(func: &ir::Function) -> Option<Plan> {
         };
         let args: Vec<ir::BlockArg> = back_call.args(&dfg.value_lists).collect();
         if args.len() != dfg.block_params(header).len() {
-            if dbg { eprintln!("[unroll]     X: arity mismatch"); }
+            if dbg {
+                eprintln!("[unroll]     X: arity mismatch");
+            }
             continue;
         }
-        let ir::BlockArg::Value(step_val) = args[iv_idx] else { if dbg { eprintln!("[unroll]     X: step not value"); } continue };
+        let ir::BlockArg::Value(step_val) = args[iv_idx] else {
+            if dbg {
+                eprintln!("[unroll]     X: step not value");
+            }
+            continue;
+        };
         let step_val = dfg.resolve_aliases(step_val);
-        let ir::ValueDef::Result(step_inst, 0) = dfg.value_def(step_val) else { if dbg { eprintln!("[unroll]     X: step not inst result"); } continue };
+        let ir::ValueDef::Result(step_inst, 0) = dfg.value_def(step_val) else {
+            if dbg {
+                eprintln!("[unroll]     X: step not inst result");
+            }
+            continue;
+        };
         let ir::InstructionData::Binary { opcode: Opcode::Iadd, args: sargs, .. } =
             dfg.insts[step_inst]
         else {
-            if dbg { eprintln!("[unroll]     X: step not iadd"); }
+            if dbg {
+                eprintln!("[unroll]     X: step not iadd");
+            }
             continue;
         };
         let iv = dfg.resolve_aliases(iv);
         let delta = match (const_of(func, sargs[0]), const_of(func, sargs[1])) {
             (None, Some(d)) if dfg.resolve_aliases(sargs[0]) == iv => d,
             (Some(d), None) if dfg.resolve_aliases(sargs[1]) == iv => d,
-            _ => { if dbg { eprintln!("[unroll]     X: step not iv+const: sargs={sargs:?} iv={iv:?}"); } continue },
+            _ => {
+                if dbg {
+                    eprintln!("[unroll]     X: step not iv+const: sargs={sargs:?} iv={iv:?}");
+                }
+                continue;
+            }
         };
         if delta == 0 || delta > MAX_DELTA {
-            if dbg { eprintln!("[unroll]     X: delta={delta}"); }
+            if dbg {
+                eprintln!("[unroll]     X: delta={delta}");
+            }
             continue;
         }
 
@@ -761,24 +809,46 @@ fn clone_body(
 
     let insts: Vec<Inst> = insts.to_vec();
     for &old_inst in &insts {
-        let mut data = func.dfg.insts[old_inst];
-        {
-            let mut value_lists = std::mem::take(&mut func.dfg.value_lists);
-            let mut jump_tables = std::mem::take(&mut func.dfg.jump_tables);
-            let mut exception_tables = std::mem::take(&mut func.dfg.exception_tables);
-            // `InstructionData` is `Copy` and its `BlockCall`s share the value
-            // pool with the original instruction. Deep-clone them first, or
-            // remapping the clone's branch arguments would corrupt the original.
+        let original = func.dfg.insts[old_inst];
+        let mut value_lists = std::mem::take(&mut func.dfg.value_lists);
+        let mut jump_tables = std::mem::take(&mut func.dfg.jump_tables);
+        let mut exception_tables = std::mem::take(&mut func.dfg.exception_tables);
+        // `InstructionData` is `Copy`, but pooled operand lists and `BlockCall`
+        // arguments live in the value pool. Deep-clone the whole instruction
+        // before remapping: otherwise the first clone rewrites the original
+        // call's shared argument list and later clones remap the wrong values.
+        let mut data = original.deep_clone(&mut value_lists);
+        // `deep_clone` already copies Jump/Brif destinations. Branch tables and
+        // exception tables keep their branches out of line, and `data` still
+        // refers to the source table, so clone the table before mutating it.
+        match &mut data {
+            ir::InstructionData::BranchTable { table, .. } => {
+                let cloned = jump_tables[*table].clone();
+                *table = jump_tables.push(cloned);
+            }
+            ir::InstructionData::TryCall { exception, .. }
+            | ir::InstructionData::TryCallIndirect { exception, .. } => {
+                let cloned = exception_tables[*exception].clone();
+                *exception = exception_tables.push(cloned);
+            }
+            _ => {}
+        }
+        if matches!(
+            data,
+            ir::InstructionData::BranchTable { .. }
+                | ir::InstructionData::TryCall { .. }
+                | ir::InstructionData::TryCallIndirect { .. }
+        ) {
             for call in data.branch_destination_mut(&mut jump_tables, &mut exception_tables) {
                 *call = call.deep_clone(&mut value_lists);
             }
-            data.map_values(&mut value_lists, &mut jump_tables, &mut exception_tables, |v| {
-                *vmap.get(&v).unwrap_or(&v)
-            });
-            func.dfg.value_lists = value_lists;
-            func.dfg.jump_tables = jump_tables;
-            func.dfg.exception_tables = exception_tables;
         }
+        data.map_values(&mut value_lists, &mut jump_tables, &mut exception_tables, |v| {
+            *vmap.get(&v).unwrap_or(&v)
+        });
+        func.dfg.value_lists = value_lists;
+        func.dfg.jump_tables = jump_tables;
+        func.dfg.exception_tables = exception_tables;
         let ctrl_typevar = func.dfg.ctrl_typevar(old_inst);
         let new_inst = func.dfg.make_inst(data);
         func.dfg.make_inst_results(new_inst, ctrl_typevar);
@@ -855,6 +925,28 @@ impl Affine {
     }
 }
 
+/// Whether `plan.body` contains an instruction whose repeated execution is
+/// observable or can trap. Full reassociation and lane lowering skip the body
+/// for the intermediate iterations, so they are only sound for a body that is
+/// free of calls, memory effects and traps. Partial/clone unrolling executes
+/// every clone, so it remains valid for such bodies.
+fn body_has_observable_effect(func: &ir::Function, plan: &Plan) -> bool {
+    func.layout.block_insts(plan.body).any(|inst| {
+        if inst == plan.back_edge {
+            return false;
+        }
+        let op = func.dfg.insts[inst].opcode();
+        op.is_call()
+            || op.is_branch()
+            || op.is_terminator()
+            || op.is_return()
+            || op.can_trap()
+            || op.other_side_effects()
+            || op.can_store()
+            || op.can_load()
+    })
+}
+
 /// Compute the affine form of every instruction result in `plan.body`, starting
 /// from the header parameters as the basis. Returns `None` if the body is not a
 /// pure affine update of the loop state (it reads or writes memory, calls out, or
@@ -883,6 +975,18 @@ fn analyze_affine(func: &ir::Function, plan: &Plan) -> Option<Vec<Option<Affine>
     for (i, &p) in dfg.block_params(plan.header).iter().enumerate() {
         forms[p.as_u32() as usize] = Some(basis(i));
     }
+    // LICM may have hoisted literal increments/multipliers to a preheader.
+    // Seed every 64-bit constant, not only those still inside the body.
+    for block in func.layout.blocks() {
+        for inst in func.layout.block_insts(block) {
+            let results = dfg.inst_results(inst);
+            if let ir::InstructionData::UnaryImm { opcode: Opcode::Iconst, imm, .. } = dfg.insts[inst] {
+                if results.len() == 1 && is_i64(results[0]) {
+                    forms[results[0].as_u32() as usize] = Some(Affine { coeffs: vec![0; n], c: imm.bits() as u64, atoms: Vec::new() });
+                }
+            }
+        }
+    }
 
     let add = |a: &Affine, b: &Affine| {
         let mut r = a.clone();
@@ -906,14 +1010,9 @@ fn analyze_affine(func: &ir::Function, plan: &Plan) -> Option<Vec<Option<Affine>
         }
         r
     };
-    let constant = |c: u64| Affine { coeffs: vec![0; n], c, atoms: Vec::new() };
     let as_const = |a: &Option<Affine>| -> Option<u64> {
         let a = a.as_ref()?;
-        if a.atoms.is_empty() && a.coeffs.iter().all(|&x| x == 0) {
-            Some(a.c)
-        } else {
-            None
-        }
+        if a.atoms.is_empty() && a.coeffs.iter().all(|&x| x == 0) { Some(a.c) } else { None }
     };
     // Build `op(x, imm)` as an atom when `x` is a pure linear form.
     let as_atom = |op: Opcode, x: &Option<Affine>, imm: u64| -> Option<Affine> {
@@ -935,7 +1034,7 @@ fn analyze_affine(func: &ir::Function, plan: &Plan) -> Option<Vec<Option<Affine>
             ir::InstructionData::UnaryImm { opcode: Opcode::Iconst, imm, .. }
                 if is_i64(results[0]) =>
             {
-                Some(constant(imm.bits() as u64))
+                Some(Affine { coeffs: vec![0; n], c: imm.bits() as u64, atoms: Vec::new() })
             }
             ir::InstructionData::Binary { opcode: Opcode::Iadd, args, .. } if is_i64(args[0]) => {
                 let (a, b) = (
@@ -996,10 +1095,9 @@ fn power(
     let dfg = &func.dfg;
     let n = dfg.block_params(plan.header).len();
     let back_args: Vec<Value> = match dfg.insts[plan.back_edge] {
-        ir::InstructionData::Jump { destination, .. } => destination
-            .args(&dfg.value_lists)
-            .filter_map(|a| a.as_value())
-            .collect(),
+        ir::InstructionData::Jump { destination, .. } => {
+            destination.args(&dfg.value_lists).filter_map(|a| a.as_value()).collect()
+        }
         _ => return None,
     };
     if back_args.len() != n {
@@ -1240,7 +1338,8 @@ fn detect_lane(func: &ir::Function, plan: &Plan, forms: &[Option<Affine>]) -> Op
     let a_next = dfg.resolve_aliases(back[a_idx]);
     let mn_param = dfg.resolve_aliases(params[mn_idx]);
     let ir::ValueDef::Result(sel_inst, _) = dfg.value_def(mn_step) else { return None };
-    let ir::InstructionData::Ternary { opcode: Opcode::Select, args, .. } = dfg.insts[sel_inst] else {
+    let ir::InstructionData::Ternary { opcode: Opcode::Select, args, .. } = dfg.insts[sel_inst]
+    else {
         return None;
     };
     let (arm1, arm2) = (dfg.resolve_aliases(args[1]), dfg.resolve_aliases(args[2]));
@@ -1292,10 +1391,9 @@ fn apply_lanes(func: &mut ir::Function, plan: &Plan, li: &LaneInfo) -> bool {
     // header must end in a brif whose arms are `body` and the loop exit.
     let Some(brif) = func.layout.last_inst(header) else { return false };
     let succs = match &func.dfg.insts[brif] {
-        ir::InstructionData::Brif { blocks, .. } => [
-            blocks[0].block(&func.dfg.value_lists),
-            blocks[1].block(&func.dfg.value_lists),
-        ],
+        ir::InstructionData::Brif { blocks, .. } => {
+            [blocks[0].block(&func.dfg.value_lists), blocks[1].block(&func.dfg.value_lists)]
+        }
         _ => return false,
     };
     let exit = if succs[0] == body {
@@ -1364,10 +1462,7 @@ fn apply_lanes(func: &mut ir::Function, plan: &Plan, li: &LaneInfo) -> bool {
             destination.args(&func.dfg.value_lists).collect()
         }
         ir::InstructionData::Brif { blocks, .. } => {
-            let arm = blocks
-                .iter()
-                .find(|bc| bc.block(&func.dfg.value_lists) == header)
-                .unwrap();
+            let arm = blocks.iter().find(|bc| bc.block(&func.dfg.value_lists) == header).unwrap();
             arm.args(&func.dfg.value_lists).collect()
         }
         _ => return false,
@@ -1563,11 +1658,17 @@ fn apply(func: &mut ir::Function, plan: &Plan, factor: u64) {
     // and can be evaluated in a handful of multiplies, collapsing the carried
     // dependency chain. Duplicating the body cannot achieve that.
     if let Some(forms) = analyze_affine(func, plan) {
+        let pure_body = !body_has_observable_effect(func, plan);
         if std::env::var_os("RAKIT_LANE_DEBUG").is_some() {
             match detect_lane(func, plan, &forms) {
                 Some(li) => eprintln!(
                     "[lane] MATCH iv={} a={} mn={} C={} bound={} bound%4={}",
-                    li.iv_idx, li.a_idx, li.mn_idx, li.c, li.bound, li.bound % 4
+                    li.iv_idx,
+                    li.a_idx,
+                    li.mn_idx,
+                    li.c,
+                    li.bound,
+                    li.bound % 4
                 ),
                 None => eprintln!("[lane] no match"),
             }
@@ -1575,7 +1676,7 @@ fn apply(func: &mut ir::Function, plan: &Plan, factor: u64) {
         // Lane transform: rewrite the LCG-plus-reduction loop into F independent
         // lanes (1 multiply/iter) when the shape and a divisible constant trip
         // count allow it. Falls through to the clone path otherwise.
-        if lane_enabled() {
+        if pure_body && lane_enabled() {
             if let Some(li) = detect_lane(func, plan, &forms) {
                 if apply_lanes(func, plan, &li) {
                     return;
@@ -1590,9 +1691,8 @@ fn apply(func: &mut ir::Function, plan: &Plan, factor: u64) {
         let all_affine = back.iter().all(|&v| form_of(v).is_some());
         // Atoms (`i | 1`) have no closed form to fold over 128 steps; they stay on
         // the small partial factor so the code does not blow up.
-        let any_atoms =
-            back.iter().any(|&v| form_of(v).is_some_and(|f| !f.atoms.is_empty()));
-        if all_affine && !any_atoms {
+        let any_atoms = back.iter().any(|&v| form_of(v).is_some_and(|f| !f.atoms.is_empty()));
+        if pure_body && all_affine && !any_atoms {
             if let Some(rows) = power(func, plan, &forms, factor) {
                 let rows: Vec<Affine> = rows.into_iter().flatten().collect();
                 apply_reassoc(func, plan, factor, &rows);
@@ -1620,10 +1720,9 @@ fn apply(func: &mut ir::Function, plan: &Plan, factor: u64) {
 /// The values passed back to the header, in parameter order.
 fn back_states(func: &ir::Function, plan: &Plan) -> Vec<Value> {
     match func.dfg.insts[plan.back_edge] {
-        ir::InstructionData::Jump { destination, .. } => destination
-            .args(&func.dfg.value_lists)
-            .filter_map(|a| a.as_value())
-            .collect(),
+        ir::InstructionData::Jump { destination, .. } => {
+            destination.args(&func.dfg.value_lists).filter_map(|a| a.as_value()).collect()
+        }
         _ => Vec::new(),
     }
 }
@@ -1657,10 +1756,8 @@ fn compose(
     if back.len() != n {
         return None;
     }
-    let step: Vec<Option<Affine>> = back
-        .iter()
-        .map(|&v| forms[dfg.resolve_aliases(v).as_u32() as usize].clone())
-        .collect();
+    let step: Vec<Option<Affine>> =
+        back.iter().map(|&v| forms[dfg.resolve_aliases(v).as_u32() as usize].clone()).collect();
 
     let mut rows: Vec<Vec<Option<Affine>>> = Vec::with_capacity(steps as usize);
     rows.push(step.clone());
@@ -1677,7 +1774,12 @@ fn compose(
 /// a compile-time constant (and `iv + last` cannot wrap) this is a single
 /// compare against a constant limit, instead of the general no-wrap test
 /// combined with the last-iteration test.
-fn build_guard(pos: &mut FuncCursor<'_>, plan: &Plan, last: u64, bound_const: Option<u64>) -> Value {
+fn build_guard(
+    pos: &mut FuncCursor<'_>,
+    plan: &Plan,
+    last: u64,
+    bound_const: Option<u64>,
+) -> Value {
     let iv = plan.iv;
     if let Some(b) = bound_const {
         if b.checked_add(last).is_some() {
@@ -1726,7 +1828,8 @@ fn apply_partial(func: &mut ir::Function, plan: &Plan, factor: u64, forms: &[Opt
     // Snapshot the body before inserting anything, so the clones copy the loop
     // body alone and not the precomputation this function adds to it.
     let body_insts: Vec<Inst> = func.layout.block_insts(plan.body).collect();
-    let single_args: Vec<ir::BlockArg> = (0..n).map(|j| back_arg(func, plan.back_edge, j)).collect();
+    let single_args: Vec<ir::BlockArg> =
+        (0..n).map(|j| back_arg(func, plan.back_edge, j)).collect();
 
     // Guard plus the closed-form affine values, at the top of the body. These are
     // independent of each other, so the chain they replace disappears even though
@@ -1738,7 +1841,8 @@ fn apply_partial(func: &mut ir::Function, plan: &Plan, factor: u64, forms: &[Opt
         let guard = build_guard(&mut pos, plan, last, bound_const);
         let pre: Vec<Vec<Option<Value>>> = (0..factor as usize)
             .map(|k| {
-                at[k].iter()
+                at[k]
+                    .iter()
                     .map(|f| f.as_ref().map(|a| build_affine(&mut pos, &header_params, a)))
                     .collect()
             })

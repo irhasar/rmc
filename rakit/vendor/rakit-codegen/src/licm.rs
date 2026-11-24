@@ -20,8 +20,7 @@
 //! local), and it is sound without a full alias analysis. Any other load is
 //! blocked as soon as the loop contains a store.
 //!
-//! The pass is gated on `enable_licm` so a default Rakit build is
-//! unaffected.
+//! The pass is on by default; `RAKIT_NO_LICM=1` disables it (see `enabled`).
 
 use alloc::vec::Vec;
 
@@ -142,9 +141,23 @@ fn ensure_preheader(func: &mut Function, cfg: &ControlFlowGraph, header: Block) 
 
     // Split the edge from the header's immediate dominator. The idom of a loop
     // header is outside the loop, so the new block runs once per entry and is a
-    // valid preheader.
-    let idom = DominatorTree::with_function(func, cfg).idom(header)?;
+    // valid preheader -- but only when that edge is the loop's *only* entry. A
+    // second predecessor from outside the loop keeps jumping straight to the
+    // header and bypasses the new block, so an instruction hoisted into it is
+    // undefined on that path (Cranelift's regalloc reports `EntryLivein`).
+    let domtree = DominatorTree::with_function(func, cfg);
+    let idom = domtree.idom(header)?;
     if idom == header {
+        return None;
+    }
+    let outside_preds = func
+        .layout
+        .blocks()
+        .filter(|b| *b != header)
+        .filter(|b| cfg.succ_iter(*b).any(|s| s == header))
+        .filter(|b| !domtree.block_dominates(header, *b))
+        .count();
+    if outside_preds > 1 {
         return None;
     }
     let term = func.layout.last_inst(idom)?;
@@ -388,4 +401,106 @@ fn block_param_owner(func: &Function, value: Value) -> Option<Block> {
     func.layout
         .blocks()
         .find(|b| func.dfg.block_params(*b).contains(&value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cursor::{Cursor, FuncCursor};
+    use crate::ir::types::{I32, I64};
+    use crate::ir::{InstBuilder, ValueDef};
+
+    /// True when every value operand is defined in a block that dominates its
+    /// use: the SSA invariant Cranelift's register allocator relies on.
+    fn ssa_dominates(func: &Function) -> bool {
+        let cfg = ControlFlowGraph::with_function(func);
+        let domtree = DominatorTree::with_function(func, &cfg);
+        for block in func.layout.blocks() {
+            for inst in func.layout.block_insts(block) {
+                for arg in func.dfg.inst_values(inst) {
+                    let arg = func.dfg.resolve_aliases(arg);
+                    let def = match func.dfg.value_def(arg) {
+                        ValueDef::Param(pb, _) => pb,
+                        ValueDef::Result(di, _) => match func.layout.inst_block(di) {
+                            Some(b) => b,
+                            None => return false,
+                        },
+                        ValueDef::Union(..) => return false,
+                    };
+                    if !domtree.block_dominates(def, block) {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// A loop header with two predecessors from *outside* the loop. Splitting
+    /// only the idom edge leaves the second entry bypassing the new preheader.
+    ///
+    /// ```text
+    /// entry --brif--> header          (entry is the idom and one entry edge)
+    ///   \-----------> bx --jump--> header   (a second entry edge)
+    /// header --brif--> body --jump--> header   (back edge)
+    ///   \-----------> exit
+    /// ```
+    fn two_entry_loop() -> Function {
+        let mut func = Function::new();
+        let entry = func.dfg.make_block();
+        let bx = func.dfg.make_block();
+        let header = func.dfg.make_block();
+        let body = func.dfg.make_block();
+        let exit = func.dfg.make_block();
+
+        let mut cur = FuncCursor::new(&mut func);
+
+        cur.insert_block(entry);
+        let cond = cur.ins().iconst(I32, 1);
+        let k = cur.ins().iconst(I64, 7);
+        let one = cur.ins().iconst(I64, 1);
+        cur.ins().brif(cond, header, &[], bx, &[]);
+
+        cur.insert_block(bx);
+        cur.ins().jump(header, &[]);
+
+        cur.insert_block(header);
+        // Invariant: both operands are defined in `entry`, outside the loop.
+        let inv = cur.ins().iadd(k, one);
+        let cond2 = cur.ins().iconst(I32, 1);
+        cur.ins().brif(cond2, body, &[], exit, &[]);
+
+        cur.insert_block(body);
+        let _ = cur.ins().iadd(inv, one);
+        cur.ins().jump(header, &[]);
+
+        cur.insert_block(exit);
+        cur.ins().return_(&[inv]);
+
+        drop(cur);
+        func
+    }
+
+    #[test]
+    fn licm_does_not_split_a_multi_entry_loop_header() {
+        let mut func = two_entry_loop();
+        assert!(ssa_dominates(&func), "input CFG should already be SSA-dominant");
+        let blocks_before = func.layout.blocks().count();
+
+        do_licm(&mut func);
+
+        // A preheader may only be created when the split edge is the loop's
+        // sole entry; here the header has two, so no block may be inserted.
+        assert_eq!(
+            blocks_before,
+            func.layout.blocks().count(),
+            "LICM created a preheader for a loop header with a second entry"
+        );
+        assert!(
+            ssa_dominates(&func),
+            "LICM hoisted an invariant into a preheader that does not dominate \
+             every entry to the loop, so the value is undefined on the other \
+             entry path (regalloc reports `EntryLivein`)"
+        );
+    }
 }

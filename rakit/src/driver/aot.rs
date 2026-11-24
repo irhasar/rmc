@@ -254,7 +254,6 @@ fn compile_cgu(
                 collect_max,
             )
         });
-
         for codegened_func in aot_module.codegened_functions {
             crate::base::compile_fn(
                 &prof,

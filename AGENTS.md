@@ -1,4 +1,344 @@
+## Session (2026-11-23) — `rakit-ir` removed, `rakit-opt` kept
+- **Decision:** delete the separate RIR crate and its CLIF↔RIR bridge. Keep
+  `rakit-opt` as the production pass layer; it owns the passes that produce the
+  real wins (rec_loop, store_forward, div_test, if_convert, unroll, sincos,
+  inliner).
+- **Evidence:** `RAKIT_NO_RIR=1` made `p3_calls` 93.8 → 56.8 ms. Isolating the
+  RIR passes showed `simplify` was the trigger: `RAKIT_NO_RIR_SIMPLIFY=1` gave
+  59.6 ms. p1/p2/p4–p9 were neutral. RIR changed `fib` so CLIF `rec_loop` no
+  longer matched.
+- **Removed:** `rakit-ir/` (IR, verifier, interpreter, tests, toy ISel/regalloc),
+  `rakit-opt/src/rir.rs`, `RirPass`, RIR inliner bodies, RIR tunables, custom
+  backend path, and the `rakit-ir` dependency.
+- **Kept:** `rakit-opt` pass manager, shared analyses, `passtime`, and all
+  first-party CLIF passes. `rakit-codegen` remains the generic optimizer/backend.
+- **Docs:** README architecture section rewritten; RIR knobs removed.
+- **Verification:** `./y.sh build` exit 0; `./y.sh test --sysroot rakit` 65
+  suites / 25,368 passed / 0 failed; `rakit-codegen` 202, `rakit-opt` 2;
+  regressions pass; heldout outputs match LLVM; allaxes p3 93.8 → 59 ms.
+
 # AGENTS.md
+
+## Session (2026-11-24) — all-axes output validation, strict held-out args
+- **Bug fixed:** `allaxes.sh` timed discovered held-out programs without
+  checking stdout. `bench/validate.sh` now holds the shared step: `--capture`
+  runs L, `--compare` requires exit 0 and byte-identical stdout+stderr for U/M;
+  validation uses the same args as the timed runs. `measure.py --expect REF`
+  checks stdout+stderr on each warmup, every timed repetition, and one
+  post-measurement verification run. Timed repetitions must be captured too:
+  discarding them to `/dev/null` lets a zero-exit mismatch in a timed run pass
+  unnoticed. The later verification run is excluded from runs, medians, and
+  RSS. Only fully validated rows print runtime timings. Runtime failure rows
+  carry no runtime numbers; compile failure rows keep compile wall/CPU/RSS
+  (size `-`). Harnesses exit nonzero.
+- **Strict inputs:** all `bench/progs/h_*.rs` use `arg<T>(index, fallback)`;
+  a present-but-unparsable argument prints `invalid argument ...` and exits 2.
+  `INPUTS=100:65536` now fails `h_simd` validation instead of silently using 7.
+- **h_branch:** scales `threshold & 0xF` into the top nibble. Default inputs
+  7/11/13 now alternate arms (~5k/21k/60k transitions) instead of one low hit.
+- **measure.py:** CLI now `sys.exit(1)` when any warmup/rep fails or `--expect`
+  output mismatches. With `--expect`, an invalid result prints only the stderr
+  diagnostic, not a text timing summary; `--json` still carries `exit`,
+  `output_ok`, and `valid`.
+- **Verification:** build 0; regressions pass; `allaxes` h_branch/h_simd match
+  LLVM; negative mismatch/exit-7 and invalid-seed cases all return rc 1 with no
+  timing rows. Compiler suite unchanged (65/25,368/0).
+
+## Session (2026-11-23) — rec_loop effect guard, analysis cache, held-out harness
+- **Bug fixed:** `RecLoopPass` deleted base-case side effects. `try_match` only
+  checked the base block's return value; `rewrite` removes five blocks, so a
+  static store in the base block disappeared. `deleted_blocks_are_safe` now
+  rejects any non-matched call/load/store/trapping op or escaping value in the
+  removed blocks. Regression `bench/tests/t_rec_loop_effects.rs`: old guard
+  prints `55 false false`, fixed prints `55 true true`.
+- **Analysis cache is live:** `if_convert`, `sincos`, `unroll` (fcvt narrowing)
+  and `store_forward` now read `PassCtx::analyses` instead of rebuilding CFG/dom.
+  `if_convert` invalidates after each rewrite; `unroll` after forwarder collapse;
+  the pass manager invalidates after every pass.
+- **Held-out harness:** programs moved to `bench/progs/h_*.rs` (auto-discovered
+  by `allaxes.sh`), with small argv fallbacks. Rakit column uses
+  `env -u RAKIT_HOST_LLVM`; all backends get `--target <host>`. Mismatch/failed
+  validation rows are `INVALID`, never `ok`; timed-run failures set exit 1.
+  `measure.py` now reports failure if *any* rep/warmup fails. `h_branch` starts
+  below threshold and compares before updating, so both arms run.
+- **Verification:** build 0; 65 suites / 25,368 passed / 0 failed; regressions
+  pass; heldout all inputs match LLVM; allaxes 15 programs compile/run.
+
+> Historical notes below predate the RIR removal. Entries mentioning `rakit-ir`,
+> `RIR`, `RirPass`, or `RAKIT_RIR_*` are archival and no longer describe the tree.
+
+
+## Session (2026-11-23, Fase 2 step 19) — calls
+- `Inst::Call(Option<Value>, u32, Vec<Value>)` plus `Function.externals`
+  (`External { namespace, index, params, ret }`). Builder `call`.
+- Bridge imports/exports CLIF `Call` for `ExternalName::User` with 0/1 returns;
+  other external kinds or multi-returns are refused.
+- DCE keeps calls; verifier checks target/arity/types; interpreter reports
+  external calls as unsupported. Addresses passed to calls escape, so
+  `mem_forward`/SROA leave those slots alone.
+- Tests: 75 RIR (2 call) + 9 bridge; h23 (`f -> g`) prints 42 with RIR;
+  h20-h22 unchanged; `./y.sh build` exit 0.
+
+## Session (2026-11-23, Fase 2 step 18) — I128 memory
+- `Type::I128` and `Val::I128(u128)` added. Interpreter reads/writes 16 bytes;
+  `int_sem` rejects I128 arithmetic (no i64 representation).
+- `mem_forward`/`sroa` use 16-byte size; bridge maps CLIF `I128`.
+- Tests: 73 RIR (4 memory, 8 sroa) + 8 bridge; `./y.sh build` exit 0; h22
+  (`u128` array) prints 42 with `sroa fired`; h20/h21 unchanged.
+
+## Session (2026-11-23, Fase 2 step 17) — SROA
+- New `rakit-ir/src/sroa.rs`: promote non-escaping scalar slots with constant
+  load/store keys. Phi nodes are added as block params at dominance-frontier
+  joins, then a dominator-tree rename replaces loads and drops stores.
+- Skip dynamic addresses, load-before-store, overlapping access ranges, and
+  phis at the entry block. Remove slots with no remaining `StackAddr` and
+  renumber the rest.
+- Wire into `RirPass` after `mem_forward`/`optimize`:
+  `simplify -> optimize -> mem_forward -> optimize -> sroa -> optimize ->
+  div_test -> if_convert -> gvn -> licm -> optimize`.
+- Tests: 71 RIR (7 sroa) + 8 bridge; `./y.sh build` exit 0; h17-h21 outputs
+  unchanged (`30/24/11/11/42`).
+
+## Session (2026-11-23, Fase 2 step 16) — liveness DSE
+- `mem_forward::dse` now uses byte-range liveness across the CFG:
+  per-block `used`/`defined`, `live-in`/`live-out` fixed point, then a
+  backward scan removes stores whose bytes are not live after them.
+- Dynamic store/load covers the whole slot. Stores overwritten later in the
+  same block or a successor are now removed; stores read in a successor stay.
+- Tests: 64 RIR (11 mem_forward) + 8 bridge; `./y.sh build` exit 0; h20/h21
+  unchanged (`11`/`42`).
+
+## Session (2026-11-23, Fase 2 step 15) — dynamic addresses
+- `mem_forward` now recognizes `Copy`, `Add` with constants, `Select`, and
+  `StackAddr + dynamic index`. `Const` and `Dyn` keys are matched separately.
+- A dynamic store kills all facts for its slot; a dynamic load disables DSE for
+  that slot. Constant stores are removed only without a dynamic load; dynamic
+  stores only when the slot has no loads.
+- Tests: 61 RIR (8 mem_forward) + 8 bridge; `./y.sh build` exit 0; h21
+  (`as_mut_ptr().add(i & 3)`) prints 42 and logs `mem_forward fired`.
+
+## Session (2026-11-23, Fase 2 step 14) — store forwarding + DSE
+- New `rakit-ir/src/mem_forward.rs`: track direct `StackAddr` values and
+  `Copy` aliases, require non-escaping private slots and in-bounds accesses.
+- Forward `store` -> later `load` within and across blocks using a
+  must-analysis over predecessors; replace loads with `Copy`.
+- Remove stores whose byte ranges are never loaded anywhere (conservative
+  global DSE), then let `optimize` clean up.
+- Wire into `RirPass` after `simplify`/`optimize`:
+  `simplify -> optimize -> mem_forward -> optimize -> div_test -> if_convert
+  -> gvn -> licm -> optimize`.
+- Tests: 58 RIR (5 mem_forward) + 8 bridge; `./y.sh build` exit 0; h20/h19
+  print 11 and log `mem_forward fired`.
+
+## Session (2026-11-23, Fase 2 step 13) — memory bridge
+- RIR: `StackSlot`/`StackSlotData`, `Function.stack_slots`, `Inst::StackAddr`,
+  `Inst::Load`, `Inst::Store` (scalar, constant offset); builder helpers.
+- Bridge `rakit-opt/src/rir.rs` imports fixed stack slots and
+  `stack_addr`/`load`/`store`/`load_no_offset`/`store_no_offset`; export
+  recreates slots and memory ops. Addresses are `I64`.
+- Interpreter: stack-slot arena with bounds checks; `Val::P` addresses.
+- Verifier checks slot range, address type, load/store types.
+- Passes stay conservative: GVN/LICM skip memory ops; if-convert rejects arms
+  with memory; DCE keeps loads/stores.
+- Tests: 53 RIR (3 memory) + 8 bridge; `./y.sh build` exit 0; h19 (array via
+  `get_unchecked`) imports, logs simplify/gvn, prints 11 like LLVM.
+
+## Session (2026-11-23, Fase 2 step 12) — LICM
+- New `rakit-ir/src/licm.rs`: finds natural loops from back edges + dominators,
+  requires a unique outside predecessor ending in `jump` to the header, and
+  hoists pure instructions whose operands are defined outside the loop and
+  dominate the preheader.
+- Skips div/rem/fdiv (speculation), loops without a preheader, and loops whose
+  preheader does not dominate the whole body. Runs to a fixpoint so invariant
+  chains hoist in successive rounds.
+- Shared `predecessors/rpo/dominators/dominates` moved into `cfg_util`; `gvn`
+  and `simplify` now use them.
+- `RirPass` order:
+  `simplify -> optimize -> div_test -> if_convert -> gvn -> licm -> optimize`.
+- Tests: 50/50 (6 div_test + 7 gvn + 7 if_convert + 15 ir + 4 licm +
+  11 simplify).
+- End-to-end: `k` (x*y only inside a loop) logs `licm fired` and prints 24;
+  `h` logs `gvn fired` + `licm fired` and prints 30, both identical.
+
+## Session (2026-11-23, Fase 2 step 11) — block merging in simplify
+- `simplify` now also merges a parameterless block with a single predecessor
+  when the predecessor ends in `jump` with no args: the block body is appended
+  to the predecessor and the block is removed (values stay defined).
+- Does not merge across a `brif` edge, a block with params, or a block with
+  multiple predecessors.
+- Tests: 46/46 (6 div_test + 7 gvn + 7 if_convert + 15 ir + 11 simplify).
+- End-to-end: `h` (loop), `pick` and `pick2` all log `simplify fired` with
+  `RAKIT_RIR=1 RAKIT_RIR_DEBUG=1`; outputs 30, `11 12 1`, `8 18`, identical.
+
+## Session (2026-11-23, Fase 2 step 10) — global GVN
+- `gvn` is now global: computes predecessors, RPO and immediate dominators
+  (Cooper-Harvey-Kennedy), inherits the expression table from the immediate
+  dominator, and only merges an expression when the first result dominates it.
+- Unreachable blocks fall back to local numbering.
+- Tests: 43/43 (6 div_test + 7 gvn + 7 if_convert + 15 ir + 8 simplify). New:
+  merge across dominating blocks, no merge across sibling branches, merge in a
+  join dominated by the entry.
+- End-to-end: a loop that computes `x*y` before the loop and again inside it
+  logs `gvn fired` with `RAKIT_RIR=1 RAKIT_RIR_DEBUG=1` and prints 30,
+  identical to normal.
+
+## Session (2026-11-23, Fase 2 step 9) — CFG simplify
+- New `rakit-ir/src/simplify.rs`: removes blocks unreachable from entry and
+  collapses empty forwarding blocks (`nop*; jump target` with no params),
+  redirecting both `jump` and `brif` edges; blocks/values are renumbered.
+- Forwarders whose `nop` result is used outside are left alone. The entry block
+  is never collapsed.
+- Shared `cfg_util::{remove_blocks, remove_values}` moved out of `if_convert`.
+- `RirPass` order:
+  `simplify -> optimize -> div_test -> if_convert -> gvn -> optimize`.
+- Tests: 41/41 (6 div_test + 5 gvn + 7 if_convert + 15 ir + 8 simplify).
+- End-to-end: `pick` with `RAKIT_RIR=1 RAKIT_RIR_DEBUG=1` logs
+  `simplify fired` (dead block removed) then `if_convert fired`; output
+  `11 12 1`, identical to normal.
+
+## Session (2026-11-23, Fase 2 step 8) — multi-value if_convert + local GVN
+- `if_convert` now handles joins/returns carrying any number of values
+  (including zero), not just one. Two identical `if`s compile to a two-param
+  join; the pass emits one `select` per join param.
+- New `rakit-ir/src/gvn.rs`: local value numbering keyed by opcode/type/operands;
+  duplicate pure instructions become `Copy` of the first result. `Hash` derives
+  added to `Type`, `BinOp`, `IntCc`, `FloatCc`.
+- `RirPass` order: `optimize -> div_test -> if_convert -> gvn -> optimize`.
+- Tests: 33/33 (6 div_test + 5 gvn + 7 if_convert + 15 ir). New: two-value
+  join, duplicate add/constant/select, different types, cross-block non-merge.
+- End-to-end: `pick2(c,x,y) = { let a = if c {x} else {y}; let b = ...; a+b }`
+  with `RAKIT_RIR=1 RAKIT_RIR_DEBUG=1` logs `if_convert fired` then
+  `gvn fired`, prints `8 18`, identical to normal.
+
+## Session (2026-11-23, Fase 2 step 7) — `if_convert` migrated to RIR
+- New `rakit-ir/src/if_convert.rs`: converts a two-way diamond (`brif` to two
+  short arms that `jump` to a common join or both `return`) into a `select` in
+  the head, then removes the arms and their now-dead values (block and value
+  indices are renumbered).
+- Conservative limits: arms have no params, one predecessor, <= 8 insts, no
+  div/rem/fdiv, and no arm-defined value is used outside the arms.
+- `RirPass` runs it after `div_test` and re-runs `optimize`.
+- Tests: 27/27 (6 div_test + 6 if_convert + 15 ir; new: simple join diamond,
+  head-value arms, return arms, skip division, skip params, skip large arm).
+- End-to-end: `RAKIT_RIR=1 RAKIT_NO_IFCONV=1` on
+  `if c { x + 1 } else { x + 2 }` logs `[rir] if_convert fired` and prints
+  `11 12 1`, identical to the normal build.
+
+## Session (2026-11-23, Fase 2 step 6) — narrow-type semantics + div_test
+- New `rakit-ir/src/int_sem.rs`: `width`/`mask`/`wrap`/`sign_extend`/
+  `shift_amount` plus shared `eval_bin`/`eval_icmp`. Values are zero-extended
+  bit patterns per type; signed ops sign-extend, shifts mask by `width-1`.
+- `interp.rs` and `opt.rs` now use `int_sem` for integers, so `I8/I16/I32`
+  arithmetic wraps and signed compares are correct in both execution and
+  constant folding.
+- `div_test` now covers `I8/I16/I32/I64` and computes a width-specific inverse
+  (`C^-1 mod 2^bits`) and threshold (`(2^bits-1)/odd`).
+- Tests: `cargo test --manifest-path rakit-ir/Cargo.toml` -> 21/21 (6 div_test
+  + 15 ir; new: narrow wrap/sign-extend, shift amount, I32 wrap, narrow
+  constant folding, narrow inverse, narrow div_test).
+- End-to-end: `RAKIT_RIR=1 RAKIT_NO_DIVTEST=1` on `u32 % 3` and `u8 % 3` logs
+  `[rir] div_test fired` for both and prints `1 2 4294967295 1 2`, identical
+  to the normal build.
+
+## Session (2026-11-23, Fase 2 step 5) — `div_test` covers even divisors in RIR
+- `rakit-ir/src/div_test.rs` now also handles `C = 2^s * odd` and powers of two
+  for `I64`: mask `x & (2^s - 1)` must be zero, plus the odd-divisor
+  multiply-compare; the two Bool tests combine with `select(a, b, false)` and
+  `ne` inverts with `select(is_zero, false, true)`.
+- The rewrite now inserts a prologue of new instructions and replaces the
+  original `icmp` with `Copy(rr, Bool, is_zero)`; `optimize` then DCEs the
+  `urem`.
+- Tests: 15/15 (the even/power-of-two test now asserts the rewrite fires for
+  `4`, `8`, `12` and for `ne` on `4`).
+- End-to-end: `RAKIT_RIR=1 RAKIT_NO_DIVTEST=1` on `x % 12 == 0` and
+  `x % 8 == 0` logs `[rir] div_test fired` for both and prints `1 2 1 1 2`,
+  identical to the normal build.
+
+## Session (2026-11-23, Fase 2 step 4) — `div_test` migrated to RIR
+- `rakit-ir/src/div_test.rs`: RIR port of the CLIF divisibility fold for `I64`
+  and odd `C > 1`: `icmp eq/ne (urem x, C), 0` -> `imul x, C^-1` +
+  `icmp ule` (and `select` for `ne`). `run()` resolves `Copy` chains and finds
+  the defining `urem`; `RirPass` calls it after `optimize` and runs `optimize`
+  again to DCE the now-dead `urem`.
+- Even divisors, narrower types and `brif`-on-remainder stay in the CLIF pass:
+  RIR `brif` takes `Bool`, and RIR has no `uextend`/Bool-`band` yet.
+- Tests: `cargo test --manifest-path rakit-ir/Cargo.toml` -> 15/15 (4 new:
+  odd `eq`, odd `ne`, even/power-of-two skipped, inverse sweep).
+- End-to-end: `RAKIT_RIR=1 RAKIT_NO_DIVTEST=1` (CLIF pass disabled) on
+  `fn f(x: u64) -> u64 { if x % 3 == 0 {1} else {2} }` logs `[rir] div_test
+  fired` + `[rir] optimized` and prints `1 2 1`, same as the normal build.
+
+## Session (2026-11-23, Fase 2 step 3) — RIR-only folds that fire end-to-end
+- `rakit-ir/src/opt.rs` now also folds, for integer types:
+  `x - x -> 0`, `x ^ x -> 0`, `x & x -> x`, `x | x -> x`, `icmp x, x` to
+  true/false per condition, `select(c, x, x) -> x`, and
+  `brif(c, b, args, b, args) -> jump b`.
+- Unit tests: `cargo test --manifest-path rakit-ir/Cargo.toml` -> 11/11
+  (4 new: icmp same operand, select same arms, bin same operand, brif same
+  target).
+- End-to-end: `RAKIT_RIR=1` on `x & x` / `x | x` logs `[rir] optimized` and the
+  binary prints the same output as the normal build (`1 2 0 0 5 6`). cg_clif
+  already folds `x ^ x`, `x - x`, `x << 0` and `if c { x } else { x }`, so only
+  `&`/`|` reach RIR here.
+- Debug: `RAKIT_RIR_DEBUG=1` also dumps the CLIF of `no-change` functions,
+  which is how the surviving `band`/`bor` were located.
+
+## Session (2026-11-23, Fase 2 step 2) — CLIF<->RIR bridge + optional `RirPass`
+- `rakit-opt/src/rir.rs`: `import(&Function) -> Option<rakit_ir::Function>` and
+  `export(&rir, &Signature) -> Option<Function>` for a conservative scalar
+  subset (constants, int/float binops, icmp/fcmp, select, block params,
+  jump/brif/return). Calls, memory, stack slots, globals and multi-result
+  instructions are refused, so unsupported functions are left untouched.
+- **Aliases are the first blocker**: cg_clif emits `vN -> vM` heavily. Without
+  `dfg.resolve_aliases` every real function fails to import (a value used in
+  `return` has no defining instruction). `lookup`/`map_value` resolve both ways.
+- **CLIF bools are `i8`**; RIR has a distinct `Bool`. `as_bool` inserts
+  `icmp ne c, 0` for `brif`/`select` conditions, so functions with `i8`
+  parameters import. A function *returning* a bool still fails the RIR verifier
+  (Bool vs I8) and is skipped.
+- `RirPass` runs first in the pipeline but is a no-op unless `RAKIT_RIR=1`.
+  `RAKIT_RIR_FORCE=1` re-exports even when the optimizer changes nothing (this
+  is how the export path is validated on real CLIF), `RAKIT_RIR_DEBUG=1` logs
+  per-function skip/no-change/roundtrip decisions.
+- Tests: `cargo test --manifest-path rakit-opt/Cargo.toml` -> 7/7 (5 bridge
+  tests: add round-trip, branch folding, block params, floats, unsupported
+  rejection). End-to-end: `RAKIT_RIR=1 RAKIT_RIR_FORCE=1` on a `while` loop and
+  a bool-parameter `if` gives output identical to the normal build.
+- The RIR optimizer only does constant folding, algebraic identities, branch
+  folding and DCE -- all already done by Cranelift's egraph -- so `RirPass`
+  usually reports `no-change`. This step delivers the bridge and the plumbing,
+  not a speedup.
+
+## Session (2026-11-23, Fase 2 step 1) — `rakit-ir` mid-level IR foundation
+- New pure crate `rakit/rakit-ir` (no dependencies): SSA IR (`ir.rs`), builder,
+  verifier (single definition, dominance, types), optimizer (`opt.rs`:
+  constant folding + algebraic identities + branch folding + DCE), and a
+  reference interpreter (`interp.rs`).
+- Values keep stable indices, so folding rewrites an instruction in place and
+  DCE turns dead instructions into `Inst::Nop`; no renumbering yet.
+- `cargo test --manifest-path rakit-ir/Cargo.toml` → 7/7 pass (integer/float
+  folding, branch folding, DCE, use-before-def rejection, block params/branch
+  args, icmp+select).
+- Not wired into the compiler yet: next step is the CLIF↔RIR bridge, then move
+  passes onto RIR one at a time.
+
+## Session (2026-11-23, later) — extract the optimization pipeline into `rakit-opt`
+- New crate `rakit/rakit-opt/` (package `rakit-opt`) owns the CLIF-level
+  optimization layer: `PassManager`, `Analyses` (CFG/dominator/loop, cached and
+  invalidated per pass), `tunables`, `passtime`, and the seven first-party
+  passes (inliner, rec_loop, store_forward, div_test, if_convert, unroll,
+  sincos).
+- `rakit/src/base.rs` now builds a `PassManager` and runs it, instead of calling
+  the passes ad hoc. The inliner stays out of the pipeline because it uses
+  `Context::inline`.
+- Moved files had `rustc_data_structures::fx` replaced by `std::collections`
+  aliases, and `pub(crate)` widened to `pub`, so `rakit-opt` has no
+  rustc-private dependency and can be built/tested on its own.
+- `Cargo.lock` regenerated (only the `rakit-opt` entry added). Verified:
+  `./y.sh build --sysroot rakit` succeeds, `dist/bin/rustc-rakit` compiles and
+  runs a sort/filter program (`sum=499500 div3=33`), and `RAKIT_PASS_TIME=1`
+  shows store_forward/unroll/if_convert/div_test running via the manager.
+- Branch `rakit-middle-end`, PR targets `replace-main-with-cgclif-experiments`.
 
 ## Session (2026-11-23) — rebrand the modified fork to Rakit
 Only the **modified** backend was rebranded to **Rakit**; the upstream baseline
@@ -27,6 +367,36 @@ the modified tree's source, docs, or scripts.
   `cargo check`/`cargo build --lib` clean in `rakit`, and
   `./y.sh build --sysroot rakit` produced `rakit/dist/bin/rustc-rakit` plus
   its Rakit-compiled std sysroot; a hello-world compiled and ran (`sum=5050`).
+
+## Session (2026-11-23) — Phase 3 backend + RIR gap closure (LANDED locally)
+- **Phase 3 implemented** in `rakit/rakit-ir/src/backend/`: `mach.rs`
+  (machine IR), `mod.rs` (`InstructionSelector`, `RegisterAllocator`,
+  `BackendError`), `isel.rs` (`RirSelector`), `regalloc.rs` (`LinearScan` with
+  liveness, graph coloring, spills), `exec.rs` (machine interpreter).
+  Object-safe traits; `RAKIT_CUSTOM_BACKEND=1` runs ISel+regalloc as a
+  validated alternate path (CLIF remains the production emitter).
+- **Gap closure**: `I128` arithmetic/compare in `int_sem` + interpreter;
+  direct/indirect calls, libcalls/known-symbol targets, multi-result calls in
+  RIR/bridge; `run_with` / `run_with_indirect` interpreter callbacks; SROA of
+  dynamic addresses into one-element slots (valid index is necessarily zero).
+  Verifier, DCE, cfg remapping, and `External` now handle all call forms.
+- **RIR default changed**: runs by default for **executable user crates**, but
+  skips std crates (`core`, `std`, `alloc`, `compiler_builtins`, `unwind`,
+  `rustc_*`) until the bridge is validated against the whole stdlib.
+  `RAKIT_RIR=1` forces on; `RAKIT_NO_RIR=1` forces off. Enabling it for std
+  still ICEs in `core`, so the skip is deliberate.
+- **Bug found/fixed**: `RirPass` overwrote `new_func.params` with the old
+  table after export; the new `ExternalName::User` indices then pointed at the
+  wrong names. `h26` (function pointer) segfaulted until that assignment was
+  removed. Multi-result support also needed `result_values()` in the verifier.
+- **Validation**: `./y.sh build` exit 0 (13–14 s); `cargo test` in
+  `rakit-ir` = 85 tests / 0 failed, `rakit-opt` = 11 / 0; `h20`–`h26` output
+  identical for default-RIR, `RAKIT_NO_RIR=1`, and forced `RAKIT_RIR=1`
+  (including `I128` array, direct call, libcall, and indirect-call programs);
+  `RAKIT_CUSTOM_BACKEND=1 RAKIT_RIR_DEBUG=1` logs `custom backend: 8 vregs, 8
+  regs, 0 spills` for `choose` in `h24`.
+- **Docs**: README bridge/SROA/I128/calls and Phase 3 sections updated.
+- **Push**: pending user-supplied PAT; branch `rakit-middle-end`.
 
 ## Session (2026-11-22, "win everything") — why the remaining p1/p2/p3/p4/p8/p9 gaps are architectural
 Ran the full per-benchmark bottleneck hunt (with RAKIT dumps via `--emit=llvm-ir`,
