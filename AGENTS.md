@@ -1,3 +1,49 @@
+## Session (2026-11-24, branch `rakit-exp5`) — x64 omit-FP: implemented, correct, RUNTIME-NEUTRAL (reverted)
+
+- **Outcome:** implemented full omit-frame-pointer for x64 (mirroring RISC-V),
+  built the whole sysroot with it, validated correct, measured **neutral**, and
+  **reverted**. This closes the biggest open runtime lever from the `rakit-exp4`
+  blocker map — don't re-attempt it for runtime.
+- **Recipe that worked (reverted; keep for reference):**
+  - `isa/x64/abi.rs` `compute_frame_layout`: `setup_area_size = if
+    flags.preserve_frame_pointers() {16} else {8}`, and **pad `clobber_size +=
+    8`** when omitting. Dropping the 8-byte `push %rbp` leaves the frame 8 bytes
+    short of the 16-byte call-site alignment, so add the missing 8 to the
+    clobber area — it is reserved *above* the spill/fixed slots, so no slot
+    offset shifts.
+  - `isa/x64/abi.rs` `gen_prologue_frame_setup` / `gen_epilogue_frame_restore`:
+    early-return an empty vector when `!flags.preserve_frame_pointers()`.
+  - Incoming stack args RBP → RSP in **both** lowering paths (they must agree):
+    `args.rs` `SyntheticAmode::finalize` (`sp_offset = tail_args_size +
+    setup_area_size + clobber_size + fixed_frame_storage_size +
+    outgoing_args_size; addr = rsp + sp_offset - offset`) and
+    `external.rs` `From<SyntheticAmode> for asm::Amode` (`base: Gpr::RSP`, same
+    `-offset`); `emit.rs` `incoming_arg_offset = tail_args_size +
+    setup_area_size + clobber_size + fixed_frame_storage_size +
+    outgoing_args_size`. (Same formula as `isa/riscv64/inst/args.rs:124-149`.)
+- **Correctness (validated before revert):** after `rm -rf build/stdlib_target`
+  (the backend `.so` is not fingerprinted, so std keeps the old lowering
+  otherwise) and a full rebuild, **all 15 bench outputs are byte-identical to
+  LLVM**; a 10-arg `i64` fn and a 10-arg `f64` fn (stack-passed args) print
+  `883500 784500`, identical to LLVM — i.e. the new RSP-relative incoming-arg
+  path is right. Hot user/core fns confirmed FP-less in disasm: `fib` and
+  `SipHasher::write` compile to `sub $N,%rsp; ...` with **no** `push %rbp` /
+  `mov %rsp,%rbp`.
+- **Runtime A/B (cpu ms, 21 reps, FP → omit-FP):** p1 100→102, p3 55→56,
+  p4 83→83, p2 48→48, p8 21→20, p9 33→34 — all within ±3% noise. Artifact size
+  ±0.0% (e.g. p2 4143368→4141728 B).
+- **Why reverted:** neutral on every axis yet it carries real correctness risk
+  for code we don't exercise: `emit.rs:1893` `emit_return_call_common_sequence`
+  **asserts** `preserve_frame_pointers()` (so `return_call` would ICE), and
+  `verifier/mod.rs:660` rejects `get_frame_pointer`/`get_return_address` without
+  FP. Net: no upside, real downside — not worth landing.
+- **Conclusion:** the x64 frame-pointer prologue/epilogue (~6 instructions per
+  call: `push rbp; mov rsp,rbp` … `mov rbp,rsp; pop rbp`) is **not** a
+  bottleneck on these workloads — they are compute/memory/vectorization bound,
+  and even call-heavy `p3` (`fib`) is call-*latency* bound, so the prologue
+  instructions hide under the call latency. Remaining backend levers are
+  regalloc quality (p8) and a loop vectorizer (p4), both large.
+
 ## Session (2026-11-24, branch `rakit-exp4`) — runtime probe (no pass-level win), x64 omit-FP blocker map
 
 - **Branch:** from `replace-main-with-cgclif-experiments` after PR #14 merged
