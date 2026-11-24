@@ -154,6 +154,19 @@ pub fn collapse_forwarders_enabled() -> bool {
     *V.get_or_init(|| !flag("RAKIT_NO_COLLAPSE"))
 }
 
+/// Whether rotation applies to every matching loop (`RAKIT_ROTATE_ALL`), not
+/// just call-bound ones.
+pub fn rotate_all() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| flag("RAKIT_ROTATE_ALL"))
+}
+
+/// Whether the loop-rotation pass runs (`RAKIT_NO_ROTATE` disables it).
+pub fn rotate_enabled() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| !flag("RAKIT_NO_ROTATE"))
+}
+
 /// Rakit `opt_level` override (`RAKIT_OPT_LEVEL`).
 pub fn opt_level() -> Option<&'static str> {
     static V: OnceLock<Option<String>> = OnceLock::new();

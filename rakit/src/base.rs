@@ -192,6 +192,10 @@ pub(crate) fn compile_fn(
     // and the shared analysis cache; each pass is independent of the others.
     // `rec_loop` and `store_forward` must precede `unroll`, whose affine
     // analysis rejects any loop that still contains a call or touches memory.
+    // Rotation runs after `unroll` so the unroller still sees the original
+    // top-tested shape; it then turns the remaining call-bound loops into
+    // bottom-tested ones (one branch per iteration instead of a test plus a
+    // back-jump).
     let mut pipeline = rakit_opt::PassManager::new();
     pipeline
         .push(Box::new(rakit_opt::RecLoopPass))
@@ -199,6 +203,7 @@ pub(crate) fn compile_fn(
         .push(Box::new(rakit_opt::DivTestPass))
         .push(Box::new(rakit_opt::IfConvertPass))
         .push(Box::new(rakit_opt::UnrollPass))
+        .push(Box::new(rakit_opt::RotatePass))
         .push(Box::new(rakit_opt::SincosPass));
     let mut analyses = rakit_opt::Analyses::new();
     let mut pctx =

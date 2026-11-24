@@ -15,5 +15,6 @@ pub mod tunables;
 pub use analyses::Analyses;
 pub use pass::{Pass, PassCtx, PassManager};
 pub use passes::{
-    DivTestPass, IfConvertPass, RecLoopPass, SincosPass, StoreForwardPass, UnrollPass,
+    DivTestPass, IfConvertPass, RecLoopPass, RotatePass, SincosPass, StoreForwardPass,
+    UnrollPass,
 };

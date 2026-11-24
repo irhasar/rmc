@@ -4,6 +4,7 @@ pub mod div_test;
 pub mod if_convert;
 pub mod inliner;
 pub mod rec_loop;
+pub mod rotate;
 pub mod sincos;
 pub mod store_forward;
 pub mod unroll;
@@ -81,8 +82,20 @@ impl Pass for UnrollPass {
     }
 }
 
-pub struct SincosPass;
+pub struct RotatePass;
 
+impl Pass for RotatePass {
+    fn name(&self) -> &'static str {
+        "rotate"
+    }
+
+    fn run(&mut self, pctx: &mut PassCtx<'_>) -> bool {
+        passtime::time(passtime::ROTATE, || rotate::run(&mut pctx.ctx.func));
+        true
+    }
+}
+
+pub struct SincosPass;
 impl Pass for SincosPass {
     fn name(&self) -> &'static str {
         "sincos"

@@ -1,3 +1,47 @@
+## Session (2026-11-24) — loop rotation pass (LANDED locally, p3 −5%)
+
+- **New pass** `rakit-opt/src/passes/rotate.rs`, wired in `src/base.rs` after
+  `unroll` and before `sincos`. Rakit lowers a guarded loop to a header that
+  tests at the top plus a latch that `jump`s back, so every iteration costs a
+  test *and* an unconditional back-jump. Rotation makes the body its own back
+  edge: the header becomes a one-shot guard, and the latch branches
+  `brif(cond2, body(next), exit(...))` with the test recomputed from the latch's
+  next-state arguments. One branch per iteration, no header re-entry.
+- **Where it fires:** only call-bound loops by default (`RAKIT_ROTATE_ALL=1`
+  widens it; that regressed `p8_minmax` +15.7% by disturbing the unroller's lane
+  loop, so it stays off). The win is the recursive-to-loop `fib` kernel:
+  `p3_calls` 59 → 56 ms (−5%), the `h_calls` heldout small. All other runtime
+  rows are within noise.
+- **Soundness model (local, not loop-analysis):** the rewrite replaces
+  `jump H(next)` with the expansion of H's `brif` at `params = next`. That is
+  valid only if (a) H does nothing but a `brif` on one `icmp`, (b) the body arm
+  passes the header params through unchanged, (c) `next` is positional to H's
+  params, and (d) the recomputed test and exit edge depend only on H params
+  (→ `next`), constants, or values defined outside the loop. Each is gated.
+- **The bug that cost the round:** Rakit's frontend lets a block read a
+  *dominating* block's values, so the loop body often reads the header's block
+  parameters (`v1`) directly instead of the body block's own params. The first
+  version bypassed the header and left `v1` pinned at the entry value →
+  **infinite loop**. Caught by `coretests::ptr::align_offset_zst` (100% CPU,
+  7+ min) after `./y.sh test`. Fix `header_values_escape`: reject the loop if
+  either arm's subgraph reads a header parameter or non-constant header result
+  (`dfg.inst_args` + branch args, aliases resolved). Constants are fine (same
+  every iteration). Minimal repro: the `--test` build of that test at
+  `-C opt-level=0` hangs; without rotation it passes.
+- **Second guard `header_has_effects`:** skipping the header also skips any
+  call/store/trapping op/volatile load in it, so only pure non-terminator header
+  instructions are allowed (modelled on `if_convert`'s `is_speculatable`).
+- **Compile cost removed:** the first version walked the successor subgraph for
+  every `brif` block (O(V²) on branchy functions; +6–9 ms CPU on `p2_mem`).
+  A loop header must be the target of some `jump`, so `run()` collects
+  `jump_targets` once and only walks headers in that set. Compile cost is now 0
+  (`p2_mem` 158/218 ms with and without rotation).
+- **Knobs:** `RAKIT_NO_ROTATE` (off switch), `RAKIT_ROTATE_ALL` (widen, off).
+- **Verification:** `./y.sh build` exit 0; `./y.sh test --sysroot rakit` →
+  65 suites / 25,368 passed / 0 failed (needs `./y.sh prepare` for
+  rand/regex/graviola first); `bench/allaxes.sh` 45/45 rows `ok` (output
+  validated vs LLVM). `p3` output byte-identical; `fib` disasm has no back-`jmp`.
+
 ## Session (2026-11-23) — `rakit-ir` removed, `rakit-opt` kept
 - **Decision:** delete the separate RIR crate and its CLIF↔RIR bridge. Keep
   `rakit-opt` as the production pass layer; it owns the passes that produce the
