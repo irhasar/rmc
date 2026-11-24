@@ -189,11 +189,16 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
       `bench/tests/t_vectorize.rs` (+ `regressions.sh` `check`) covers
       unit/strided/**zero-trip (n=0 leaves dst untouched)**/overlap/in-place/
       tail/u8; the `overlap` fixture uses `dst = src+1` so a store feeds a later
-      read (a real overwrite hazard), and `regressions.sh` **also asserts the M
-      binary contains `pmuludq`** — output equality alone cannot prove the
-      vectorizer ran (with `RAKIT_NO_VECTORIZE=1` the output still matches but
-      there is no packed multiply). Removed the committed `rustc-ice-*.txt`
-      dumps and gitignored them.
+      read (a real overwrite hazard). `regressions.sh` asserts SIMD **per
+      single-loop fixture**, not binary-wide (a tail loop could otherwise mask a
+      missed unit loop): `t_vectorize_unit` (only the n=1000 unit loop) must
+      contain `pmuludq`, proving *that* loop vectorized; `t_vectorize_guard`
+      (only an n=3 sub-vector loop) must contain `pmuludq`, proving the SIMD
+      guard/body is **generated** while it runs **zero** vector iterations (the
+      n=0 case is the unmatched scalar path, so it cannot cover the guard).
+      Output equality alone is insufficient: with `RAKIT_NO_VECTORIZE=1` the
+      output still matches but `pmuludq` is absent. Removed the committed
+      `rustc-ice-*.txt` dumps and gitignored them.
 
 ## Session (2026-11-24, branch `rakit-exp7`) — p9 reloads are real, but NOT soundly hoistable with the existing flags (alias tags don't move loads)
 

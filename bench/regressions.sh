@@ -65,17 +65,24 @@ overlap 12968996556249723189
 inplace 12776226417588255163
 tail 6121779849389533154
 u8 2907005038580616411'
+check t_vectorize_unit 'unit 12776226417588255163'
+check t_vectorize_guard 'guard 17715399688492003866'
 
-# Output equality alone cannot prove the vectorizer ran. Require a packed
-# multiply (SSE2 lowering of i32x4.imul) in the Rakit binary.
-if command -v objdump >/dev/null 2>&1; then
-    if ! objdump -d "$TMP/t_vectorize_M" --no-show-raw-insn 2>/dev/null | grep -q pmuludq; then
-        echo "[regression] t_vectorize: no packed multiply (vectorizer did not run)" >&2
-        fail=1
+# Output equality alone cannot prove the vectorizer ran. Each fixture below
+# contains exactly one xor+imul loop, so a packed multiply (SSE2 lowering of
+# i32x4.imul) in the binary proves *that* loop was vectorized (a tail loop
+# elsewhere cannot satisfy the check). t_vectorize_guard (n=3) proves the SIMD
+# guard/body is generated even though it runs zero vector iterations.
+for fx in t_vectorize_unit t_vectorize_guard; do
+    if command -v objdump >/dev/null 2>&1; then
+        if ! objdump -d "$TMP/${fx}_M" --no-show-raw-insn 2>/dev/null | grep -q pmuludq; then
+            echo "[regression] $fx: no packed multiply (loop not vectorized / guard not generated)" >&2
+            fail=1
+        fi
+    else
+        echo "[regression] $fx: objdump unavailable, skipping SIMD assertion" >&2
     fi
-else
-    echo "[regression] t_vectorize: objdump unavailable, skipping SIMD assertion" >&2
-fi
+done
 
 if [ "$fail" -eq 0 ]; then
     echo "[regression] all fixtures passed"

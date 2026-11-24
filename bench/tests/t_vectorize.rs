@@ -49,7 +49,9 @@ fn main() {
         println!("strided2 {}", ck(&c));
     }
     {
-        // Zero-trip: n == 0 must leave the destination untouched.
+        // Zero-trip (n == 0): the matcher rejects zero bounds, so this is the
+        // scalar path; it must leave the destination untouched. The generated
+        // SIMD guard with zero vector iterations is covered by t_vectorize_guard.
         let a = vec![7u32; 4];
         let b = vec![9u32; 4];
         let mut c = vec![0xDEAD_BEEFu32; 4];
