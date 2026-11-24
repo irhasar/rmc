@@ -9,10 +9,15 @@ alias-region build:
   builds (`context.rs:389`) — runs whenever `opt_level != OptLevel::None`
   (`context.rs:192-195`). So "the flag makes it ON" was wrong; it runs because we
   optimize at all.
-- **A standalone CSE pass is still the wrong approach (measured).** The
-  block-local CSE pass in `rakit-exp5` produced **byte-identical** binaries
-  (PR #16): same-address loads within a block are already handled. A standalone
-  CSE pass is a no-op where it is safe and unsound where it is not.
+- **What was actually measured (scoped, not generalized).** The block-local CSE
+  pass in `rakit-exp5` produced **byte-identical** binaries (PR #16). That
+  establishes no gain for **that** pass only: it keyed on an **identical SSA
+  address value**, and the alias lookup itself requires matching address values
+  (`alias_analysis.rs:1353-1392`). It does **not** show that all safe load CSE is
+  useless — a pass that proves **address equivalence** (two distinct
+  `block_addr`/`stack_addr`/`iadd` values denoting the same location) could find
+  matches the exact-Value lookup misses. So a CSE is **not ruled out**, but it is
+  also **not shown to help**; it must be justified by evidence (see diagnosis).
 - **But the cause of the *surviving* reloads is UNVERIFIED.** `process_inst`
   (`alias_analysis.rs:1353-1389`) aliases a load only when a known value matches
   the same `MemoryLoc` — same SSA `address`, `last_store`/memory state, extent —
