@@ -79,6 +79,8 @@ check t_vectorize_i64 $'n=1000 add=17194792273410237731\nn=999 add=7573983905390
 check t_vectorize_f64 $'n=1000 add=12605502316359290979 mul=15193480026440175715\nn=999 add=16431287870010424977 mul=15840584383383207569\nn=5 add=4555731617307007401 mul=573423646804646313\nn=1 add=11364037426215188377 mul=671366010930788249\nn=0 add=1469598103934665603 mul=1469598103934665603'
 check t_vectorize_const 'u32mul=7406505972513382635 i64add=16879444138376719115 f32mul=10425260595837503587 f32sub=16288212200764297315'
 check t_vectorize_sum $'n=1000 u32=4213332 u64=6494044\nn=999 u32=4210927 u64=6481210\nn=5 u32=23274 u64=795\nn=3 u32=13985 u64=432\nn=1 u32=4660 u64=153\nn=0 u32=0 u64=0'
+check t_vectorize_bitops $'n=1000 and=8679198063293307935 or=17640510044461566455\nn=999 and=425701985508822469 or=16951716591865051082\nn=5 and=3321434351676732587 or=7594011638986234852\nn=2 and=11141768042474047163 or=14494034960203992247\nn=0 and=1469598103934665603 or=1469598103934665603'
+check t_vectorize_start $'s=0 mul=7406505972513382635 sum=4225677\ns=1 mul=6626696854460331983 sum=4221017\ns=3 mul=16778483497030676228 sum=4211692\ns=5 mul=12379647581177015243 sum=4202403\ns=1000 mul=10102475090843504739 sum=12345'
 
 # Output equality alone cannot prove the vectorizer ran. Each fixture below
 # contains exactly one xor+imul loop, so a packed multiply (SSE2 lowering of
@@ -147,6 +149,26 @@ if command -v objdump >/dev/null 2>&1; then
     qsd=$(objdump -d --disassemble=qsum "$TMP/t_vectorize_sum_M" --no-show-raw-insn 2>/dev/null)
     if ! printf '%s\n' "$qsd" | grep -q paddq; then
         echo "[regression] t_vectorize_sum: missing paddq in qsum" >&2
+        fail=1
+    fi
+    bd=$(objdump -d --disassemble=bandfn "$TMP/t_vectorize_bitops_M" --no-show-raw-insn 2>/dev/null)
+    if ! printf '%s\n' "$bd" | grep -q pand; then
+        echo "[regression] t_vectorize_bitops: missing pand in bandfn" >&2
+        fail=1
+    fi
+    od=$(objdump -d --disassemble=borfn "$TMP/t_vectorize_bitops_M" --no-show-raw-insn 2>/dev/null)
+    if ! printf '%s\n' "$od" | grep -qE '\bpor\b'; then
+        echo "[regression] t_vectorize_bitops: missing por in borfn" >&2
+        fail=1
+    fi
+    sm=$(objdump -d --disassemble=startmul "$TMP/t_vectorize_start_M" --no-show-raw-insn 2>/dev/null)
+    if ! printf '%s\n' "$sm" | grep -q pmuludq; then
+        echo "[regression] t_vectorize_start: missing pmuludq in startmul" >&2
+        fail=1
+    fi
+    ss=$(objdump -d --disassemble=startsum "$TMP/t_vectorize_start_M" --no-show-raw-insn 2>/dev/null)
+    if ! printf '%s\n' "$ss" | grep -q paddd; then
+        echo "[regression] t_vectorize_start: missing paddd in startsum" >&2
         fail=1
     fi
 fi

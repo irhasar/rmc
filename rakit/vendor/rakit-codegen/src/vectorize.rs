@@ -157,6 +157,7 @@ struct Plan {
     n: Bound,
     base_a: Value,
     base_c: Value,
+    init: Value,
     lanes: Lanes,
     op: Opcode,
     k: Option<i64>,
@@ -254,9 +255,6 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
         return None;
     }
     let init = pargs[0].as_value()?;
-    if iconst_i64(dfg, init)? != 0 {
-        return None;
-    }
     let bterm = func.layout.last_inst(b)?;
     let ir::InstructionData::Jump { destination: bnext, .. } = dfg.insts[bterm] else {
         return None;
@@ -375,8 +373,14 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
         (top, tx, ty, None)
     };
     let ok = match lanes {
-        Lanes::U32 => matches!(op, Opcode::Bxor | Opcode::Iadd | Opcode::Isub | Opcode::Imul),
-        Lanes::I64 => matches!(op, Opcode::Bxor | Opcode::Iadd | Opcode::Isub),
+        Lanes::U32 => matches!(
+            op,
+            Opcode::Bxor | Opcode::Band | Opcode::Bor | Opcode::Iadd | Opcode::Isub | Opcode::Imul
+        ),
+        Lanes::I64 => matches!(
+            op,
+            Opcode::Bxor | Opcode::Band | Opcode::Bor | Opcode::Iadd | Opcode::Isub
+        ),
         Lanes::F32 | Lanes::F64 => {
             matches!(op, Opcode::Fadd | Opcode::Fsub | Opcode::Fmul | Opcode::Fdiv)
         }
@@ -443,6 +447,7 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
         n,
         base_a: dfg.resolve_aliases(base_a),
         base_c: dfg.resolve_aliases(store_base),
+        init,
         lanes,
         op,
         k,
@@ -455,6 +460,7 @@ struct RPlan {
     preheader: Block,
     n: Bound,
     base: Value,
+    start: Value,
     init: Value,
     lanes: Lanes,
     op: Opcode,
@@ -522,9 +528,10 @@ fn match_reduction(func: &Function, h: Block) -> Option<RPlan> {
         return None;
     }
     let pargs: Vec<_> = destination.args(&dfg.value_lists).collect();
-    if pargs.len() != 2 || iconst_i64(dfg, pargs[0].as_value()?)? != 0 {
+    if pargs.len() != 2 {
         return None;
     }
+    let start = pargs[0].as_value()?;
     let init = pargs[1].as_value()?;
 
     let bterm = func.layout.last_inst(b)?;
@@ -632,7 +639,7 @@ fn match_reduction(func: &Function, h: Block) -> Option<RPlan> {
         None => Bound::Runtime(n_side),
     };
 
-    Some(RPlan { h, preheader, n, base: dfg.resolve_aliases(base), init, lanes, op: Opcode::Iadd })
+    Some(RPlan { h, preheader, n, base: dfg.resolve_aliases(base), start, init, lanes, op: Opcode::Iadd })
 }
 
 fn apply_reduction(func: &mut Function, p: RPlan) {
@@ -657,8 +664,7 @@ fn apply_reduction(func: &mut Function, p: RPlan) {
         let mut cur = FuncCursor::new(func).at_bottom(p.preheader);
         let zero = cur.ins().iconst(p.lanes.scalar(), 0);
         let zv = cur.ins().splat(vt, zero);
-        let iz = cur.ins().iconst(types::I64, 0);
-        cur.ins().jump(vh, &[iz.into(), zv.into()]);
+        cur.ins().jump(vh, &[p.start.into(), zv.into()]);
     }
     {
         let mut cur = FuncCursor::new(func).at_bottom(vh);
@@ -724,7 +730,6 @@ fn apply(func: &mut Function, p: Plan) {
 
     {
         let mut cur = FuncCursor::new(func).at_bottom(g);
-        let zero = cur.ins().iconst(types::I64, 0);
         let size = cur.ins().iconst(types::I64, p.lanes.size() as i64);
         let n = match p.n {
             Bound::Const(c) => cur.ins().iconst(types::I64, c),
@@ -755,7 +760,7 @@ fn apply(func: &mut Function, p: Plan) {
         let lim = cur.ins().iconst(types::I64, (u64::MAX / p.lanes.size()) as i64);
         let big = cur.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, n, lim);
         let ov = cur.ins().bor(ov, big);
-        cur.ins().brif(ov, h, &[zero.into()], vh, &[zero.into()]);
+        cur.ins().brif(ov, h, &[p.init.into()], vh, &[p.init.into()]);
     }
 
     {
@@ -798,6 +803,8 @@ fn apply(func: &mut Function, p: Plan) {
         };
         let combined = match p.op {
             Opcode::Bxor => cur.ins().bxor(va, other),
+            Opcode::Band => cur.ins().band(va, other),
+            Opcode::Bor => cur.ins().bor(va, other),
             Opcode::Iadd => cur.ins().iadd(va, other),
             Opcode::Isub => cur.ins().isub(va, other),
             Opcode::Imul => cur.ins().imul(va, other),
@@ -860,7 +867,10 @@ fn fconst_bits(dfg: &DataFlowGraph, v: Value) -> Option<(u64, bool)> {
 }
 
 fn is_commutative(op: Opcode) -> bool {
-    matches!(op, Opcode::Bxor | Opcode::Iadd | Opcode::Imul | Opcode::Fadd | Opcode::Fmul)
+    matches!(
+        op,
+        Opcode::Bxor | Opcode::Band | Opcode::Bor | Opcode::Iadd | Opcode::Imul | Opcode::Fadd | Opcode::Fmul
+    )
 }
 
 fn base_and_off(

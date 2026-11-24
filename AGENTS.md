@@ -284,6 +284,14 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
     as the back-edge arg. `bwsum` (4M×20 u32): **98.4 → 44.0 ms** (LLVM 12.9;
     7.6× → 3.4×). New `t_vectorize_sum` (u32 `paddd` / u64 `paddq`,
     n=1000/999/5/3/1/0); `regressions.sh` asserts both.
+  - **M3.7 LANDED: bitwise and/or + non-zero loop start.** Map ops extended with
+    `band`/`bor` (u32/i64, two-source and const) → `pand`/`por`. Both the map and
+    the reduction path now accept **any** loop start (not just 0): the guard /
+    vector entry passes the real `init`, so `for i in s..n` vectorizes from `s`
+    and the scalar tail covers `[s + k*per_vec, n)`; `s == n` is empty. New
+    `t_vectorize_bitops` (and/or, n=1000/999/5/2/0) and `t_vectorize_start`
+    (map + sum, s=0/1/3/5/1000); `regressions.sh` asserts `pand`/`por` in
+    `bandfn`/`borfn` and `pmuludq`/`paddd` in `startmul`/`startsum`.
 
 ## Session (2026-11-24, branch `rakit-exp7`) — p9 reloads are real, but NOT soundly hoistable with the existing flags (alias tags don't move loads)
 
