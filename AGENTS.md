@@ -241,6 +241,14 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
     runtime coverage is not skipped when no disassembler is present. Known miss (correct, scalar): a bound that the
     egraph rematerializes into the header (e.g. `n & mask`) is not hoisted, so
     that loop is not vectorized.
+  - **M3.3 LANDED: combine ops xor/add/sub (optional `* K`).** The matcher now
+    accepts `c[i] = (a[i] {^,+,-} b[i]) [* K]`, not just `xor * K`; operand order
+    is preserved for `sub`. Lowers to `pxor`/`paddd`/`psubd` (+ optional
+    `pmuludq`). `l3_bw` (`wrapping_add`) **143.7 → 89.8 ms** (LLVM 57.3; was
+    2.5×, now 1.57×). New `t_vectorize_ops` (add+sub in one address-taken
+    `fn ops2`) asserts `paddd` and `psubd` **inside `ops2`**; wired into
+    `regressions.sh` (and kept out of the `pmuludq`-presence loop, which only
+    applies to multiply shapes). Gate: suite **65 / 25,368 / 0**; allaxes ok.
 
 ## Session (2026-11-24, branch `rakit-exp7`) — p9 reloads are real, but NOT soundly hoistable with the existing flags (alias tags don't move loads)
 

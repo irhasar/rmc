@@ -73,6 +73,7 @@ small 17715399688492003866 tail4=true
 rem 6121779849389533154
 overlap 12968996556249723189'
 check t_vectorize_multi 'm1 12776226417588255163 m2 15151514424346961891'
+check t_vectorize_ops 'add 17194792273410237731 sub 10846146650447627395'
 
 # Output equality alone cannot prove the vectorizer ran. Each fixture below
 # contains exactly one xor+imul loop, so a packed multiply (SSE2 lowering of
@@ -96,6 +97,19 @@ if command -v objdump >/dev/null 2>&1; then
     mc=$(objdump -d --disassemble=two_loops "$TMP/t_vectorize_multi_M" --no-show-raw-insn 2>/dev/null | grep -c pmuludq)
     if [ "$mc" -lt 4 ]; then
         echo "[regression] t_vectorize_multi: only $mc pmuludq (expected >=4; a later loop stayed scalar)" >&2
+        fail=1
+    fi
+fi
+
+# Add/sub combines: ops2 must contain paddd (add) and psubd (sub), in-function.
+if command -v objdump >/dev/null 2>&1; then
+    od=$(objdump -d --disassemble=ops2 "$TMP/t_vectorize_ops_M" --no-show-raw-insn 2>/dev/null)
+    if ! printf '%s\n' "$od" | grep -q paddd; then
+        echo "[regression] t_vectorize_ops: no paddd (add loop not vectorized)" >&2
+        fail=1
+    fi
+    if ! printf '%s\n' "$od" | grep -q psubd; then
+        echo "[regression] t_vectorize_ops: no psubd (sub loop not vectorized)" >&2
         fail=1
     fi
 fi

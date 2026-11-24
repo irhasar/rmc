@@ -7,7 +7,7 @@
 //!
 //! Target: header `H(i: i64)` brifs on a trip `i < n` (constant or a
 //! loop-invariant runtime bound); single-block
-//! body `B` computes `c[i] = (a[i] ^ b[i]) * K` for loop-invariant base
+//! body `B` computes `c[i] = (a[i] {^,+,-} b[i]) [* K]` for loop-invariant base
 //! pointers, `addr = base + (i << 2)` (u32 lanes), then `i += 1` and jumps `H`.
 //!
 //! The transform never edits `H`/`B`. It inserts a runtime disjointness guard
@@ -86,7 +86,8 @@ struct Plan {
     base_a: Value,
     base_b: Value,
     base_c: Value,
-    k: i64,
+    op: Opcode,
+    k: Option<i64>,
 }
 
 fn match_header(func: &Function, h: Block) -> Option<Plan> {
@@ -276,30 +277,40 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
         return None;
     }
 
-    let (mop, mx, my) = binary(dfg, sargs[0])?;
-    if mop != Opcode::Imul {
+    // Store value: `combine(loadA, loadB)`, optionally `* K` for a constant K.
+    // Supported combines are the u32-lane ops xor / add / sub (all lower to
+    // I32X4 instructions); other shapes stay scalar.
+    let (top, tx, ty) = binary(dfg, sargs[0])?;
+    let (op, lhs, rhs, k) = if top == Opcode::Imul {
+        let (bx, kv) = if iconst_i64(dfg, ty).is_some() {
+            (tx, ty)
+        } else if iconst_i64(dfg, tx).is_some() {
+            (ty, tx)
+        } else {
+            return None;
+        };
+        let k = iconst_i64(dfg, kv)?;
+        let (xop, xa, xb) = binary(dfg, bx)?;
+        (xop, xa, xb, Some(k))
+    } else {
+        (top, tx, ty, None)
+    };
+    if !matches!(op, Opcode::Bxor | Opcode::Iadd | Opcode::Isub) {
         return None;
     }
-    let (bx, kv) = if iconst_i64(dfg, my).is_some() {
-        (mx, my)
-    } else if iconst_i64(dfg, mx).is_some() {
-        (my, mx)
+    let (la, lb) = (dfg.resolve_aliases(lhs), dfg.resolve_aliases(rhs));
+    let r0 = dfg.resolve_aliases(dfg.first_result(loads[0]));
+    let r1 = dfg.resolve_aliases(dfg.first_result(loads[1]));
+    // Keep operand order so `sub` (non-commutative) stays `lhs - rhs`.
+    let (base_lhs, base_rhs) = if la == r0 && lb == r1 {
+        (load_bases[0], load_bases[1])
+    } else if la == r1 && lb == r0 {
+        (load_bases[1], load_bases[0])
     } else {
         return None;
     };
-    let k = iconst_i64(dfg, kv)?;
-    let (xop, xa, xb) = binary(dfg, bx)?;
-    if xop != Opcode::Bxor {
-        return None;
-    }
-    let (la, lb) = (dfg.resolve_aliases(xa), dfg.resolve_aliases(xb));
-    let r0 = dfg.resolve_aliases(dfg.first_result(loads[0]));
-    let r1 = dfg.resolve_aliases(dfg.first_result(loads[1]));
-    if !((la == r0 && lb == r1) || (la == r1 && lb == r0)) {
-        return None;
-    }
 
-    for &base in &[load_bases[0], load_bases[1], store_base] {
+    for &base in &[base_lhs, base_rhs, store_base] {
         if !defined_outside(dfg, &func.layout, base, h, b) {
             return None;
         }
@@ -309,9 +320,10 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
         h,
         preheader,
         n,
-        base_a: dfg.resolve_aliases(load_bases[0]),
-        base_b: dfg.resolve_aliases(load_bases[1]),
+        base_a: dfg.resolve_aliases(base_lhs),
+        base_b: dfg.resolve_aliases(base_rhs),
         base_c: dfg.resolve_aliases(store_base),
+        op,
         k,
     })
 }
@@ -386,12 +398,22 @@ fn apply(func: &mut Function, p: Plan) {
         let va = cur.ins().load(types::I32X4, flags, addr_a, Offset32::new(0));
         let addr_b = cur.ins().iadd(p.base_b, off);
         let vx = cur.ins().load(types::I32X4, flags, addr_b, Offset32::new(0));
-        let xored = cur.ins().bxor(va, vx);
-        let k = cur.ins().iconst(types::I32, p.k);
-        let kv = cur.ins().splat(types::I32X4, k);
-        let m = cur.ins().imul(xored, kv);
+        let combined = match p.op {
+            Opcode::Bxor => cur.ins().bxor(va, vx),
+            Opcode::Iadd => cur.ins().iadd(va, vx),
+            Opcode::Isub => cur.ins().isub(va, vx),
+            _ => unreachable!(),
+        };
+        let val = match p.k {
+            Some(k) => {
+                let kc = cur.ins().iconst(types::I32, k);
+                let kv = cur.ins().splat(types::I32X4, kc);
+                cur.ins().imul(combined, kv)
+            }
+            None => combined,
+        };
         let addr_c = cur.ins().iadd(p.base_c, off);
-        cur.ins().store(flags, m, addr_c, Offset32::new(0));
+        cur.ins().store(flags, val, addr_c, Offset32::new(0));
         let four = cur.ins().iconst(types::I64, 4);
         let nxt = cur.ins().iadd(vb_i, four);
         cur.ins().jump(vh, &[nxt.into()]);
