@@ -1,7 +1,7 @@
 // Kernel-only timing probe: times init, the 20 kernel passes, and the hash
 // SEPARATELY (no subtraction between whole-process runs). Prints ns per phase.
 // Correctness check: `sum` must match between L and M. Needs BOTH builds:
-//   rustc -O bench/l3/ktime.rs -o ktime_L
+//   rustc +nightly-2026-11-17 -O bench/l3/ktime.rs -o ktime_L
 //   env -u RAKIT_HOST_LLVM rakit/dist/bin/rustc-rakit --target <host> \
 //       -C opt-level=3 bench/l3/ktime.rs -o ktime_M --edition 2021
 use std::time::Instant;
