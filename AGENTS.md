@@ -142,6 +142,66 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
      universal gate above. Only then is p4 unlocked safely.
   3. **M3.3** generalize ops (xor/add first), then integrate `addr_base`/private-slot.
 - Not implemented in code yet; recorded so the multi-session effort is grounded.
+  - **Blocker found (2026-11-24, branch `rakit-exp10`):** a `rakit-opt` CLIF pass
+    runs **before** the backend egraph. `base.rs:212` runs the pipeline; the
+    egraph + LICM run later inside `Context::compile` (`context.rs:195-203`), and
+    the `.opt.rakit` dump is written **after** compile (`base.rs:273`). At
+    pipeline time the L3 inner loop is **pre-SSA** — `[vecblock] block3
+    nparams=0 term=Jump`, induction in a stack slot — while the `block3(v7:i64)`
+    phi form exists **only post-egraph**. So the planned rakit-opt vectorizer
+    cannot match the loop (verified: pass runs on 73 fns, 0 matches; output stays
+    correct because it never fires). **Corrected plan:** implement M3.1 as a
+    **post-egraph** pass in the vendored `rakit-codegen`, next to LICM
+    (`context.rs:203`), where the SSA loop is present. The WIP pass in
+    `rakit-opt/src/passes/vectorize.rs` (strict shape match + runtime
+    disjointness guard + `I32X4` body + reuse original loop as scalar tail) is
+    written but **unwired** from the pipeline until moved to the post-egraph hook.
+  - **LANDED (post-egraph, `rakit-exp10`):** M3.1 is now implemented as a
+    post-egraph pass in the vendored backend
+    (`vendor/rakit-codegen/src/vectorize.rs`, called from `context.rs` right
+    after egraph+LICM). It matches the raw-pointer loop
+    `c[i]=(a[i]^b[i])*K`, `addr=base+(i<<2)`, constant trip; adds a **runtime
+    disjointness guard** (`|dst-src| >= n*4`, else scalar), an `I32X4` vector
+    loop (16-byte load/load, `bxor`, `imul.i32x4` by `splat(K)`, 16-byte store),
+    and **reuses the original loop as the scalar tail/fallback** (no scalar
+    duplication, no SSA value deleted). The pass **recomputes cfg+domtree** after
+    adding blocks — a stale dominator tree otherwise panics `blockorder`
+    (`lb_to_bindex[lb]` missing key). Knob `RAKIT_NO_VECTORIZE`.
+    - Measured (medians, A/B same compiler): `l3_iso` 140.0→**93.5** ms wall,
+      `l3_tail` 139.7→**94.0** ms (**−33%**); `pmuludq` now present. All four L3
+      fixtures match L's checksum on/off (incl. `l3_overlap`→scalar fallback and
+      `l3_tail`→scalar remainder).
+    - `l3_bw` (add) and `ktime` (slice/bounds-checked) are **not** matched yet;
+      `l3_iso` is still ~1.6× L because its init loops are not vectorized. M3.2
+      (bounds-check multi-block) and M3.3 remain.
+    - Suite: 65 suites / 25,368 passed / 0 failed. `allaxes` 15 progs all `ok`
+      with no runtime regression on p1–p9/h_*.
+    - **Soundness hardening (review fixes):** exact unit stride (`i+1` only, both
+      operand orders); body must be the **true** edge of `i<n` (a false-edge body
+      inverts the `i+4<=n` gate); header must be **effect-free** (pure arith +
+      compare only — no load/store/call/trap, since the vector loop bypasses it);
+      exact `Load`/`Store` opcodes (reject `uload8`/`istore8`/… narrow accesses);
+      require scalar mem flags `notrap` **and no explicit endianness** (else
+      reject, to avoid losing trap/byte-order semantics); `scaled_of` accepts only
+      `i<<2` (not `2<<i`) and commutative `i*4`; body rejects `can_trap`
+      (`trapnz`/div) since the vector body would skip it; pass gated to
+      `isa.name()=="x64"` (baseline RISC-V cannot lower `I32X4`). Regression
+      `bench/tests/t_vectorize.rs` (+ `regressions.sh` `check`) covers
+      unit/strided/**zero-trip (n=0 leaves dst untouched)**/overlap/in-place/
+      tail/u8; the `overlap` fixture uses `dst = src+1` so a store feeds a later
+      read (a real overwrite hazard). `regressions.sh` asserts SIMD **per
+      single-loop fixture**, not binary-wide (a tail loop could otherwise mask a
+      missed unit loop): `t_vectorize_unit` (only the n=1000 unit loop) must
+      contain `pmuludq`, proving *that* loop vectorized; `t_vectorize_guard`
+      (only an n=3 sub-vector loop) must contain `pmuludq`, proving the SIMD
+      guard/body is **generated** while it runs **zero** vector iterations (the
+      n=0 case is the unmatched scalar path, so it cannot cover the guard). The
+      guard fixture pads buffers to 4 and seeds `c[3]` with a sentinel, asserting
+      `tail4=true`, so a buggy four-lane store for n=3 is caught (checking only
+      the three written elements would miss it).
+      Output equality alone is insufficient: with `RAKIT_NO_VECTORIZE=1` the
+      output still matches but `pmuludq` is absent. Removed the committed
+      `rustc-ice-*.txt` dumps and gitignored them.
 
 ## Session (2026-11-24, branch `rakit-exp7`) — p9 reloads are real, but NOT soundly hoistable with the existing flags (alias tags don't move loads)
 

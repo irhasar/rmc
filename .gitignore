@@ -17,3 +17,6 @@ rakit/rakit-ir/target/
 rakit/rakit-ir/Cargo.lock
 rakit/rakit-opt/target/
 rakit/rakit-opt/Cargo.lock
+
+# rustc ICE dumps
+rustc-ice-*.txt
