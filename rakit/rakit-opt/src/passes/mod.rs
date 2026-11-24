@@ -64,10 +64,17 @@ impl Pass for DivTestPass {
     }
 
     fn run(&mut self, pctx: &mut PassCtx<'_>) -> bool {
-        if !has_opcode(&pctx.ctx.func, Opcode::Urem) {
+        // Respect the disable switch before doing any work: a disabled pass must
+        // cost nothing, not even the opcode pre-scan.
+        if !crate::tunables::div_test_enabled() {
             return false;
         }
-        passtime::time(passtime::DIV_TEST, || div_test::run(&mut pctx.ctx.func));
+        // The pre-scan is inside the timer so the reported time includes it.
+        passtime::time(passtime::DIV_TEST, || {
+            if has_opcode(&pctx.ctx.func, Opcode::Urem) {
+                div_test::run(&mut pctx.ctx.func);
+            }
+        });
         true
     }
 }
@@ -80,16 +87,19 @@ impl Pass for IfConvertPass {
     }
 
     fn run(&mut self, pctx: &mut PassCtx<'_>) -> bool {
-        // A two-way diamond needs a head, two arms and a join, i.e. at least
-        // three blocks, and a `brif` head. Below that (or without any branch)
-        // the pass can only scan and find nothing, so skip it: on a crate with
-        // thousands of small functions this is most of the compile cost.
-        if pctx.ctx.func.layout.blocks().nth(2).is_none()
-            || !has_opcode(&pctx.ctx.func, Opcode::Brif)
-        {
+        if !crate::tunables::if_convert_enabled() {
             return false;
         }
-        passtime::time(passtime::IF_CONVERT, || if_convert::run(&mut pctx.ctx.func, pctx.analyses));
+        // A two-way diamond needs a head, two arms and a join (>=3 blocks) and a
+        // `brif` head; skip otherwise. The block-count check and the opcode scan
+        // are inside the timer so the reported time includes them.
+        passtime::time(passtime::IF_CONVERT, || {
+            if pctx.ctx.func.layout.blocks().nth(2).is_some()
+                && has_opcode(&pctx.ctx.func, Opcode::Brif)
+            {
+                if_convert::run(&mut pctx.ctx.func, pctx.analyses);
+            }
+        });
         true
     }
 }

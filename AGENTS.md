@@ -23,68 +23,77 @@
   - `if_convert`: skip unless it has ≥3 blocks **and** an `Opcode::Brif`.
   - `sincos`: skip unless it has an `Opcode::Call`.
   All three are necessary conditions (no `urem`/`brif`/call ⇒ the pass cannot
-  fire), so the IR is unchanged.
+  fire), so the IR is unchanged. The disable switches (`RAKIT_NO_DIVTEST`,
+  `RAKIT_NO_IFCONV`) are checked **before** the scan, so a disabled pass costs
+  nothing; and the pre-scan runs **inside** the `passtime::time` region so the
+  reported per-pass time includes the scan.
   - **Byte-identical:** all 15 bench programs md5-match the pre-change build.
   - **A/B compile (median, reps=15, same session):** `p2_mem` 158→**155** wall
     (cpu 217→217), `h_mem` 168→**165** (238→233), `p4_simd` 107→**105**
-    (132→128). `div_test` per-pass time on `p2_mem`/`h_mem` cgu.1: 1.7/2.1 →
-    **0.4** ms.
+    (132→128). Scan-inclusive `div_test` per-pass on `p2_mem`/`h_mem` cgu.1:
+    1.7/2.1 → **0.6** ms (the 0.4 quoted earlier excluded the scan).
+- **Measurement caveat (wall vs cpu):** **runtime is unchanged on CPU time**;
+  wall time is sensitive to machine contention and must be read with CPU time.
+  One allaxes pass showed `p1_arith` M at **261 ms wall / 101 ms CPU** (a
+  scheduling stall); an isolated 20-rep re-measure gives **101/100 ms** and the
+  clean re-run matrix below shows 101/100. Judge runtime by CPU (and by a clean
+  re-run), not a single wall sample.
 - **Verification:** `./y.sh build` exit 0; `./y.sh test --sysroot rakit` → 65
   suites / 25,368 passed / 0 failed; `bench/allaxes.sh` (CREPS=3 RREPS=7) →
-  45/45 rows `ok`. Runtime and sizes unchanged (matrix below).
+  45/45 rows `ok`. Runtime (CPU) and sizes unchanged (matrix below).
 
 ### Full all-axes matrix (`bench/allaxes.sh`, CREPS=3 RREPS=7)
 L = LLVM, U = cg_clif upstream, M = modified Rakit. Compile = wall / cpu (user+sys)
 ms / peak RSS MB / artifact bytes. Run = wall / cpu ms / peak RSS MB. All stdout
-matched LLVM.
+matched LLVM. (Run wall is contention-sensitive; compare with run cpu.)
 
 | prog | bk | Cwall | Ccpu | Crss | size(B) | Rwall | Rcpu | Rrss |
 |------|----|------:|-----:|-----:|--------:|------:|-----:|-----:|
-| h_arith | L | 115 | 138 | 117.5 | 4617128 | 2 | 2 | 10.8 |
-| h_arith | U | 90 | 117 | 120.3 | 5839120 | 2 | 2 | 10.9 |
-| h_arith | M | 99 | 125 | 120.6 | 4078672 | 2 | 2 | 10.8 |
-| h_branch | L | 118 | 143 | 118.0 | 4616832 | 2 | 2 | 10.8 |
-| h_branch | U | 87 | 113 | 120.3 | 5837264 | 2 | 2 | 10.9 |
-| h_branch | M | 100 | 128 | 120.8 | 4077008 | 2 | 2 | 10.8 |
-| h_calls | L | 117 | 140 | 118.3 | 4616872 | 3 | 2 | 10.6 |
-| h_calls | U | 88 | 115 | 120.3 | 5837792 | 2 | 2 | 10.8 |
-| h_calls | M | 99 | 129 | 121.1 | 4077368 | 2 | 2 | 10.8 |
-| h_float | L | 126 | 152 | 116.8 | 4637984 | 2 | 2 | 10.9 |
-| h_float | U | 97 | 123 | 119.9 | 5861024 | 3 | 2 | 10.9 |
-| h_float | M | 100 | 128 | 120.0 | 4118168 | 3 | 2 | 10.9 |
-| h_mem | L | 264 | 430 | 137.4 | 4646848 | 24 | 3 | 10.9 |
-| h_mem | U | 132 | 181 | 136.0 | 5959856 | 27 | 10 | 10.9 |
-| h_mem | M | 166 | 233 | 137.4 | 4166120 | 9 | 4 | 10.8 |
-| h_simd | L | 144 | 170 | 124.0 | 4617704 | 2 | 2 | 10.8 |
-| h_simd | U | 96 | 125 | 125.4 | 5843736 | 4 | 3 | 10.6 |
-| h_simd | M | 110 | 138 | 126.2 | 4081096 | 2 | 2 | 10.8 |
-| p1_arith | L | 85 | 104 | 105.5 | 4635232 | 82 | 82 | 10.8 |
-| p1_arith | U | 79 | 103 | 108.6 | 5877944 | 108 | 108 | 10.6 |
-| p1_arith | M | 86 | 106 | 109.5 | 4146112 | 261 | 101 | 10.6 |
-| p2_mem | L | 244 | 379 | 133.2 | 4639888 | 16 | 16 | 10.9 |
-| p2_mem | U | 128 | 171 | 132.1 | 5936144 | 157 | 157 | 10.9 |
-| p2_mem | M | 160 | 217 | 133.4 | 4143368 | 47 | 47 | 10.7 |
-| p3_calls | L | 98 | 119 | 116.0 | 4612368 | 38 | 37 | 10.8 |
-| p3_calls | U | 85 | 111 | 117.6 | 5820136 | 117 | 115 | 10.9 |
-| p3_calls | M | 94 | 121 | 118.1 | 4067048 | 62 | 62 | 10.8 |
-| p4_simd | L | 107 | 128 | 116.6 | 4636096 | 55 | 55 | 48.2 |
-| p4_simd | U | 92 | 116 | 118.0 | 5892376 | 157 | 157 | 49.4 |
-| p4_simd | M | 103 | 129 | 119.0 | 4152736 | 84 | 83 | 48.8 |
-| p5_inline | L | 80 | 101 | 104.9 | 4609368 | 58 | 57 | 10.9 |
-| p5_inline | U | 74 | 98 | 107.5 | 5813704 | 894 | 892 | 10.6 |
-| p5_inline | M | 84 | 108 | 108.0 | 4059960 | 6 | 6 | 10.6 |
-| p6_scalar | L | 85 | 102 | 101.1 | 4609368 | 58 | 57 | 10.8 |
-| p6_scalar | U | 77 | 97 | 103.7 | 5813688 | 909 | 907 | 10.8 |
-| p6_scalar | M | 83 | 104 | 104.4 | 4059960 | 7 | 6 | 10.9 |
-| p7_branchy | L | 87 | 107 | 105.4 | 4609520 | 43 | 43 | 10.8 |
-| p7_branchy | U | 81 | 101 | 107.3 | 5813800 | 101 | 100 | 10.8 |
-| p7_branchy | M | 87 | 111 | 108.1 | 4060120 | 35 | 36 | 10.8 |
-| p8_minmax | L | 85 | 102 | 105.1 | 4609544 | 18 | 18 | 10.7 |
-| p8_minmax | U | 80 | 104 | 107.3 | 5813752 | 39 | 40 | 10.7 |
-| p8_minmax | M | 87 | 111 | 108.0 | 4060088 | 21 | 20 | 10.8 |
-| p9_u64f32 | L | 97 | 115 | 110.9 | 4635448 | 30 | 30 | 17.8 |
-| p9_u64f32 | U | 88 | 110 | 114.0 | 5886872 | 76 | 76 | 18.9 |
-| p9_u64f32 | M | 97 | 122 | 114.2 | 4149744 | 34 | 34 | 18.2 |
+| h_arith | L | 148 | 154 | 117.7 | 4617128 | 193 | 2 | 10.8 |
+| h_arith | U | 92 | 119 | 120.0 | 5839120 | 2 | 2 | 11.0 |
+| h_arith | M | 104 | 132 | 120.6 | 4078672 | 2 | 2 | 11.0 |
+| h_branch | L | 122 | 149 | 118.1 | 4616832 | 2 | 2 | 11.1 |
+| h_branch | U | 91 | 121 | 120.3 | 5837264 | 2 | 2 | 10.8 |
+| h_branch | M | 103 | 131 | 120.5 | 4077008 | 2 | 2 | 11.0 |
+| h_calls | L | 118 | 143 | 118.8 | 4616872 | 2 | 2 | 11.1 |
+| h_calls | U | 92 | 122 | 120.8 | 5837792 | 3 | 2 | 10.8 |
+| h_calls | M | 103 | 133 | 120.8 | 4077368 | 2 | 2 | 10.8 |
+| h_float | L | 128 | 152 | 117.0 | 4637984 | 2 | 2 | 10.7 |
+| h_float | U | 95 | 125 | 119.7 | 5861024 | 3 | 3 | 11.0 |
+| h_float | M | 103 | 132 | 120.0 | 4118168 | 2 | 2 | 11.0 |
+| h_mem | L | 276 | 441 | 138.3 | 4646848 | 3 | 3 | 11.0 |
+| h_mem | U | 139 | 191 | 136.1 | 5959856 | 10 | 9 | 11.1 |
+| h_mem | M | 172 | 245 | 137.8 | 4166120 | 5 | 4 | 10.7 |
+| h_simd | L | 145 | 168 | 124.2 | 4617704 | 2 | 2 | 11.0 |
+| h_simd | U | 102 | 128 | 125.7 | 5843736 | 4 | 3 | 11.0 |
+| h_simd | M | 112 | 140 | 126.2 | 4081096 | 2 | 2 | 11.0 |
+| p1_arith | L | 89 | 110 | 105.8 | 4635232 | 82 | 83 | 11.1 |
+| p1_arith | U | 88 | 105 | 108.6 | 5877944 | 108 | 108 | 11.0 |
+| p1_arith | M | 90 | 115 | 109.4 | 4146112 | 101 | 100 | 11.0 |
+| p2_mem | L | 254 | 395 | 133.9 | 4639888 | 17 | 17 | 11.0 |
+| p2_mem | U | 139 | 183 | 132.3 | 5936144 | 159 | 156 | 11.0 |
+| p2_mem | M | 161 | 219 | 133.6 | 4143368 | 50 | 49 | 11.0 |
+| p3_calls | L | 101 | 126 | 116.2 | 4612368 | 37 | 37 | 11.0 |
+| p3_calls | U | 89 | 115 | 117.8 | 5820136 | 116 | 116 | 10.7 |
+| p3_calls | M | 112 | 134 | 118.7 | 4067048 | 56 | 55 | 10.8 |
+| p4_simd | L | 109 | 130 | 116.6 | 4636096 | 56 | 56 | 48.2 |
+| p4_simd | U | 94 | 118 | 118.2 | 5892376 | 157 | 155 | 49.5 |
+| p4_simd | M | 106 | 130 | 119.0 | 4152736 | 84 | 84 | 48.8 |
+| p5_inline | L | 84 | 104 | 104.8 | 4609368 | 58 | 58 | 10.8 |
+| p5_inline | U | 80 | 103 | 107.4 | 5813704 | 892 | 891 | 11.0 |
+| p5_inline | M | 84 | 109 | 108.0 | 4059960 | 7 | 6 | 10.8 |
+| p6_scalar | L | 83 | 102 | 101.2 | 4609368 | 58 | 57 | 11.1 |
+| p6_scalar | U | 77 | 98 | 103.7 | 5813688 | 903 | 901 | 10.9 |
+| p6_scalar | M | 83 | 105 | 104.2 | 4059960 | 7 | 6 | 10.8 |
+| p7_branchy | L | 85 | 103 | 105.2 | 4609520 | 43 | 42 | 10.8 |
+| p7_branchy | U | 79 | 102 | 107.6 | 5813800 | 102 | 102 | 11.0 |
+| p7_branchy | M | 88 | 109 | 108.1 | 4060120 | 36 | 35 | 11.0 |
+| p8_minmax | L | 87 | 106 | 105.2 | 4609544 | 18 | 18 | 10.7 |
+| p8_minmax | U | 80 | 102 | 107.3 | 5813752 | 38 | 38 | 10.8 |
+| p8_minmax | M | 87 | 110 | 107.9 | 4060088 | 21 | 20 | 11.1 |
+| p9_u64f32 | L | 97 | 117 | 110.9 | 4635448 | 31 | 30 | 17.8 |
+| p9_u64f32 | U | 108 | 116 | 113.6 | 5886872 | 77 | 76 | 18.8 |
+| p9_u64f32 | M | 99 | 124 | 114.5 | 4149744 | 34 | 34 | 18.2 |
 
 ## Session (2026-11-24, branch `rakit-further-experiments`) — compile-axis wins
 
