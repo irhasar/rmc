@@ -94,17 +94,17 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
   `pmulld` when SSE4.1, else a `pmuludq` sequence (`lower.isle:1166-1182`).
 - **LLVM vectorizes it** (binary: 14 `pmuludq`, 15 `paddd`, 54 `pxor`, 98
   `pshufd`); Rakit does not (0 `pmuludq`, 8 `pxor`).
-  **Measurement (current `bench/l3/` fixtures; position-dependent inputs +
-  hash-all; full process incl. init+hash; this machine):** `l3_iso` **L 54.0 ms
-  vs M 138.8 ms (~2.57x)**; `l3_bw` (trivial tri-stream, identical ~960 MB
-  *nominal* traffic) **L 56.0 ms vs M 141.4 ms**. L's trivial kernel (56.0) ≈ L's
-  L3 (54.0), **consistent with a memory-bandwidth limit** — but that is two
-  *process times* coinciding, **not** a measured traffic/bandwidth (no PMU
-  counters; `nominal bytes / time` is an estimate; the runner also times
-  init+hash). The older "L3 isolation 66.7 vs 28.3" (conflated with init) and the
-  later "49.9 vs 110.3" (last-element fixture) are **historical** and superseded
-  by the numbers above. A 4-wide vectorized M can approach ~L; the vectorizer is
-  justified by the *kernel*.
+  **Kernel-only measurement (what vectorizing L3 can recover):** an internal
+  `Instant`-timed probe (init/hash excluded; 3 warmup + 20 timed passes = 80M
+  iters) gives **L ≈22.7 ms vs M ≈72.8 ms (~3.2x)**. **Process totals are NOT the
+  kernel gap:** `l3_iso` L 54.0 / M 138.8 and `l3_bw` L 56.0 / M 141.4 include
+  init+hash (≈31 ms L / ≈66 ms M) — M's position-dependent init (closure `map`
+  loops) and the hash-all loop dominate, so the ~2.57x *process* ratio is diluted
+  and must not be read as the kernel gap. 960 MB / 22.7 ms ≈ **42 GB/s** achievable
+  here (the earlier "~19 GB/s" was a process average, not bandwidth; bandwidth-
+  limit remains circumstantial — no PMU). Older "66.7 vs 28.3" (init-conflated)
+  and "49.9 vs 110.3" (last-element) are **historical**. A 4-wide vectorized M can
+  approach L's ~22.7 ms kernel; the vectorizer is justified by the *kernel*.
 - **Blocker is CFG shape:** p4 L3 is **multi-block** — `block29` (bounds check
   `brif`) → `block30` (compute+store) → back-edge. Address `base + i*4`, induction
   `i`, `i'=i+1`.
@@ -128,7 +128,7 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
      loop**; the original loop is **reused as the scalar tail** (re-enter its
      header at `i` for `n % 4`), so the scalar loop is not duplicated. Fixtures
      live in `bench/l3/` (excluded from the held-out `progs/h*.rs` argv sweep; run
-     via `bench/allaxes.sh "$PWD/bench/l3/*.rs"`): `l3_iso` (disjoint fast path),
+     via `bench/allaxes.sh "$PWD/bench/l3/l3_*.rs"`; the kernel-only timing probe is `bench/l3/ktime.rs`, run separately): `l3_iso` (disjoint fast path),
      `l3_tail` (trip not divisible by 4 -> remainder), `l3_overlap` (dst overlaps
      sources -> must fall back to scalar), `l3_bw` (reference). Each hashes **all**
      output elements so every store is checked, not just the last.
