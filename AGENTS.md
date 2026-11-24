@@ -1,3 +1,175 @@
+## Project kickoff (2026-11-24, branch `rakit-exp5`) — p4 loop autovectorizer (milestone plan)
+
+Started "opsi 2" (the big backend project) targeting `p4_simd` (M ~83 ms vs LLVM
+~57 ms). p4 has three loops; only two are vectorizable:
+- L1 `a[i]=sin(i as f32); b[i]=cos(i as f32)` — **libcall-bound, not
+  vectorizable**; sincos fusion already helps. Ignore.
+- L2 `s += a[i]*b[i] + abs(a[i]-b[i])` — elementwise + horizontal reduction.
+- L3 `c[i] = (a[i].to_bits() ^ b[i].to_bits()).wrapping_mul(2654435761)` —
+  elementwise map, `u32`. Read Rakit CLIF now: the loops **are unrolled 128x**
+  (huge single-block bodies) but remain **scalar** — LLVM's win is real SIMD
+  (`mulps/addps/andps/pmulld`), not unrolling.
+
+**Why this is a project, not a pass:** a correct loop vectorizer needs, in
+order:
+1. **Alias/no-aliasing proof** for the three distinct `Vec` data pointers
+   (`a`,`b`,`c` in L2/L3). Without `noalias` the loads/stores of different Vecs
+   may alias; a vectorized read-ahead or reordered store would be wrong. Rust
+   does mark `&mut` `noalias`, but these are raw `Vec` derefs through bounds
+   checks — the evidence isn't in the CLIF today. (This is the same wall as
+   §25 bounds-check elimination.)
+2. **Bounds-check elimination** for `for i in 0..n { v[i] }` with `v.len()==n`:
+   §25 showed the guard compares the `Range::end` block param against a
+   *separately reloaded* `v.len()`, so the two must first be CSE'd (needs a
+   load-value-numbering that proves no store to the Vec header between them).
+3. **Loop legality + widening**: single induction var (step 1), pure elementwise
+   body, no calls/traps, contiguous access, then build `i32x4`/`f32x4`
+   loads/stores, splat the constant, vector `bxor`/`imulx`/`fmulx`/`fabsx`, and
+   a horizontal reduce for L2 **only if it preserves the f32 addition order**
+   (see the ordering caveat below); scalar tail for `n % lanes`.
+4. **Codegen support check**: `pmulld` is SSE4.1 — must be feature-gated;
+   verify vector `bxor`/`imul` (`pmulld`) lower in `rakit-codegen`.
+
+**Float-reduction ordering is a hard constraint (not optional).** p4's L2 is
+`s += a[i]*b[i] + (a[i]-b[i]).abs()` on `f32`. Rust does **not** permit
+reassociating floating-point additions, so a lane-wise (horizontal) reduction
+that regroups them is **not a legal transform** — it can change the printed
+result. L2 may only be vectorized in a way that keeps the exact addition order
+(e.g. no regroup across lanes), or left scalar. The safe first real target is
+**L3** (`u32` xor-mul), which has no ordering constraint; L1 (sin/cos) is
+libcall-bound.
+
+**Milestones (each its own commit, each validated by the full gate: build,
+15/15 stdout identical to LLVM, suite 65/25,368/0, allaxes 45/45):**
+- M1: load-value-numbering / redundant-load CSE + `v.len()==n` proof (enables
+  bounds-check elimination) — also helps p2.
+- M2: bounds-check elimination for `0..v.len()` loops (retire §25's blocker).
+- M3: legality analysis + a **map-only (no reduction)** vectorizer for L3
+  (`u32` xor-mul map) as the first real target (simplest body, no reduction).
+- M4: L2 reduction (horizontal), tails, `f32x4`.
+- M5: tune; measure vs LLVM.
+
+Each milestone is independently landable and correctness-gated; none is
+attempted blindly. Do **not** land a vectorizer without the alias proof (M1) —
+reordering loads/stores of possibly-aliasing Vecs silently corrupts results.
+
+### M1 first attempt — blocked by debug value-labels (reverted)
+Wrote `rakit-opt/src/passes/load_cse.rs`: block-local redundant-load elimination
+(merge a `load` with an earlier same-address/type/offset/flags `load` in the same
+block when no store/call/side-effect lies between; this IR has **no volatile
+flag**, so it is semantically safe in a store-free stretch). Note the egraph has **two** load-elimination paths: the
+flags-gated GVN (`readonly+notrap+can_move`, which Rust `Vec` loads are not) and
+a separate **alias-analysis** path (`OptResult::AliasedLoad`,
+`egraph/mod.rs:549-565`) that replaces a load with an earlier load or stored
+value regardless of those flags — the latter is why the block-local pass was
+redundant. It
+**ICE'd compiling `core`**: `change_to_alias` inserts a
+`ValueLabelAssignments::Alias` entry keyed by the *removed* value
+(`dfg.rs:270-271`), and the machinst value-label emitter then does
+`self.value_regs[val]... .only_reg().unwrap()` on an empty reg set
+(`machinst/lower.rs:1064`). Guarding on a pre-existing label is not enough —
+`change_to_alias` creates the entry itself. Safe load elimination that removes a
+value therefore needs the value-label machinery to follow/relocate alias labels
+(or debuginfo to be dropped for the merged value), which is a real M1 sub-task,
+not a drop-in pass. **Reverted** (no ICE shipped); this is the first concrete
+blocker to solve for M1.
+- **Resolved & then found redundant.** The ICE is fixable: after
+  `change_to_alias`, drop the merged value's debug label and
+  `layout.remove_inst` the now-dead load so the value-label scan never visits a
+  value with no register. That builds `core` and passes output checks — but the
+  resulting binaries are **byte-identical with and without the pass** on
+  p1–p9 (value neutral). So the egraph/MIR already eliminates *same-block*
+  redundant loads; the remaining redundancy is **cross-block** (the guard's
+  length reload vs the bounds-check length reload). Block-local load CSE is
+  therefore a no-op pass that only costs compile time → **reverted**. Conclusion
+  for M1: it must be a **cross-block** load CSE / value numbering with dominance
+  plus a no-store-on-path proof — the same alias/analysis wall as §25, i.e. the
+  genuinely hard part. Do not re-add a block-local-only version.
+
+## Session (2026-11-24, branch `rakit-exp5`) — x64 omit-FP: execution-correct but UNWIND-INVALID, RUNTIME-NEUTRAL (reverted)
+
+- **Outcome:** implemented full omit-frame-pointer for x64 (mirroring RISC-V),
+  built the whole sysroot with it, validated **execution output only** (unwind
+  is NOT correct — see the unwind bullet), measured **neutral on runtime**, and
+  **reverted**. This closes the biggest open runtime lever from the `rakit-exp4`
+  blocker map — don't re-attempt it for runtime.
+- **Recipe (execution works; unwind still needs the extra change below; kept for
+  reference, reverted):**
+  - `isa/x64/abi.rs` `compute_frame_layout`: `setup_area_size = if
+    flags.preserve_frame_pointers() {16} else {8}`, and **pad `clobber_size +=
+    8`** when omitting. Dropping the 8-byte `push %rbp` leaves the frame 8 bytes
+    short of the 16-byte call-site alignment, so add the missing 8 to the
+    clobber area — it is reserved *above* the spill/fixed slots, so no slot
+    offset shifts.
+  - `isa/x64/abi.rs` `gen_prologue_frame_setup` / `gen_epilogue_frame_restore`:
+    early-return an empty vector when `!flags.preserve_frame_pointers()`.
+  - **Unwind must ALSO change — the recipe as written is not a correct build.**
+    Even with no frame setup, `gen_clobber_save` still emits
+    `UnwindInst::DefineNewFrame` in `gen_clobber_save` (`x64/abi.rs:652`; `DefineNewFrame` at line 707) and the System V encoder
+    sets `CallFrameInstruction::CfaRegister(fp)` when `mr.fp()` exists
+    (`isa/unwind/systemv.rs:209-220`) — it tells the unwinder the CFA is in RBP
+    even though the function never set RBP. So the omit-FP build would produce
+    **wrong backtraces / broken unwinding**; a correct build must also suppress
+    `DefineNewFrame`/CFA-register for non-FP frames (e.g. clear `mr.fp()`).
+    Because of this the omit-FP experiment is **not fully correct**, and the
+    "outputs identical" check below proves only execution, never unwind.
+  - Incoming stack args RBP → RSP in **both** lowering paths (they must agree):
+    `args.rs` `SyntheticAmode::finalize` (`sp_offset = tail_args_size +
+    setup_area_size + clobber_size + fixed_frame_storage_size +
+    outgoing_args_size; addr = rsp + sp_offset - offset`) and
+    `external.rs` `From<SyntheticAmode> for asm::Amode` (`base: Gpr::RSP`, same
+    `-offset`); `emit.rs` `incoming_arg_offset = tail_args_size +
+    setup_area_size + clobber_size + fixed_frame_storage_size +
+    outgoing_args_size`. (Same formula as `isa/riscv64/inst/args.rs:142-151`.)
+- **Correctness — EXECUTION ONLY (unwind is NOT correct, see the unwind bullet
+  above).** After `rm -rf build/stdlib_target`
+  (the backend `.so` is not fingerprinted, so std keeps the old lowering
+  otherwise) and a full rebuild, **all 15 bench outputs are byte-identical to
+  LLVM**; a 10-arg `i64` fn and a 10-arg `f64` fn (stack-passed args) print
+  `883500 784500`, identical to LLVM — i.e. the new RSP-relative incoming-arg
+  path is right. Hot user/core fns confirmed FP-less in disasm: `fib` and
+  `SipHasher::write` compile to `sub $N,%rsp; ...` with **no** `push %rbp` /
+  `mov %rsp,%rbp`.
+- **Runtime A/B (cpu ms, 21 reps, FP → omit-FP):** p1 100→102, p3 55→56,
+  p4 83→83, p2 48→48, p8 21→20, p9 33→34. Most are within the ±3% band, **but
+  p8's −4.8% (21→20) is above it**; with only 15–21 reps a single clamped A/B
+  does **not** establish that as a real win — treat p8 as inconclusive/noise
+  until measured with many more reps and unrounded medians. Artifact size
+  ±0.0% (e.g. p2 4143368→4141728 B).
+- **Why reverted:** neutral on every axis yet it carries real correctness risk
+  for code we don't exercise: `emit.rs:1893` `emit_return_call_common_sequence`
+  **asserts** `preserve_frame_pointers()` (so `return_call` would ICE), and
+  `verifier/mod.rs:660` rejects `get_frame_pointer`/`get_return_address` without
+  FP. Net: no upside, real downside — not worth landing.
+- **Conclusion:** the x64 frame-pointer prologue/epilogue (~6 instructions per
+  call: `push rbp; mov rsp,rbp` … `mov rbp,rsp; pop rbp`) is **not** a
+  bottleneck on these workloads — they are compute/memory/vectorization bound,
+  and even call-heavy `p3` (`fib`) is call-*latency* bound, so the prologue
+  instructions hide under the call latency. Remaining backend levers are
+  a loop vectorizer (p4), which is large.
+- **Addendum — p8 is already near-optimal (so "regalloc cycle" was a red
+  herring).** Disassembling `p8_minmax`'s hot loop: state `(i, a, mn)` is carried
+  entirely in registers (`rax`=i, `r10`=a, `r8`=mn) with **no stack traffic** —
+  `imul a*C; or $1,%rax; add a; cmp; mov %r10,%rax; cmovb %r8,%rax; mov
+  %rax,%r8; mov %rcx,%rax; jmp` (~10 instrs/iter). The only copies are the
+  min-reduction (`mov/cmovb/mov`), which are needed because `a` (in `r10`) must
+  survive for the next iteration while `mn` is updated. So the residual p8 gap
+  (M ~20 ms vs LLVM ~18 ms) is not a removable spill/cycle — it is inherent to
+  the scalar recurrence; LLVM's edge is elsewhere. Do not chase a "parallel-copy
+  cycle" in p8.
+- **Standing scoreboard, grounded in the full matrix below (`prog | bk |
+  Cwall | Ccpu | Crss | size(B) | Rwall | Rcpu | Rrss`):** M's compile is faster
+  than **LLVM** but **slower than upstream cg_clif (U)** — `h_arith` Cwall U **88**
+  ms vs M **100** ms. M's **artifact size is smallest** in that matrix (e.g.
+  `h_arith` size L 4617128 / U 5839120 / M **4078672** B). Runtime M wins only
+  **p5/p6/p7**, **loses p1/p2/p3/p4**, and the `h_*` rows are **not uniformly
+  ties** — `h_mem` Rcpu L **3** ms vs M **4** ms (M loses runtime CPU to LLVM).
+  Do not state "M wins compile" or "ties h_*" without the full L/U/M matrix
+  (Cwall/Ccpu/Crss/size + Rwall/Rcpu/Rrss) to back it. Closing p1 (memory-operand constants + branchy saturating cast +
+  serial int↔float chain), p2 (hashbrown/sort codegen depth), p3 (call-latency /
+  middle-end), p4 (a real loop autovectorizer) is a **months-scale backend
+  effort** comparable to LLVM's own middle-end, not an incremental pass.
+
 ## Session (2026-11-24, branch `rakit-exp4`) — runtime probe (no pass-level win), x64 omit-FP blocker map
 
 - **Branch:** from `replace-main-with-cgclif-experiments` after PR #14 merged
@@ -40,7 +212,7 @@
     arg) reads them via RBP**; omitting the frame pointer breaks such
     **ordinary calls**, not only `return_call`. This is **fixable by mirroring
     RISC-V**, which already lowers `AMode::IncomingArg` **SP-relative** from the
-    frame layout (`isa/riscv64/inst/args.rs:124-149`:
+    frame layout (`isa/riscv64/inst/args.rs:142-151`:
     `sp_offset = tail_args_size + setup_area_size + clobber_size +
     fixed_frame_storage_size + outgoing_args_size`, then `sp_offset - off`).
     The earlier claim that "RSP moves within a function" is **wrong for
