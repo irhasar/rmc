@@ -5,7 +5,8 @@
 //! before the egraph, where the induction is still a stack slot, so this must
 //! live in the backend.
 //!
-//! Target: header `H(i: i64)` brifs on a constant trip `i < n`; single-block
+//! Target: header `H(i: i64)` brifs on a trip `i < n` (constant or a
+//! loop-invariant runtime bound); single-block
 //! body `B` computes `c[i] = (a[i] ^ b[i]) * K` for loop-invariant base
 //! pointers, `addr = base + (i << 2)` (u32 lanes), then `i += 1` and jumps `H`.
 //!
@@ -45,31 +46,38 @@ pub fn enabled() -> bool {
     }
 }
 
-/// Vectorize at most one canonical loop in `func`. Returns whether the CFG
-/// changed (the caller must recompute cfg/domtree when it did).
+/// Vectorize every canonical loop in `func`. Returns whether the CFG changed
+/// (the caller must recompute cfg/domtree when it did).
+///
+/// We iterate a snapshot of the original blocks: `apply` only *adds* blocks and
+/// keeps the scalar header/body (as the tail), so each original header is
+/// matched at most once and the freshly created vector blocks are never
+/// revisited. This matters because the inliner/unroller can duplicate the same
+/// loop many times into one function (e.g. a constant-trip outer loop unrolled
+/// 20x); vectorizing only the first copy leaves the rest scalar.
 pub fn do_vectorize(func: &mut Function) -> bool {
-    let Some(plan) = find_plan(func) else { return false };
-    apply(func, plan);
-    true
+    let headers: Vec<Block> = func.layout.blocks().collect();
+    let mut changed = false;
+    for h in headers {
+        if !func.layout.is_block_inserted(h) {
+            continue;
+        }
+        if let Some(plan) = match_header(func, h) {
+            apply(func, plan);
+            changed = true;
+        }
+    }
+    changed
 }
 
 struct Plan {
     h: Block,
     preheader: Block,
-    n: i64,
+    n: Value,
     base_a: Value,
     base_b: Value,
     base_c: Value,
     k: i64,
-}
-
-fn find_plan(func: &Function) -> Option<Plan> {
-    for h in func.layout.blocks().collect::<Vec<_>>() {
-        if let Some(plan) = match_header(func, h) {
-            return Some(plan);
-        }
-    }
-    None
 }
 
 fn match_header(func: &Function, h: Block) -> Option<Plan> {
@@ -87,10 +95,6 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
     if cc != IntCC::UnsignedLessThan || dfg.resolve_aliases(cx) != i {
         return None;
     }
-    let n = iconst_i64(dfg, cy)?;
-    if n <= 0 {
-        return None;
-    }
     let s0 = blocks[0].block(&dfg.value_lists);
     let s1 = blocks[1].block(&dfg.value_lists);
     // The body must be the *true* edge of `i < n` (the loop runs while i < n).
@@ -100,6 +104,20 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
         return None;
     }
     let b = s0;
+    // Trip bound: accept a loop-invariant runtime value (dynamic length) as well
+    // as a constant. The vector gate `i+4 <= n` and the disjointness guard
+    // `|dst-src| >= n*4` both work for any runtime n; a runtime n == 0 simply
+    // falls through to the scalar tail (H), which does nothing. Only a constant
+    // zero/negative bound is rejected as pointless.
+    let n = dfg.resolve_aliases(cy);
+    if n == i || dfg.value_type(n) != types::I64 || !defined_outside(dfg, &func.layout, n, h, b) {
+        return None;
+    }
+    if let Some(c) = iconst_i64(dfg, n) {
+        if c <= 0 {
+            return None;
+        }
+    }
     // The scalar header runs once per iteration; the vector loop bypasses it for
     // the vectorized prefix, so it must be effect-free (pure arithmetic + the
     // comparison only).
@@ -298,9 +316,8 @@ fn apply(func: &mut Function, p: Plan) {
     {
         let mut cur = FuncCursor::new(func).at_bottom(g);
         let zero = cur.ins().iconst(types::I64, 0);
-        let n = cur.ins().iconst(types::I64, p.n);
         let four = cur.ins().iconst(types::I64, 4);
-        let lbytes = cur.ins().imul(n, four);
+        let lbytes = cur.ins().imul(p.n, four);
         let (pa, pb, pc) = (p.base_a, p.base_b, p.base_c);
         let mut ov = None;
         for src in [pa, pb] {
@@ -322,8 +339,7 @@ fn apply(func: &mut Function, p: Plan) {
         let mut cur = FuncCursor::new(func).at_bottom(vh);
         let four = cur.ins().iconst(types::I64, 4);
         let nxt = cur.ins().iadd(vh_i, four);
-        let n = cur.ins().iconst(types::I64, p.n);
-        let cond = cur.ins().icmp(IntCC::UnsignedLessThanOrEqual, nxt, n);
+        let cond = cur.ins().icmp(IntCC::UnsignedLessThanOrEqual, nxt, p.n);
         cur.ins().brif(cond, vb, &[vh_i.into()], h, &[vh_i.into()]);
     }
 

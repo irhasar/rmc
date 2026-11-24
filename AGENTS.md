@@ -202,6 +202,20 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
       Output equality alone is insufficient: with `RAKIT_NO_VECTORIZE=1` the
       output still matches but `pmuludq` is absent. Removed the committed
       `rustc-ice-*.txt` dumps and gitignored them.
+  - **M3.2 LANDED: dynamic trip bound + vectorize every loop.** `match_header`
+    now accepts a **loop-invariant runtime bound** (`n` may be a function
+    parameter / any value defined outside the loop, not just an `iconst`); the
+    existing `i+4 <= n` gate and `|dst-src| >= n*4` disjointness guard already
+    work for any runtime `n` (runtime `n == 0` falls through to the scalar tail).
+    `do_vectorize` now vectorizes **every** matching loop in a function (over a
+    snapshot of the original blocks), not just the first: the inliner/unroller
+    can duplicate one loop many times into a function, and vectorizing only the
+    first left the rest scalar. Measured on `bench/l3/ktime.rs` (kernel with a
+    runtime `n` parameter), median of 5: kernel **73.3 → 25.5 ms** (LLVM
+    23.3 ms — was 3.15×, now ~1.09×), `sum` matches; all four L3 checksums
+    unchanged. New `bench/tests/t_vectorize_dyn.rs` (opaque `black_box` bound →
+    runtime path, `pmuludq` asserted). Gate: suite **65 / 25,368 / 0**;
+    `allaxes` 15 progs all `ok` with **no runtime regression** (p1–p9/h_*).
 
 ## Session (2026-11-24, branch `rakit-exp7`) — p9 reloads are real, but NOT soundly hoistable with the existing flags (alias tags don't move loads)
 

@@ -67,13 +67,14 @@ tail 6121779849389533154
 u8 2907005038580616411'
 check t_vectorize_unit 'unit 12776226417588255163'
 check t_vectorize_guard 'guard 17715399688492003866 tail4=true'
+check t_vectorize_dyn 'dyn 12776226417588255163 n=1000'
 
 # Output equality alone cannot prove the vectorizer ran. Each fixture below
 # contains exactly one xor+imul loop, so a packed multiply (SSE2 lowering of
 # i32x4.imul) in the binary proves *that* loop was vectorized (a tail loop
 # elsewhere cannot satisfy the check). t_vectorize_guard (n=3) proves the SIMD
 # guard/body is generated even though it runs zero vector iterations.
-for fx in t_vectorize_unit t_vectorize_guard; do
+for fx in t_vectorize_unit t_vectorize_guard t_vectorize_dyn; do
     if command -v objdump >/dev/null 2>&1; then
         if ! objdump -d "$TMP/${fx}_M" --no-show-raw-insn 2>/dev/null | grep -q pmuludq; then
             echo "[regression] $fx: no packed multiply (loop not vectorized / guard not generated)" >&2
