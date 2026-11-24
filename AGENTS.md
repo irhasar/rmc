@@ -1,64 +1,109 @@
 ## Session (2026-11-24, branch `rakit-exp8`) — post-`addr_base`-fix all-axes scoreboard (L/U/M); remaining gap is all large
 
-### M3 kickoff — vectorizer feasibility (evidence, not yet implemented)
-- **p4 L3 = `c[i] = (a[i].to_bits() ^ b[i].to_bits()).wrapping_mul(2654435761)`**, `a,b: Vec<f32>`, `c: Vec<u32>` → per element: bitcast f32→u32 (free), xor, **u32 multiply by constant**, store u32.
-- **Backend can do it:** the x64 backend lowers vector `i32x4.imul` on baseline SSE2 — `pmulld` when SSE4.1, else a `pmuludq`-based sequence (`lower.isle:1166-1182`). No backend work needed for the mul.
-- **LLVM already vectorizes this**: its binary has 14 `pmuludq`, 15 `paddd`, 54 `pxor`, 98 `pshufd`; Rakit has 0 `pmuludq`, 8 `pxor`. **L3 in isolation: M 66.7 ms vs L 28.3 ms (38 ms gap).** So vectorizing L3 is worth it.
-- **The blocker is CFG shape:** p4 L3 is **multi-block** — `block29` (bounds check `brif`) → `block30` (compute+store) → back-edge `block4`. Address form: `addr = base + (i*4)` with `i` the induction var; `i' = i+1`.
-- **Staged plan** (each stage gated by output validation vs LLVM + full suite):
-  1. **M3.1** single-block, bounds-check-free map loop `dst[i] = (s1[i]^s2[i])*K` (u32), constant or runtime trip with a `len` that is a multiple-of-4 fast path + scalar tail; emit `I32X4` body via `imul.i32x4` and `splat`. Validated on a synthetic `get_unchecked` microbench (M vs L).
-  2. **M3.2** handle the bounds-check multi-block shape (either hoist `i+3 < n` before the vector body, or require the induction bound to equal the slice length so the checks are provably redundant).
-  3. **M3.3** generalize ops (add/xor only first; mul later), then integrate with `addr_base`/private-slot info.
-- Not started in code yet; recorded so the multi-session effort is grounded. (No behavioral change.)
+Canonical matrix on the merged build: `cd bench && CREPS=2 RREPS=7 ./allaxes.sh`
+(log `/tmp/allaxes_now.log`). All rows `ok` (the harness validates stdout vs
+LLVM). Full all-axes set: compile **wall/cpu** ms, compile peak-RSS MB, size
+bytes, then run **wall/cpu** ms, run peak-RSS MB.
 
-Ran the canonical matrix on the merged build (`cd bench && CREPS=2 RREPS=7
-./allaxes.sh`; log `/tmp/allaxes_now.log`). All rows `ok` (stdout validated
-against LLVM by the harness). Run/compile in ms, size in bytes; RSS ~equal
-(L≈M, U slightly higher). Run `L/U/M`; Compile `M/L`; Size `M/L`.
-
-| prog | run L/U/M | comp M/L | size M/L |
-|------|-----------|----------|----------|
-| h_arith  | 2/2/2     | 106/121 | 4078672/4617128 |
-| h_branch | 2/2/2     | 108/119 | 4077008/4616832 |
-| h_calls  | 2/2/2     | 106/118 | 4077368/4616872 |
-| h_float  | 2/2/2     | 106/128 | 4118168/4637984 |
-| h_mem    | 3/10/4    | 172/262 | 4166120/4646848 |
-| h_simd   | 2/4/2     | 120/143 | 4081096/4617704 |
-| p1_arith | 81/108/101|  94/86  | 4146112/4635232 |
-| p2_mem   | 16/156/48 | 164/243 | 4143368/4639888 |
-| p3_calls | 41/117/55 |  98/100 | 4067048/4612368 |
-| p4_simd  | 56/166/84 | 110/113 | 4152736/4636096 |
-| p5_inline| 58/896/7  |  88/85  | 4059960/4609368 |
-| p6_scalar| 58/902/6  |  88/91  | 4059960/4609368 |
-| p7_branchy| 43/100/35|  90/87  | 4060120/4609520 |
-| p8_minmax| 18/38/20  |  90/91  | 4060088/4609544 |
-| p9_u64f32| 30/76/33  | 100/96  | 4149744/4635448 |
+| prog | be | C wall/cpu | C RSS | C size | R wall/cpu | R RSS |
+|------|----|-----------|-------|--------|-----------|-------|
+| h_arith | L | 121/145 | 117.5 | 4617128 | 2/2 | 11.1 |
+| h_arith | U | 97/123 | 120.4 | 5839120 | 2/2 | 11.1 |
+| h_arith | M | 106/135 | 120.5 | 4078672 | 2/2 | 11.0 |
+| h_branch | L | 119/144 | 117.9 | 4616832 | 2/2 | 11.0 |
+| h_branch | U | 90/118 | 120.2 | 5837264 | 2/2 | 11.0 |
+| h_branch | M | 108/136 | 120.5 | 4077008 | 2/2 | 11.0 |
+| h_calls | L | 118/144 | 118.4 | 4616872 | 2/2 | 11.0 |
+| h_calls | U | 90/118 | 120.6 | 5837792 | 2/2 | 11.1 |
+| h_calls | M | 106/136 | 120.8 | 4077368 | 2/2 | 11.1 |
+| h_float | L | 128/152 | 116.7 | 4637984 | 2/2 | 11.1 |
+| h_float | U | 91/119 | 119.7 | 5861024 | 3/2 | 11.0 |
+| h_float | M | 106/134 | 119.9 | 4118168 | 2/2 | 11.1 |
+| h_mem | L | 262/424 | 137.6 | 4646848 | 3/3 | 11.0 |
+| h_mem | U | 140/188 | 136.2 | 5959856 | 10/9 | 11.1 |
+| h_mem | M | 172/239 | 137.2 | 4166120 | 4/4 | 11.0 |
+| h_simd | L | 143/167 | 124.1 | 4617704 | 2/2 | 11.0 |
+| h_simd | U | 98/127 | 125.7 | 5843736 | 4/3 | 10.9 |
+| h_simd | M | 120/149 | 126.1 | 4081096 | 2/2 | 11.0 |
+| p1_arith | L | 86/105 | 105.6 | 4635232 | 81/81 | 11.1 |
+| p1_arith | U | 88/105 | 108.5 | 5877944 | 108/108 | 11.1 |
+| p1_arith | M | 94/116 | 109.2 | 4146112 | 101/100 | 11.1 |
+| p2_mem | L | 243/371 | 133.5 | 4639888 | 16/16 | 11.0 |
+| p2_mem | U | 131/174 | 132.2 | 5936144 | 156/156 | 11.0 |
+| p2_mem | M | 164/222 | 133.0 | 4143368 | 48/48 | 11.1 |
+| p3_calls | L | 100/124 | 116.1 | 4612368 | 41/39 | 11.0 |
+| p3_calls | U | 88/114 | 117.5 | 5820136 | 117/116 | 11.0 |
+| p3_calls | M | 98/125 | 118.1 | 4067048 | 55/55 | 11.1 |
+| p4_simd | L | 113/134 | 116.8 | 4636096 | 56/55 | 48.2 |
+| p4_simd | U | 95/118 | 118.3 | 5892376 | 166/156 | 49.4 |
+| p4_simd | M | 110/133 | 118.8 | 4152736 | 84/83 | 48.8 |
+| p5_inline | L | 85/104 | 104.8 | 4609368 | 58/57 | 11.0 |
+| p5_inline | U | 77/101 | 107.5 | 5813704 | 896/894 | 10.8 |
+| p5_inline | M | 88/113 | 108.2 | 4059960 | 7/6 | 10.8 |
+| p6_scalar | L | 91/106 | 101.1 | 4609368 | 58/57 | 11.1 |
+| p6_scalar | U | 79/100 | 103.9 | 5813688 | 902/900 | 11.0 |
+| p6_scalar | M | 88/110 | 104.2 | 4059960 | 6/6 | 11.0 |
+| p7_branchy | L | 87/106 | 105.0 | 4609520 | 43/42 | 11.1 |
+| p7_branchy | U | 80/102 | 107.7 | 5813800 | 100/100 | 11.0 |
+| p7_branchy | M | 90/113 | 108.2 | 4060120 | 35/35 | 11.0 |
+| p8_minmax | L | 91/109 | 105.2 | 4609544 | 18/17 | 11.0 |
+| p8_minmax | U | 82/102 | 107.3 | 5813752 | 38/38 | 11.0 |
+| p8_minmax | M | 90/112 | 107.9 | 4060088 | 20/20 | 11.0 |
+| p9_u64f32 | L | 96/115 | 110.6 | 4635448 | 30/29 | 17.8 |
+| p9_u64f32 | U | 91/113 | 113.8 | 5886872 | 76/76 | 18.9 |
+| p9_u64f32 | M | 100/124 | 114.3 | 4149744 | 33/33 | 18.2 |
 
 **Findings**
-- **Size: M wins on every program** (~4.06–4.16 MB vs L 4.61–4.64, U 5.81–5.96).
-- **Compile: M ≈ L** (M faster on p2 164 vs 243, h_mem 172 vs 262; within 5–10%
-  elsewhere) but **slower than U** (the extra first-party passes cost ~10–30 ms
-  on the big programs). RSS equal.
-- **Run: M wins p5 (7 vs 58), p6 (6 vs 58), p7 (35 vs 43); ties p8 (20 vs 18),
-  p9 (33 vs 30); loses p1 (101 vs 81), p2 (48 vs 16), p3 (55 vs 41), p4 (84 vs 56).**
-- The merged `addr_base` fix caused **no change** on any row (confirmed neutral
-  across all axes — expected: 0 eligible `readonly` loads, see `rakit-exp7`).
+- **Size: M smallest on every program** (~4.06–4.16 MB vs L 4.61–4.64, U 5.81–5.96).
+- **Compile:** M ≈ L on wall/cpu (M faster on p2 164/222 vs 243/371, h_mem
+  172/239 vs 262/424); M is **slower than U** (extra passes). Compile RSS ~equal
+  (M/U ~118–137 MB; L ~101–137 MB; M ≈ U within ~1–3 MB).
+- **Run:** M wins p5 (7/6 vs 58/57), p6 (6/6 vs 58/57), p7 (35/35 vs 43/42); ties
+  p8 (20/20 vs 18/17), p9 (33/33 vs 30/29); loses p1 (101/100 vs 81/81),
+  p2 (48/48 vs 16/16), p3 (55/55 vs 41/39), p4 (84/83 vs 56/55). Run RSS ~equal.
+- **Neutrality of the `addr_base` fix is only established for p9** (paired
+  before/after: `(%rsp)` 13→13, `.opt` loads 9→9, CPU 34.5→33.6 ms, output
+  identical). There is **no paired pre-fix baseline for the other programs**, so
+  "no change on every row" is **not** claimed — the table is a single post-fix
+  L/U/M comparison.
 
-**Where the remaining gap is (all large; no sound micro-lever left)**
-- p1: branchy saturating `f64→u64` (documented negative result; constants not
-  loop-invariant at `emit`).
-- p2: sort/hash codegen + regalloc spills (backend, not a pass).
-- p3: `fib` tree + `format!`/std::fmt (algorithmic/std-level).
-- p4: separate `sinf`/`cosf` + no loop vectorizer (needs alias-aware vectorizer).
-- The hot "reloads" in p9/p4 are `Vec` **stack headers** that are written at
-  construction **before** the loop → `readonly` is unsound; alias tags do not
-  move loads; the in-loop store/call is opaque to LICM. So per-iteration header
-  reloads are **not soundly removable** with the existing flags.
-- **Conclusion:** to "win everything" the remaining work is the **loop
-  vectorizer** (p1/p4) plus backend regalloc/compile-quality (p2) — multi-week
-  efforts, not knob-sized. Next big lever = a legality analysis + map-only
-  vectorizer for the call-free `c[i]=(a[i]^b[i])*K` shape (p4 L3); the float
-  L2 loop (`acc += a[i]*b[i]`) cannot be vectorized (Rust forbids f32 reassoc).
+**Where the remaining gap is**
+- p1: branchy saturating `f64→u64` (documented negative result).
+- p2: sort/hash codegen + regalloc spills (backend).
+- p3: `fib` + `std::fmt`.
+- p4: **`sincosf` fusion IS firing** (the M binary references `sincosf`; `nm` shows
+  `U sincosf`), so p4 is *not* separate `sinf`/`cosf`. The cost is the unvectorized
+  L2/L3 plus libm cost.
+- p4 **L2 is partially vectorizable**: `s += a[i]*b[i] + (a[i]-b[i]).abs()` — the
+  per-element term is independent, so SIMD can compute the terms while the
+  accumulator `s` still adds them **in program order** (f32 non-associativity
+  forbids reassociating the accumulator, not vectorizing the terms).
+- The p9/p4 "reloads" are `Vec` **stack headers** written before the loop →
+  `readonly` is unsound. LICM's store scan keys on `can_store()` (`licm.rs:256-268`)
+  and the `sinf` **call has no `can_store`, so it is not an opaque store**; the
+  dynamic `a[i]=` store is opaque, and the header loads fail the `readonly` flag
+  check regardless. So those reloads are not soundly removable with the existing
+  flags.
+
+### M3 kickoff — vectorizer feasibility (evidence, not yet implemented)
+- **p4 L3 = `c[i] = (a[i].to_bits() ^ b[i].to_bits()).wrapping_mul(2654435761)`**
+  → u32 xor + u32 mul-by-const.
+- **Backend can do it:** x64 lowers vector `i32x4.imul` on baseline SSE2 —
+  `pmulld` when SSE4.1, else a `pmuludq` sequence (`lower.isle:1166-1182`).
+- **LLVM vectorizes it** (binary: 14 `pmuludq`, 15 `paddd`, 54 `pxor`, 98
+  `pshufd`); Rakit does not (0 `pmuludq`, 8 `pxor`). **L3 in isolation: M 66.7 ms
+  vs L 28.3 ms (38 ms gap).**
+- **Blocker is CFG shape:** p4 L3 is **multi-block** — `block29` (bounds check
+  `brif`) → `block30` (compute+store) → back-edge. Address `base + i*4`, induction
+  `i`, `i'=i+1`.
+- **Staged plan** (each gated by output validation vs LLVM + full suite):
+  1. **M3.1** single-block, bounds-free map loop `dst[i]=(s1[i]^s2[i])*K` (u32),
+     multiple-of-4 fast path + scalar tail; emit `I32X4` (`imul.i32x4` + `splat`).
+     Validated on a synthetic `get_unchecked` microbench.
+  2. **M3.2** handle the bounds-check multi-block shape (hoist `i+3 < n` or require
+     bound = slice length so checks are redundant) — this is what unlocks p4.
+  3. **M3.3** generalize ops (xor/add first), then integrate `addr_base`/private-slot.
+- Not implemented in code yet; recorded so the multi-session effort is grounded.
 
 ## Session (2026-11-24, branch `rakit-exp7`) — p9 reloads are real, but NOT soundly hoistable with the existing flags (alias tags don't move loads)
 
