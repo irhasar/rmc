@@ -59,6 +59,18 @@ value therefore needs the value-label machinery to follow/relocate alias labels
 (or debuginfo to be dropped for the merged value), which is a real M1 sub-task,
 not a drop-in pass. **Reverted** (no ICE shipped); this is the first concrete
 blocker to solve for M1.
+- **Resolved & then found redundant.** The ICE is fixable: after
+  `change_to_alias`, drop the merged value's debug label and
+  `layout.remove_inst` the now-dead load so the value-label scan never visits a
+  value with no register. That builds `core` and passes output checks — but the
+  resulting binaries are **byte-identical with and without the pass** on
+  p1–p9 (value neutral). So the egraph/MIR already eliminates *same-block*
+  redundant loads; the remaining redundancy is **cross-block** (the guard's
+  length reload vs the bounds-check length reload). Block-local load CSE is
+  therefore a no-op pass that only costs compile time → **reverted**. Conclusion
+  for M1: it must be a **cross-block** load CSE / value numbering with dominance
+  plus a no-store-on-path proof — the same alias/analysis wall as §25, i.e. the
+  genuinely hard part. Do not re-add a block-local-only version.
 
 ## Session (2026-11-24, branch `rakit-exp5`) — x64 omit-FP: implemented, correct, RUNTIME-NEUTRAL (reverted)
 
