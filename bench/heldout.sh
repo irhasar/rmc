@@ -59,7 +59,7 @@ for src in $PROGS; do
     ref="$TMP/${b}_L_${n}_${seed}.out"
     valid_L=0
     if [ "${ok_L:-0}" = 1 ]; then
-      if "$OUT/${b}_L" "$n" "$seed" >"$ref" 2>&1; then
+      if "$BENCH/validate.sh" --capture "$ref" "$OUT/${b}_L" "$n" "$seed"; then
         valid_L=1
       else
         printf '%-9s %-2s %6s | RUN_FAIL\n' "$b" L "$n"
@@ -70,15 +70,14 @@ for src in $PROGS; do
       eval "valid_$bk=0"
       eval "ok=\${ok_$bk:-0}"
       if [ "$ok" != 1 ] || [ "$valid_L" != 1 ]; then continue; fi
-      out="$TMP/${b}_${bk}_${n}_${seed}.out"
-      if ! "$OUT/${b}_$bk" "$n" "$seed" >"$out" 2>&1; then
+      "$BENCH/validate.sh" --compare "$ref" "$OUT/${b}_$bk" "$n" "$seed"
+      vrc=$?
+      if [ "$vrc" = 2 ]; then
         printf '%-9s %-2s %6s | RUN_FAIL\n' "$b" "$bk" "$n"
         fail=1
         continue
-      fi
-      if ! cmp -s "$ref" "$out"; then
+      elif [ "$vrc" != 0 ]; then
         printf '%-9s %-2s %6s | OUTPUT_MISMATCH\n' "$b" "$bk" "$n"
-        diff -u "$ref" "$out" >&2 || true
         fail=1
         continue
       fi

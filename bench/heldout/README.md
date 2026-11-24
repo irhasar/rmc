@@ -16,6 +16,11 @@ Custom inputs use `n:seed` pairs:
 INPUTS="10000:7 50000:11 200000:13" bench/heldout.sh
 ```
 
+A supplied argument that does not parse for that program is rejected with exit
+2 and a diagnostic; the harness reports a failed validation instead of silently
+timing a different workload.
+
 The harness compiles with LLVM (`L`), upstream cg_clif (`U`), and Rakit (`M`),
 checks that every output matches LLVM, and prints compile wall/CPU/RSS/size
-plus run wall/CPU/RSS.
+plus run wall/CPU/RSS. `bench/allaxes.sh` uses the same `bench/validate.sh`
+step, so discovered held-out programs are gated the same way.

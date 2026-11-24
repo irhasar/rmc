@@ -1,7 +1,24 @@
 // Held-out calls: recursive work plus a runtime-sized outer loop.
+
+fn arg<T: std::str::FromStr>(index: usize, fallback: T) -> T {
+    match std::env::args().nth(index) {
+        None => fallback,
+        Some(raw) => raw.parse().unwrap_or_else(|_| {
+            eprintln!(
+                "invalid argument {index}: {raw:?} (expected {})",
+                std::any::type_name::<T>()
+            );
+            std::process::exit(2)
+        }),
+    }
+}
 #[inline(never)]
 fn fib(n: u64) -> u64 {
-    if n < 2 { n } else { fib(n - 1) + fib(n - 2) }
+    if n < 2 {
+        n
+    } else {
+        fib(n - 1) + fib(n - 2)
+    }
 }
 
 #[inline(never)]
@@ -10,8 +27,8 @@ fn mix(x: u64) -> u64 {
 }
 
 fn main() {
-    let n: u64 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(10000);
-    let seed: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(7);
+    let n: u64 = arg(1, 10000);
+    let seed: u64 = arg(2, 7);
     let mut acc = seed;
     for i in 0..n {
         acc ^= mix(i ^ acc);

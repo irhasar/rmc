@@ -19,6 +19,24 @@
 
 # AGENTS.md
 
+## Session (2026-11-24) — all-axes output validation, strict held-out args
+- **Bug fixed:** `allaxes.sh` timed discovered held-out programs without
+  checking stdout. `bench/validate.sh` now holds the shared step: `--capture`
+  runs L, `--compare` requires exit 0 and byte-identical stdout+stderr for U/M;
+  validation uses the same args as the timed runs. Only validated rows print
+  runtime timings. `COMPILE_FAIL`/`RUN_FAIL`/`OUTPUT_MISMATCH`/`INVALID` rows
+  print compile axes but no runtime numbers, and the harness exits nonzero.
+- **Strict inputs:** all `bench/progs/h_*.rs` use `arg<T>(index, fallback)`;
+  a present-but-unparsable argument prints `invalid argument ...` and exits 2.
+  `INPUTS=100:65536` now fails `h_simd` validation instead of silently using 7.
+- **h_branch:** scales `threshold & 0xF` into the top nibble. Default inputs
+  7/11/13 now alternate arms (~5k/21k/60k transitions) instead of one low hit.
+- **measure.py:** CLI now `sys.exit(1)` when any warmup/rep fails; the JSON
+  `exit` field is no longer the only failure signal.
+- **Verification:** build 0; regressions pass; `allaxes` h_branch/h_simd match
+  LLVM; negative mismatch/exit-7 and invalid-seed cases all return rc 1 with no
+  timing rows. Compiler suite unchanged (65/25,368/0).
+
 ## Session (2026-11-23) — rec_loop effect guard, analysis cache, held-out harness
 - **Bug fixed:** `RecLoopPass` deleted base-case side effects. `try_match` only
   checked the base block's return value; `rewrite` removes five blocks, so a

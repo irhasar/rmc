@@ -3285,9 +3285,9 @@ setelah setiap pass, sehingga tidak ada analisis basi.
   `INVALID`. Kegagalan run saat pengukuran juga men-set exit code harness.
 - `measure.py` mengembalikan exit tidak nol bila **salah satu** repetisi atau
   warmup gagal, bukan hanya repetisi terakhir.
-- `h_branch` sekarang membandingkan sebelum update dan mulai di bawah
-  `threshold`, jadi lengan `else`/minimal ikut dieksekusi; output default
-  `10000 3 18444184258005128603` identik untuk L/U/M.
+- `h_branch` sekarang membandingkan sebelum update dan skala `threshold` kecil
+  ke nibble atas, sehingga lengan `else`/minimal dan `if` bergantian ribuan
+  kali; output default identik untuk L/U/M.
 
 ### 31.4 Verifikasi
 
@@ -3298,3 +3298,48 @@ setelah setiap pass, sehingga tidak ada analisis basi.
   identik dengan LLVM untuk enam program.
 - `bench/allaxes.sh` (`CREPS=1 RREPS=2`) → 15 program (9 p + 6 h), semua
   compile/run berhasil; tidak ada output mismatch.
+
+## 32. Audit ketiga: validasi all-axes, input ketat, status alat ukur (2026-11-24)
+
+### 32.1 Validasi output di `allaxes.sh`
+
+`bench/validate.sh` sekarang menjadi langkah validasi bersama untuk
+`allaxes.sh` dan `heldout.sh`. Untuk setiap program, `L` dijalankan dengan
+argumen yang sama seperti saat pengukuran dan outputnya disimpan; `U` dan `M`
+wajib keluar dengan status 0 dan stdout+stderr identik dengan referensi `L`.
+Baris timing runtime hanya dicetak setelah validasi lulus. Kegagalan
+compile/run/mismatch menghasilkan `COMPILE_FAIL`, `RUN_FAIL`, `OUTPUT_MISMATCH`,
+atau `INVALID` tanpa angka runtime, dan harness keluar dengan status tidak nol.
+
+Contoh yang diuji: program sementara yang mencetak nama executable menghasilkan
+`OUTPUT_MISMATCH` untuk U/M dan `rc=1`; program yang `exit 7` menghasilkan
+`RUN_FAIL` untuk L, `INVALID` untuk U/M, dan `rc=1`.
+
+### 32.2 Argumen held-out yang tidak valid ditolak
+
+Keenam program `h_*.rs` memakai helper `arg<T>(index, fallback)`: default hanya
+dipakai jika argumen tidak ada. Argumen yang ada tetapi gagal di-parse
+mencetak `invalid argument <n>: <nilai> (expected <tipe>)` dan keluar dengan
+status 2. Dengan `INPUTS=100:65536`, `h_simd` (seed `u16`) sekarang gagal
+validasi; sebelumnya diam-diam memakai seed 7.
+
+### 32.3 `h_branch` dan status CLI `measure.py`
+
+`h_branch` memetakan `threshold & 0xF` ke nibble atas sebelum dibandingkan.
+Untuk input default 7/11/13, kedua lengan bergantian (≈5.000/21.000/60.000
+transisi pada 10.000/50.000/200.000 iterasi), bukan hanya sekali.
+
+`bench/measure.py` kini memanggil `sys.exit(0 jika semua run/warmup sukses,
+selain itu 1)`, sehingga status kegagalan terlihat oleh shell maupun harness,
+bukan hanya sebagai field `exit` di JSON.
+
+### 32.4 Verifikasi
+
+- `./y.sh build` → exit 0.
+- `./y.sh test --sysroot rakit` → **65 suite, 25.368 test lulus, 0 gagal**
+  (tidak ada perubahan kode compiler pada putaran ini).
+- `bench/regressions.sh` → `all fixtures passed`.
+- `bench/allaxes.sh` dengan `h_branch`/`h_simd` → validasi lulus, semua output
+  identik dengan LLVM.
+- Kasus negatif allaxes (mismatch output, `exit 7`) dan heldout
+  (`INPUTS=100:65536`) semuanya keluar `rc=1` tanpa baris timing palsu.

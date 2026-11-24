@@ -5,12 +5,17 @@
 #   compile : wall, cpu (user+sys), peak RSS, artifact size
 #   run     : wall, cpu (user+sys), peak RSS
 #
+# A backend is measured only after its output matches LLVM's and its run exits
+# zero. Validation uses the same arguments as the timed runs.
+#
 # Usage: allaxes.sh [prog-glob]
 set -u
 BENCH=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(dirname "$BENCH")
 PROGS=${1:-"$BENCH/progs/*.rs"}
 OUT="$BENCH/out/allaxes"; mkdir -p "$OUT"
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
 N=nightly-2026-11-17
 TARGET=$(rustc +$N -vV | sed -n 's/^host: //p')
 RUSTC_LLVM="rustc +$N"
@@ -29,24 +34,89 @@ if [ "${SKIP_REGRESSIONS:-0}" != "1" ]; then
   "$BENCH/regressions.sh" || exit 1
 fi
 
-hdr="prog       bk | Cwall   Ccpu    Crss   size      | Rwall   Rcpu    Rrss"
+hdr="prog       bk | Cwall   Ccpu    Crss   size      | Rwall   Rcpu    Rrss | output"
 printf '%s\n' "$hdr"
-printf '%s\n' "---------------------------------------------------------------------------"
+printf '%s\n' "--------------------------------------------------------------------------------------"
+
+fail=0
 
 for src in $PROGS; do
   b=$(basename "$src" .rs)
+
   for bk in L U M; do
     bin="$OUT/${b}_$bk"
     cres=$("${MEASURE[@]}" --reps "$CREPS" --warmup 1 -- ${CMD[$bk]} --target "$TARGET" -C opt-level=3 "$src" -o "$bin" --edition 2021 | jf)
     read -r cw cc cr ce <<<"$cres"
+    eval "cw_$bk=$cw cc_$bk=$cc cr_$bk=$cr ce_$bk=$ce"
     if [ "$ce" != "0" ] || [ ! -f "$bin" ]; then
-      printf '%-10s %-2s | COMPILE_FAIL exit=%s\n' "$b" "$bk" "$ce"; continue
+      eval "ok_$bk=0 state_$bk=COMPILE_FAIL"
+      fail=1
+    else
+      eval "ok_$bk=1 state_$bk=OK sz_$bk=$(stat -c %s "$bin")"
     fi
-    sz=$(stat -c %s "$bin")
-    rres=$("${MEASURE[@]}" --reps "$RREPS" --warmup 1 -- "$bin" | jf)
+  done
+
+  ref="$TMP/${b}_L.out"
+  valid_L=0
+  if [ "${ok_L:-0}" = 1 ]; then
+    if "$BENCH/validate.sh" --capture "$ref" "$OUT/${b}_L"; then
+      valid_L=1
+    else
+      eval "state_L=RUN_FAIL"
+      fail=1
+    fi
+  fi
+
+  for bk in U M; do
+    valid=0
+    eval "ok=\${ok_$bk:-0}"
+    if [ "$ok" = 1 ] && [ "$valid_L" = 1 ]; then
+      "$BENCH/validate.sh" --compare "$ref" "$OUT/${b}_$bk"
+      vrc=$?
+      if [ "$vrc" = 0 ]; then
+        valid=1
+      elif [ "$vrc" = 2 ]; then
+        eval "state_$bk=RUN_FAIL"
+        fail=1
+      else
+        eval "state_$bk=OUTPUT_MISMATCH"
+        fail=1
+      fi
+    elif [ "${ok:-0}" = 1 ]; then
+      eval "state_$bk=INVALID"
+      fail=1
+    fi
+    eval "valid_$bk=$valid"
+  done
+  eval "valid_L=$valid_L"
+
+  for bk in L U M; do
+    eval "ok=\${ok_$bk:-0}"
+    eval "state=\${state_$bk:-INVALID}"
+    if [ "$ok" != 1 ]; then
+      eval "ce=\${ce_$bk:-?}"
+      printf '%-10s %-2s | COMPILE_FAIL exit=%s\n' "$b" "$bk" "$ce"
+      continue
+    fi
+    eval "cw=\$cw_$bk cc=\$cc_$bk cr=\$cr_$bk sz=\$sz_$bk"
+    eval "valid=\${valid_$bk:-0}"
+    if [ "$valid" != 1 ]; then
+      printf '%-10s %-2s | %6sms %6sms %6sM %9s | %s\n' \
+        "$b" "$bk" "$cw" "$cc" "$(mb "$cr")" "$sz" "$state"
+      continue
+    fi
+    rres=$("${MEASURE[@]}" --reps "$RREPS" --warmup 1 -- "$OUT/${b}_$bk" | jf)
     read -r rw rc rr re <<<"$rres"
-    printf '%-10s %-2s | %6sms %6sms %6sM %9s | %6sms %6sms %6sM\n' \
-      "$b" "$bk" "$cw" "$cc" "$(mb $cr)" "$sz" "$rw" "$rc" "$(mb $rr)"
+    if [ "$re" != 0 ]; then
+      fail=1
+      printf '%-10s %-2s | %6sms %6sms %6sM %9s | RUN_FAIL exit=%s\n' \
+        "$b" "$bk" "$cw" "$cc" "$(mb "$cr")" "$sz" "$re"
+      continue
+    fi
+    printf '%-10s %-2s | %6sms %6sms %6sM %9s | %6sms %6sms %6sM | ok\n' \
+      "$b" "$bk" "$cw" "$cc" "$(mb "$cr")" "$sz" "$rw" "$rc" "$(mb $rr)"
   done
   echo
 done
+
+exit "$fail"

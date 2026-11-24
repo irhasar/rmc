@@ -66,3 +66,4 @@ if __name__ == "__main__":
     else:
         print(f"{res['name']}: wall={res['wall_med']*1000:.1f}ms (min {res['wall_min']*1000:.1f}) "
               f"cpu={res['cpu_med']*1000:.1f}ms rss={res['maxrss_med_kb']/1024:.1f}MB exit={res['exit']}")
+    sys.exit(0 if res["exit"] == 0 else 1)

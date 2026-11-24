@@ -1,9 +1,22 @@
 // Held-out SIMD: runtime-sized packed-integer multiply/add/shift loop.
+
+fn arg<T: std::str::FromStr>(index: usize, fallback: T) -> T {
+    match std::env::args().nth(index) {
+        None => fallback,
+        Some(raw) => raw.parse().unwrap_or_else(|_| {
+            eprintln!(
+                "invalid argument {index}: {raw:?} (expected {})",
+                std::any::type_name::<T>()
+            );
+            std::process::exit(2)
+        }),
+    }
+}
 use std::arch::x86_64::*;
 
 fn main() {
-    let n: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(10000);
-    let seed: u16 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(7);
+    let n: usize = arg(1, 10000);
+    let seed: u16 = arg(2, 7);
     let mut sum = 0u64;
     unsafe {
         let mut acc = _mm_set1_epi16(seed as i16);
