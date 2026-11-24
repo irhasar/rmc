@@ -93,8 +93,12 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
 - **Backend can do it:** x64 lowers vector `i32x4.imul` on baseline SSE2 —
   `pmulld` when SSE4.1, else a `pmuludq` sequence (`lower.isle:1166-1182`).
 - **LLVM vectorizes it** (binary: 14 `pmuludq`, 15 `paddd`, 54 `pxor`, 98
-  `pshufd`); Rakit does not (0 `pmuludq`, 8 `pxor`). **L3 in isolation: M 66.7 ms
-  vs L 28.3 ms (38 ms gap).**
+  `pshufd`); Rakit does not (0 `pmuludq`, 8 `pxor`).
+  **Correction:** the earlier "L3 isolation M 66.7 vs L 28.3" **conflated the
+  array-construction loops** with the kernel. Proper isolation (repeat the kernel
+  20x on fixed data, 80M iters): **L 49.9 ms vs M 110.3 ms (~2.2x)**, and L is
+  **memory-bound** (~48 MB/pass x 20 = ~960 MB => ~50 ms at ~20 GB/s), so a 4-wide
+  vectorized M can reach ~L. Vectorizer justified by the *kernel*, not the init.
 - **Blocker is CFG shape:** p4 L3 is **multi-block** — `block29` (bounds check
   `brif`) → `block30` (compute+store) → back-edge. Address `base + i*4`, induction
   `i`, `i'=i+1`.
