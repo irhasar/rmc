@@ -362,6 +362,23 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
     two-source `a[i] += b[i]` -> `paddd` (guard still emitted for `b`), f32
     `a[i] *= 2.0` -> `mulps`. New `t_vectorize_inplace`
     (n=1000/999/17/15/1/0); regressions asserts the four ops.
+  - **M4.9 LANDED: wide volatile reads + real overlap fixtures.**
+    (a) `read_volatile::<__m256i>` aborted codegen: the direct trapping load used
+    a 256-bit vector type that the x64 backend cannot lower. Only layouts up to
+    128 bits take the single direct load now; wider ones are read in
+    supported-size chunks (i64→i32→i16→i8) with **trapping** loads into a fresh
+    stack slot, so an unused result still performs the read and no wide load is
+    emitted (`vol256_discard`/`vol256_use`/`vol12_*` verified L==M).
+    (b) The `constmul1`/`scalemul` overlap fixtures used **two** allocations, so
+    they never overlapped; both now alias one buffer with the destination one
+    element ahead, which genuinely exercises the scalar fallback (checksums
+    recomputed from LLVM).
+    New `bench/tests/t_volatile.rs` (volatile byte loop, discarded byte read,
+    12-byte struct, `__m256i`); `regressions.sh` asserts the loop is never
+    widened and that each discard case keeps `mfence` plus a real read.
+    Gate: suite 65/25368/0; regressions green; allaxes 15/15 ok, run total
+    413 ms vs L 412 (1.00x), compile 1626 vs 1899 ms (0.86x), size 61.5 vs
+    69.35 MB (-11.3%); vs upstream run 0.16x.
   - **M4.8 LANDED: second review round.**
     (a) A discarded volatile read was still dropped: `load_scalar` emits a
     `notrap` load and `must_lower_even_if_unused` skips it, leaving only the

@@ -64,9 +64,12 @@ fn main() {
     let h64 = ck(&o64);
     let hf1 = ck(&of1.iter().map(|x| x.to_bits() as u64).collect::<Vec<_>>());
     let hf2 = ck(&of2.iter().map(|x| x.to_bits() as u64).collect::<Vec<_>>());
-    let mut ov = vec![0u32; n];
+    // Same allocation, destination one element ahead: the ranges overlap, so the
+    // map must take the scalar fallback.
+    let mut ov = a32.clone();
     let o: unsafe extern "C" fn(*const u32, *mut u32, usize) = constmul1;
-    unsafe { o(a32.as_ptr(), ov.as_mut_ptr().add(1), n - 1) };
+    let op = ov.as_mut_ptr();
+    unsafe { o(op as *const u32, op.add(1), n - 1) };
     println!(
         "u32mul={} i64add={} f32mul={} f32sub={} ov={}",
         h32,

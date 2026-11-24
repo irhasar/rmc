@@ -733,15 +733,42 @@ fn codegen_regular_intrinsic_call<'tcx>(
                 ),
                 _ => None,
             };
+            let size = inner_layout.size.bytes() as i64;
             let val = match rakit_ty {
-                Some(ty) => {
+                // The x64 backend only lowers vector loads up to 128 bits.
+                Some(ty) if size <= 16 => {
                     let v = fx
                         .bcx
                         .ins()
                         .load(ty, MemFlagsData::new(), ptr_val, Offset32::new(0));
                     CValue::by_val(v, inner_layout)
                 }
-                None => CValue::by_ref(Pointer::new(ptr_val), inner_layout),
+                // Wider values (e.g. `__m256i`) have no single load: read them
+                // into a local slot in chunks the target can lower. The loads
+                // stay trapping, so an unused result still performs the read.
+                _ => {
+                    let align = if size % 8 == 0 { 8 } else { 1 };
+                    let slot = fx.create_stack_slot(size as u32, align);
+                    let mut off = 0i64;
+                    while off < size {
+                        let left = size - off;
+                        let (ty, step) = if left >= 8 {
+                            (types::I64, 8)
+                        } else if left >= 4 {
+                            (types::I32, 4)
+                        } else if left >= 2 {
+                            (types::I16, 2)
+                        } else {
+                            (types::I8, 1)
+                        };
+                        let v = Pointer::new(ptr_val)
+                            .offset(fx, Offset32::new(off as i32))
+                            .load(fx, ty, MemFlagsData::new());
+                        slot.offset_i64(fx, off).store(fx, v, MemFlagsData::new().with_notrap());
+                        off += step;
+                    }
+                    CValue::by_ref(slot, inner_layout)
+                }
             };
             ret.write_cvalue(fx, val);
         }

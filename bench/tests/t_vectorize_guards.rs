@@ -53,22 +53,6 @@ pub unsafe extern "C" fn sum_ctr2(pa: *const u32, ctr: *mut u32, n: usize) -> u3
     }
     s
 }
-// The result is discarded: the volatile read must still happen.
-#[inline(never)]
-#[no_mangle]
-pub unsafe extern "C" fn vol_discard(pa: *const u8) {
-    let _ = core::ptr::read_volatile(pa);
-}
-#[inline(never)]
-#[no_mangle]
-pub unsafe extern "C" fn vol_loop(pa: *const u8, pc: *mut u8, n: usize) {
-    let mut i = 0usize;
-    while i < n {
-        let v = core::ptr::read_volatile(pa.add(i));
-        core::ptr::write_volatile(pc.add(i), v ^ 0x5a);
-        i += 1;
-    }
-}
 fn ck(v: &[u64]) -> u64 {
     let mut h = 1469598103934665603u64;
     for &x in v {
@@ -83,10 +67,6 @@ fn main() {
         let mut ctr = 0u32;
         let f: unsafe extern "C" fn(*const u32, *mut u32, usize) -> u32 = sum_ctr;
         let s = unsafe { f(a.as_ptr(), &mut ctr, n) };
-        let ab: Vec<u8> = (0..n).map(|i| (i as u8).wrapping_mul(37)).collect();
-        let mut ob = vec![0u8; n];
-        let g: unsafe extern "C" fn(*const u8, *mut u8, usize) = vol_loop;
-        unsafe { g(ab.as_ptr(), ob.as_mut_ptr(), n) };
         let mut o2 = vec![0u32; n];
         let m2: unsafe extern "C" fn(*const u32, *mut u32, usize) = mul2;
         unsafe { m2(a.as_ptr(), o2.as_mut_ptr(), n) };
@@ -97,19 +77,9 @@ fn main() {
         let mut ctr2 = 0u32;
         let f2: unsafe extern "C" fn(*const u32, *mut u32, usize) -> u32 = sum_ctr2;
         let s2 = unsafe { f2(a.as_ptr(), &mut ctr2, n) };
-        let vd: unsafe extern "C" fn(*const u8) = std::hint::black_box(vol_discard);
-        let one = [7u8; 1];
-        unsafe { vd(one.as_ptr()) };
         println!(
-            "n={} sum={} ctr={} vol={} mul2={} mul8={} sum2={} ctr2={}",
-            n,
-            s,
-            ctr,
-            ck(&ob.iter().map(|x| *x as u64).collect::<Vec<_>>()),
-            h2,
-            h8,
-            s2,
-            ctr2
+            "n={} sum={} ctr={} mul2={} mul8={} sum2={} ctr2={}",
+            n, s, ctr, h2, h8, s2, ctr2
         );
     }
 }
