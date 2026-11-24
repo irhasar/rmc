@@ -81,6 +81,7 @@ check t_vectorize_const 'u32mul=7406505972513382635 i64add=16879444138376719115 
 check t_vectorize_sum $'n=1000 u32=4213332 u64=6494044\nn=999 u32=4210927 u64=6481210\nn=5 u32=23274 u64=795\nn=3 u32=13985 u64=432\nn=1 u32=4660 u64=153\nn=0 u32=0 u64=0'
 check t_vectorize_bitops $'n=1000 and=8679198063293307935 or=17640510044461566455\nn=999 and=425701985508822469 or=16951716591865051082\nn=5 and=3321434351676732587 or=7594011638986234852\nn=2 and=11141768042474047163 or=14494034960203992247\nn=0 and=1469598103934665603 or=1469598103934665603'
 check t_vectorize_start $'s=0 mul=7406505972513382635 sum=4225677\ns=1 mul=6626696854460331983 sum=4221017\ns=3 mul=16778483497030676228 sum=4211692\ns=5 mul=12379647581177015243 sum=4202403\ns=1000 mul=10102475090843504739 sum=12345'
+check t_vectorize_scalar $'n=1000 mul=7406505972513382635 add=9424463066469146027 fmul=10425260595837503587\nn=999 mul=3464759790932634684 add=8376324054428928831 fmul=12049442534097153681\nn=5 mul=6468920626777132041 add=4948225117454695846 fmul=12629251342556830121\nn=2 mul=2034113175188541570 add=13298927877194760002 fmul=5938173602147907835\nn=0 mul=1469598103934665603 add=1469598103934665603 fmul=1469598103934665603'
 
 # Output equality alone cannot prove the vectorizer ran. Each fixture below
 # contains exactly one xor+imul loop, so a packed multiply (SSE2 lowering of
@@ -169,6 +170,21 @@ if command -v objdump >/dev/null 2>&1; then
     ss=$(objdump -d --disassemble=startsum "$TMP/t_vectorize_start_M" --no-show-raw-insn 2>/dev/null)
     if ! printf '%s\n' "$ss" | grep -q paddd; then
         echo "[regression] t_vectorize_start: missing paddd in startsum" >&2
+        fail=1
+    fi
+    scm=$(objdump -d --disassemble=scalemul "$TMP/t_vectorize_scalar_M" --no-show-raw-insn 2>/dev/null)
+    if ! printf '%s\n' "$scm" | grep -q pmuludq; then
+        echo "[regression] t_vectorize_scalar: missing pmuludq in scalemul" >&2
+        fail=1
+    fi
+    sca=$(objdump -d --disassemble=scaleadd "$TMP/t_vectorize_scalar_M" --no-show-raw-insn 2>/dev/null)
+    if ! printf '%s\n' "$sca" | grep -q paddd; then
+        echo "[regression] t_vectorize_scalar: missing paddd in scaleadd" >&2
+        fail=1
+    fi
+    scf=$(objdump -d --disassemble=fscale "$TMP/t_vectorize_scalar_M" --no-show-raw-insn 2>/dev/null)
+    if ! printf '%s\n' "$scf" | grep -q mulps; then
+        echo "[regression] t_vectorize_scalar: missing mulps in fscale" >&2
         fail=1
     fi
 fi

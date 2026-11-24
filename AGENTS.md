@@ -292,6 +292,17 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
     `t_vectorize_bitops` (and/or, n=1000/999/5/2/0) and `t_vectorize_start`
     (map + sum, s=0/1/3/5/1000); `regressions.sh` asserts `pand`/`por` in
     `bandfn`/`borfn` and `pmuludq`/`paddd` in `startmul`/`startsum`.
+  - **M3.8 LANDED: loop-invariant scalar broadcast.** `Rhs::Scalar(Value)` lets
+    `c[i] = a[i] OP s` vectorize when `s` is a loop-invariant scalar (defined
+    outside the loop, same type as the element) for every existing lane/op
+    (`pmuludq`/`paddd`/`mulps`/…). The disjointness guard ignores scalars (only
+    memory sources count). New `t_vectorize_scalar` (u32 `*k`, u32 `+k`, f32
+    `*k`; n=1000/999/5/2/0); `regressions.sh` asserts `pmuludq`/`paddd`/`mulps`.
+  - **u8/u16 lanes: deferred (reverted).** Plain `a[i]` on `&[u8]`/`&[u16]`
+    lowers to **narrow** `uload8`/`sload16` loads and `istore8`/`istore16`
+    stores, which the matcher rejects (it requires exact `Load`/`Store`).
+    Supporting them needs widening/narrow load-store handling. The
+    `Lanes::U8/U16` experiment did not fire and was reverted (no effect).
 
 ## Session (2026-11-24, branch `rakit-exp7`) — p9 reloads are real, but NOT soundly hoistable with the existing flags (alias tags don't move loads)
 

@@ -7,7 +7,8 @@
 //!
 //! Target: header `H(i: i64)` brifs on a trip `i < n` (constant or a
 //! loop-invariant runtime bound); single-block
-//! body `B` computes `c[i] = (a[i] OP b[i]) [* K]` or `c[i] = a[i] OP K` for
+//! body `B` computes `c[i] = (a[i] OP b[i]) [* K]`, `c[i] = a[i] OP K`, or
+//! `c[i] = a[i] OP s` (loop-invariant scalar) for
 //! loop-invariant base
 //! pointers, `addr = base + (i << 2)` (u32 lanes), then `i += 1` and jumps `H`.
 //!
@@ -149,6 +150,8 @@ enum Rhs {
     Mem(Value),
     IntConst(i64),
     FConst { bits: u64, is_f32: bool },
+    /// A loop-invariant scalar broadcast to every lane (`c[i] = a[i] OP s`).
+    Scalar(Value),
 }
 
 struct Plan {
@@ -418,6 +421,10 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
             Rhs::IntConst(ci)
         } else if let Some((bits, is_f32)) = fconst_bits(dfg, c) {
             Rhs::FConst { bits, is_f32 }
+        } else if dfg.value_type(c) == elem_ty
+            && defined_outside(dfg, &func.layout, c, h, b)
+        {
+            Rhs::Scalar(c) // loop-invariant scalar broadcast
         } else {
             return None;
         };
@@ -425,6 +432,7 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
             (Rhs::IntConst(_), Lanes::U32 | Lanes::I64) => {}
             (Rhs::FConst { is_f32, .. }, Lanes::F32) if *is_f32 => {}
             (Rhs::FConst { is_f32, .. }, Lanes::F64) if !*is_f32 => {}
+            (Rhs::Scalar(_), _) => {} // already checked == elem_ty
             _ => return None,
         }
         (load_bases[0], cval)
@@ -800,6 +808,7 @@ fn apply(func: &mut Function, p: Plan) {
                 };
                 cur.ins().splat(vt, fc)
             }
+            Rhs::Scalar(v) => cur.ins().splat(vt, v),
         };
         let combined = match p.op {
             Opcode::Bxor => cur.ins().bxor(va, other),
