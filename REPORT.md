@@ -3335,7 +3335,10 @@ transisi pada 10.000/50.000/200.000 iterasi), bukan hanya sekali.
 
 `bench/measure.py` kini memanggil `sys.exit(1)` bila ada warmup/repetisi yang
 gagal atau outputnya tidak cocok dengan `--expect`, sehingga status kegagalan
-terlihat oleh shell maupun harness, bukan hanya sebagai field JSON.
+terlihat oleh shell maupun harness, bukan hanya sebagai field JSON. Saat
+`--expect` diberikan dan hasilnya tidak valid, ringkasan teks tidak dicetak;
+hanya diagnostik `OUTPUT MISMATCH`/`RUN FAIL` di stderr. Output `--json` tetap
+memuat `exit`, `output_ok`, dan `valid` untuk harness.
 
 ### 32.4 Verifikasi
 

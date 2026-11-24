@@ -33,8 +33,10 @@
   `INPUTS=100:65536` now fails `h_simd` validation instead of silently using 7.
 - **h_branch:** scales `threshold & 0xF` into the top nibble. Default inputs
   7/11/13 now alternate arms (~5k/21k/60k transitions) instead of one low hit.
-- **measure.py:** CLI now `sys.exit(1)` when any warmup/rep fails; the JSON
-  `exit` field is no longer the only failure signal.
+- **measure.py:** CLI now `sys.exit(1)` when any warmup/rep fails or `--expect`
+  output mismatches. With `--expect`, an invalid result prints only the stderr
+  diagnostic, not a text timing summary; `--json` still carries `exit`,
+  `output_ok`, and `valid`.
 - **Verification:** build 0; regressions pass; `allaxes` h_branch/h_simd match
   LLVM; negative mismatch/exit-7 and invalid-seed cases all return rc 1 with no
   timing rows. Compiler suite unchanged (65/25,368/0).

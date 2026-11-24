@@ -95,7 +95,7 @@ if __name__ == "__main__":
                 expect=a.expect)
     if a.json:
         print(json.dumps(res))
-    else:
+    elif not a.expect or res["valid"]:
         print(f"{res['name']}: wall={res['wall_med']*1000:.1f}ms (min {res['wall_min']*1000:.1f}) "
               f"cpu={res['cpu_med']*1000:.1f}ms rss={res['maxrss_med_kb']/1024:.1f}MB exit={res['exit']}")
     sys.exit(0 if res["valid"] else 1)
