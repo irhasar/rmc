@@ -482,7 +482,7 @@ fn match_header(func: &Function, h: Block) -> Option<Plan> {
             return None;
         };
         match (&cval, lanes) {
-            (Rhs::IntConst(_), Lanes::U32 | Lanes::I64) => {}
+            (Rhs::IntConst(_), Lanes::U32 | Lanes::I64 | Lanes::U8 | Lanes::U16) => {}
             (Rhs::FConst { is_f32, .. }, Lanes::F32) if *is_f32 => {}
             (Rhs::FConst { is_f32, .. }, Lanes::F64) if !*is_f32 => {}
             (Rhs::Scalar(_), _) => {} // already checked == elem_ty

@@ -332,6 +332,20 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
     byte and unsigned word min/max need SSE4.1 and stay out). New
     `t_vectorize_minmax` (n=1000/999/17/15/1/0); `regressions.sh` asserts the four
     ops.
+  - **M4.2 LANDED: u8/u16 constant operands.** `(Rhs::IntConst, U8|U16)` is now
+    allowed, so `c[i] = a[i] OP K` for `+ ^ & |` becomes `paddb`/`pxor`/`pand`/
+    `por`/`paddw` (splat of `iconst.i8`/`i16` lowers fine; no multiply/min/max).
+    New `t_vectorize_narrow_const` (8 fns, n=1000/999/17/15/1/0); regressions
+    asserts `paddb`/`pxor`/`pand`/`por`/`paddw`.
+  - **Vector shifts: BLOCKED by a Cranelift ICE.** `ishl`/`ushr`/`sshr` with a
+    splat-constant amount ICEs in x64 lowering (`mask_xmm_shift`: "cannot
+    construct Gpr from register ... with register class Float"). Reverted; needs
+    a fix in the vendored Cranelift before shifts can vectorize.
+  - **Slice loops (bounds checks): not vectorized.** `for i in 0..n { c[i]=a[i]+b[i] }`
+    lowers every access with a bounds `icmp`+`brif` to a cold `call panic; trap`
+    block, i.e. a multi-block body *with internal control flow*. Vectorizing it
+    needs bounds-check elimination / range analysis (prove `i < len` from the
+    loop guard), not just the chain matcher.
 
 ## Session (2026-11-24, branch `rakit-exp7`) — p9 reloads are real, but NOT soundly hoistable with the existing flags (alias tags don't move loads)
 
