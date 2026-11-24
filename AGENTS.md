@@ -1,5 +1,16 @@
 ## Session (2026-11-24, branch `rakit-exp8`) — post-`addr_base`-fix all-axes scoreboard (L/U/M); remaining gap is all large
 
+### M3 kickoff — vectorizer feasibility (evidence, not yet implemented)
+- **p4 L3 = `c[i] = (a[i].to_bits() ^ b[i].to_bits()).wrapping_mul(2654435761)`**, `a,b: Vec<f32>`, `c: Vec<u32>` → per element: bitcast f32→u32 (free), xor, **u32 multiply by constant**, store u32.
+- **Backend can do it:** the x64 backend lowers vector `i32x4.imul` on baseline SSE2 — `pmulld` when SSE4.1, else a `pmuludq`-based sequence (`lower.isle:1166-1182`). No backend work needed for the mul.
+- **LLVM already vectorizes this**: its binary has 14 `pmuludq`, 15 `paddd`, 54 `pxor`, 98 `pshufd`; Rakit has 0 `pmuludq`, 8 `pxor`. **L3 in isolation: M 66.7 ms vs L 28.3 ms (38 ms gap).** So vectorizing L3 is worth it.
+- **The blocker is CFG shape:** p4 L3 is **multi-block** — `block29` (bounds check `brif`) → `block30` (compute+store) → back-edge `block4`. Address form: `addr = base + (i*4)` with `i` the induction var; `i' = i+1`.
+- **Staged plan** (each stage gated by output validation vs LLVM + full suite):
+  1. **M3.1** single-block, bounds-check-free map loop `dst[i] = (s1[i]^s2[i])*K` (u32), constant or runtime trip with a `len` that is a multiple-of-4 fast path + scalar tail; emit `I32X4` body via `imul.i32x4` and `splat`. Validated on a synthetic `get_unchecked` microbench (M vs L).
+  2. **M3.2** handle the bounds-check multi-block shape (either hoist `i+3 < n` before the vector body, or require the induction bound to equal the slice length so the checks are provably redundant).
+  3. **M3.3** generalize ops (add/xor only first; mul later), then integrate with `addr_base`/private-slot info.
+- Not started in code yet; recorded so the multi-session effort is grounded. (No behavioral change.)
+
 Ran the canonical matrix on the merged build (`cd bench && CREPS=2 RREPS=7
 ./allaxes.sh`; log `/tmp/allaxes_now.log`). All rows `ok` (stdout validated
 against LLVM by the harness). Run/compile in ms, size in bytes; RSS ~equal
