@@ -91,7 +91,7 @@ check t_vectorize_shift_var $'n=1000 s=0 4443170450025176819 4443170450025176819
 check t_vectorize_inplace $'n=1000 2067684494068040691 4955472742519183899 2257382229062978179 7219609798812422243 mix=1216567661396735\nn=999 4938945738208900473 14598870757050654369 6360620038797656489 3574130843177975441 mix=16855457192477885161\nn=17 3956057608133206998 12127250348921852964 14400859015502114329 18144213985805612505 mix=13086125181362180361\nn=15 4854181577974998993 2643014722888691377 4245625956762491497 4326354876010677041 mix=16259185720986712641\nn=1 4953162257141659110 15597959157331910276 4953163356653287321 341477803479070617 mix=4953163356653287321\nn=0 1469598103934665603 1469598103934665603 1469598103934665603 1469598103934665603 mix=1469598103934665603'
 check t_vectorize_slice $'n=1000 2067684494068040691 2257382229062978179 2067684494068040691\nn=999 4938945738208900473 6360620038797656489 4938945738208900473\nn=17 3956057608133206998 14400859015502114329 3956057608133206998\nn=15 4854181577974998993 4245625956762491497 4854181577974998993\nn=1 4953162257141659110 4953163356653287321 4953162257141659110\nn=0 1469598103934665603 1469598103934665603 1469598103934665603'
 check t_vectorize_guards $'n=1000 sum=499500 ctr=1000 mul2=14734897173167142259 mul8=5635034875195320451 sum2=499500 ctr2=1000\nn=4 sum=6 ctr=4 mul2=4806693891325407483 mul8=17023279625793469443 sum2=6 ctr2=4\nn=3 sum=3 ctr=3 mul2=12198867445692768159 mul8=12189314888668763241 sum2=3 ctr2=3\nn=1 sum=0 ctr=1 mul2=4953163356653287321 mul8=4953163356653287321 sum2=0 ctr2=1\nn=0 sum=0 ctr=0 mul2=1469598103934665603 mul8=1469598103934665603 sum2=0 ctr2=0'
-check t_volatile $'n=1000 loop=17230722056597992339\nn=17 loop=18156365728903607819\nn=1 loop=4953257914653313467\nn=0 loop=1469598103934665603\nv256 18004264572236793056\nv12 3735928559 305419896 3405691582'
+check t_volatile $'n=1000 loop=17230722056597992339\nn=17 loop=18156365728903607819\nn=1 loop=4953257914653313467\nn=0 loop=1469598103934665603\nv256 18004264572236793056\nv12 3735928559 305419896 3405691582\nv512 0 efa6f4a65354892b'
 
 # Output equality alone cannot prove the vectorizer ran. Each fixture below
 # contains exactly one xor+imul loop, so a packed multiply (SSE2 lowering of
@@ -304,24 +304,39 @@ if command -v objdump >/dev/null 2>&1; then
             fail=1
         fi
     done
-    # Volatile: never widened, reads preserved, wide values read in chunks.
+    # Volatile: never widened, every source load issued, wide values copied.
     vv="$TMP/t_volatile_M"
     d=$(objdump -d --disassemble=vol_u8_loop "$vv" --no-show-raw-insn 2>/dev/null)
     if printf '%s\n' "$d" | grep -qE "\b(paddb|paddd|movdqu)\b"; then
         echo "[regression] t_volatile: volatile byte loop was vectorized" >&2
         fail=1
     fi
-    for fn in vol_discard_u8 vol12_discard vol256_discard; do
-        d=$(objdump -d --disassemble=$fn "$vv" --no-show-raw-insn 2>/dev/null)
+    # A discarded read must issue *all* of its source loads with an alignment the
+    # value guarantees (an aggregate must not become one misaligned wide load).
+    check_src_loads() {
+        fn=$1
+        want=$2
+        got=$(objdump -d --disassemble="$fn" "$vv" --no-show-raw-insn 2>/dev/null \
+            | grep -cE 'mov[a-z]*[[:space:]]+[0-9a-fx]*\(%rdi\),')
+        if [ "$got" -ne "$want" ]; then
+            echo "[regression] t_volatile: $fn issued $got source loads, want $want" >&2
+            fail=1
+        fi
+        d=$(objdump -d --disassemble="$fn" "$vv" --no-show-raw-insn 2>/dev/null)
         if ! printf '%s\n' "$d" | grep -q mfence; then
             echo "[regression] t_volatile: $fn lost its fence" >&2
             fail=1
         fi
-        if ! printf '%s\n' "$d" | grep -q '(%r'; then
-            echo "[regression] t_volatile: $fn read was dropped" >&2
-            fail=1
-        fi
-    done
+    }
+    check_src_loads vol_discard_u8 1
+    check_src_loads vol12_discard 3
+    check_src_loads vol256_discard 4
+    check_src_loads vol512_discard 0
+    d=$(objdump -d --disassemble=vol512_discard "$vv" --no-show-raw-insn 2>/dev/null)
+    if ! printf '%s\n' "$d" | grep -q call; then
+        echo "[regression] t_volatile: vol512_discard did not use a copy call" >&2
+        fail=1
+    fi
 
 fi
 

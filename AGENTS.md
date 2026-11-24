@@ -362,6 +362,49 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
     two-source `a[i] += b[i]` -> `paddd` (guard still emitted for `b`), f32
     `a[i] *= 2.0` -> `mulps`. New `t_vectorize_inplace`
     (n=1000/999/17/15/1/0); regressions asserts the four ops.
+  - **M4.10 LANDED: volatile chunk alignment + per-program matrix.**
+    (a) Chunking a wide volatile read by 8 bytes issued a misaligned `i64` load
+    for a 4-byte-aligned aggregate (faults where misaligned loads are not
+    supported). The chunked path is now a single `emit_small_memory_copy` with
+    the source's guaranteed ABI alignment (`1` for `unaligned_volatile_load`)
+    and trapping flags, so chunk sizes stay within that alignment and large
+    values use a library call instead of unbounded expansion. Verified:
+    `vol12_discard` (field at offset 4 inside a `repr(C)` wrapper) issues
+    exactly three 4-byte loads, `vol256_discard` four 8-byte loads,
+    `vol_discard_u8` one, `vol512_discard` zero inline loads plus a `memcpy`
+    call; every case keeps `mfence`.
+    (b) `t_volatile` cast an 8-byte-aligned array to `*const __m256i`
+    (undefined alignment); it now uses a `#[repr(C, align(32))]` wrapper, and a
+    `Big512([u64; 64])` case covers the library-call path.
+    (c) `regressions.sh` counts *source load instructions* (`mov…(%rdi),`) per
+    function and requires the exact number, so a partially dropped read fails
+    and stores/address arithmetic no longer satisfy the check.
+
+    **Full all-axes matrix** (CREPS=2 RREPS=7, `bench/allaxes.sh`; compile =
+    wall ms / cpu ms / peak RSS MB / bytes, run = wall ms / cpu ms / peak RSS MB):
+
+    | prog | C L | C U | C M | R L | R U | R M |
+    |---|---|---|---|---|---|---|
+    | h_arith | 126/151/118.0/4617128 | 96/125/119.3/5839120 | 104/133/120.5/4078224 | 2/2/11.0 | 2/2/11.0 | 2/2/11.1 |
+    | h_branch | 117/142/118.5/4616832 | 90/119/119.3/5837264 | 105/135/121.1/4076568 | 2/2/11.1 | 2/2/10.7 | 2/2/11.1 |
+    | h_calls | 118/144/118.7/4616872 | 92/121/119.6/5837792 | 104/133/120.7/4076928 | 2/2/11.0 | 3/3/11.1 | 2/2/10.8 |
+    | h_float | 126/151/117.6/4637984 | 92/118/118.5/5861024 | 107/134/119.8/4117728 | 2/2/11.1 | 3/2/11.0 | 2/2/11.1 |
+    | h_mem | 279/452/138.2/4646856 | 136/186/134.7/5959856 | 175/246/136.6/4165648 | 3/3/11.0 | 10/9/11.0 | 4/4/10.8 |
+    | h_simd | 141/165/124.3/4617704 | 96/125/124.7/5843736 | 114/143/125.8/4080656 | 2/2/11.0 | 4/3/11.0 | 2/2/11.0 |
+    | p1_arith | 85/103/106.3/4635232 | 86/107/108.1/5877944 | 92/116/109.1/4145648 | 82/81/10.8 | 108/108/11.0 | 102/101/11.0 |
+    | p2_mem | 251/384/134.4/4639896 | 134/179/131.0/5936144 | 166/224/133.0/4142864 | 17/16/10.8 | 159/161/11.0 | 49/49/11.0 |
+    | p3_calls | 101/124/116.1/4612368 | 89/115/116.6/5820136 | 102/130/118.1/4066592 | 37/37/11.1 | 118/118/11.0 | 58/58/11.0 |
+    | p4_simd | 108/128/116.8/4636096 | 95/120/117.2/5892376 | 110/135/118.6/4152280 | 57/57/48.2 | 160/157/49.4 | 84/83/48.8 |
+    | p5_inline | 83/103/105.2/4609368 | 80/104/106.9/5813704 | 92/118/108.0/4059504 | 58/58/11.1 | 895/893/11.0 | 7/6/11.1 |
+    | p6_scalar | 89/108/101.8/4609368 | 80/103/102.9/5813688 | 87/109/104.2/4059504 | 58/57/11.0 | 907/907/11.1 | 7/6/10.9 |
+    | p7_branchy | 91/109/105.6/4609520 | 82/106/106.8/5813800 | 90/114/107.9/4059664 | 43/43/11.1 | 101/101/11.0 | 36/35/11.0 |
+    | p8_minmax | 86/103/105.4/4609544 | 81/103/106.9/5813752 | 89/111/107.9/4059648 | 18/17/11.0 | 39/38/11.1 | 21/20/10.8 |
+    | p9_u64f32 | 98/118/111.3/4635448 | 91/115/112.8/5886872 | 101/126/114.5/4149304 | 31/30/17.8 | 78/78/18.8 | 35/34/18.2 |
+    | **TOTAL** | 1899/2485/1738.2/69350216 | 1420/1846/1745.3/87847208 | 1638/2107/1765.8/61490760 | 414/409/209.1 | 2589/2582/211.2 | 413/406/209.7 |
+
+    M vs L: compile **0.86x**, size **-11.3%**, run **1.00x**; M vs U: compile
+    1.16x, size -30.0%, run **0.16x**. Suite 65/25368/0; regressions green;
+    allaxes 15/15 ok, no INVALID.
   - **M4.9 LANDED: wide volatile reads + real overlap fixtures.**
     (a) `read_volatile::<__m256i>` aborted codegen: the direct trapping load used
     a 256-bit vector type that the x64 backend cannot lower. Only layouts up to

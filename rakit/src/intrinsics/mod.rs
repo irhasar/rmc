@@ -747,27 +747,36 @@ fn codegen_regular_intrinsic_call<'tcx>(
                 // into a local slot in chunks the target can lower. The loads
                 // stay trapping, so an unused result still performs the read.
                 _ => {
-                    let align = if size % 8 == 0 { 8 } else { 1 };
-                    let slot = fx.create_stack_slot(size as u32, align);
-                    let mut off = 0i64;
-                    while off < size {
-                        let left = size - off;
-                        let (ty, step) = if left >= 8 {
-                            (types::I64, 8)
-                        } else if left >= 4 {
-                            (types::I32, 4)
-                        } else if left >= 2 {
-                            (types::I16, 2)
-                        } else {
-                            (types::I8, 1)
-                        };
-                        let v = Pointer::new(ptr_val)
-                            .offset(fx, Offset32::new(off as i32))
-                            .load(fx, ty, MemFlagsData::new());
-                        slot.offset_i64(fx, off).store(fx, v, MemFlagsData::new().with_notrap());
-                        off += step;
+                    // No single load above 128 bits. Copy into a local slot with
+                    // an alignment-aware copy: chunk sizes stay within the
+                    // source's guaranteed alignment (an i64 load would be
+                    // misaligned for a 4-byte-aligned aggregate) and large
+                    // values use a library call instead of unbounded expansion.
+                    // The flags keep the source loads trapping, so an unused
+                    // result still performs the read.
+                    let align = if matches!(intrinsic, sym::unaligned_volatile_load) {
+                        1
+                    } else {
+                        inner_layout.align.bytes().try_into().unwrap_or(1)
+                    };
+                    if size == 0 {
+                        CValue::by_ref(Pointer::new(ptr_val), inner_layout)
+                    } else {
+                        let align = align.min(size as u32);
+                        let slot = fx.create_stack_slot(size as u32, align);
+                        let dst = slot.get_addr(fx);
+                        fx.bcx.emit_small_memory_copy(
+                            fx.target_config,
+                            dst,
+                            ptr_val,
+                            size as u64,
+                            align as u8,
+                            align as u8,
+                            true,
+                            MemFlagsData::new(),
+                        );
+                        CValue::by_ref(slot, inner_layout)
                     }
-                    CValue::by_ref(slot, inner_layout)
                 }
             };
             ret.write_cvalue(fx, val);
