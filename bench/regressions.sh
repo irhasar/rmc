@@ -671,8 +671,12 @@ then
     printf '%s\n' "$sfout" | tail -5 >&2
     fail=1
 else
-    if ! printf '%s\n' "$sfout" | grep -q '^\[sf\]'; then
-        echo "[regression] t_deep_cast_chain: store forwarding reported nothing" >&2
+    # A completed summary (`[sf] <fn> insts=...`) is the only line that says the
+    # pass handled the function: the bail messages (`no stack slot`, `nothing
+    # trackable`) also start with `[sf]` and would otherwise satisfy this.
+    if ! printf '%s\n' "$sfout" | grep -qE '^\[sf\] \S+ insts=[0-9]+ '; then
+        echo "[regression] t_deep_cast_chain: store forwarding completed on no function" >&2
+        printf '%s\n' "$sfout" | grep '^\[sf\]' | head -5 >&2
         fail=1
     fi
     if printf '%s\n' "$sfout" | grep -q 'truncated'; then

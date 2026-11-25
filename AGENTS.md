@@ -1,4 +1,17 @@
 ## Session (2026-11-24, branch `rakit-exp12`) — store-forward address memoisation; write-once rule rejected
+## Session (2026-11-25, branch `rakit-exp13`) — review round 17: skip messages are not a summary
+
+- **The deep-cast regression accepted bail messages as proof the pass ran.** It
+  required a line starting with `[sf]`, and the debug messages added in round 16
+  (`no stack slot`, `nothing trackable`) start with exactly that: on
+  `t_deep_cast_chain` the compile prints 26 summaries *and* 7 skip lines, so the
+  check could be satisfied by the skips alone. It now requires a completed summary
+  (`[sf] <fn> insts=<n> ...`), and prints the `[sf]` lines it did see when it fails.
+- Verified in both directions: a log holding only `no stack slot` /
+  `nothing trackable` is rejected, a summary line is accepted, and the real
+  fixture still passes with 26 summaries and no truncation.
+- Harness only; no compiler change. `regressions.sh` exit 0.
+
 ## Session (2026-11-25, branch `rakit-exp13`) — review round 16: the counter gate could not be attributed, so it is gone
 
 - **A positive `xblk` could come from a helper, not the shape.** Confirmed by
