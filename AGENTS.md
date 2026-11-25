@@ -43,6 +43,25 @@ kept in two `I8X16` variables — a `CPlace`/`analyze` change, not a lowering on
 Note this is *not* where ripgrep's remaining gap is (memchr is ~5 ms of a
 ~2.1 s run).
 
+**Negative result — do not retry naively: forwarding the over-aligned slots.**
+Taught `store_forward` an `AlignedSlot(slot, shift)` base so a store through
+`iadd(stack_addr(s), shift)` forwards to a load through the *same* derived
+pointer, plus `analyze`/DSE conservatism for the unknown shift. Result: the
+AVX2 kernel got **worse** (3.11 → 4.7 ms) and the function gained loads
+(16 → 25). Making the slot private pulls it into the pass's fact machinery,
+where the new "same slot, unknown shift ⇒ always invalidate" rule destroys
+plain-slot facts that used to survive, while the aligned store/load pairs
+mostly *don't* match (rakit recomputes the idiom per access, so the `shift`
+values differ). Reverted. If retried, first canonicalise the idiom so every
+access to a slot shares one derived pointer value.
+
+**ripgrep matrix reproduced this session** (`ripgrep 14.1.1`, 2000-file / 40 MB
+corpus, M/L): literal 2.42×, captures 2.28×, `-i` alternation **6.51×**,
+multi-pattern `-F x4` **7.44×**, `--files` 1.75×, total **5.35×** (M 2076 ms,
+L 388 ms, U 4695 ms). The two worst are regex-automata's Teddy prefilter, which
+is the AVX2 path above — so closing the 32-byte SIMD slot round-trip is what
+moves ripgrep, not the byte-copy lowering.
+
 **Push status:** `GITHUB_TOKEN` and `OH_GIT_CREDENTIAL_ACCESS_TOKEN_GITHUB` are
 both rejected for `irhasar/rmc` (403 / invalid token). Commit `89c6302` is local
 only; push with a user-supplied `repo`-scoped PAT.
