@@ -1,4 +1,49 @@
 ## Session (2026-11-24, branch `rakit-exp12`) — store-forward address memoisation; write-once rule rejected
+## Session (2026-11-25, branch `rakit-exp12`) — review round 3: three store-forward miscompiles
+
+All three were reproduced with a fixture **before** the fix, using the
+previously built `dist/bin/rustc-rakit` (the `.so` is not part of cargo's
+fingerprint, so the old pass was still installed).
+
+- **Provenance stopped at `Binary`.** `provenance_rec` matched only
+  `InstructionData::Binary`, but `pure_address_arith` also accepts `uextend`,
+  `sextend`, `ireduce` and `bitcast`, which are *unary*. A cast of a
+  `stack_addr` therefore had no provenance, so handing it to a call did not mark
+  the slot as escaping (`!is_addr && !pure_address_arith(call)` was never
+  reached) and `drop_dead_stores` removed its initialization. Fixture
+  `t_cast_escape` smuggles the address as `f64` bits into a non-inlined reader:
+  pre-fix `1`, LLVM `127`, fixed `127`. The match now uses
+  `data.opcode()` + `arguments()`, i.e. every format the whitelist accepts.
+  This only ever *adds* escapes: `prov`/`confined` are unchanged, and
+  `drop_dead_stores` already treats an unknown base conservatively.
+- **Tracked-access test used the candidate pointer set.** `addr_only` was
+  filtered by `escaping_ptr` *after* the "is this access tracked?" loop, so a
+  pointer used both as a store address and as an operand of further address
+  arithmetic passed the test while `record_store` later classified the same
+  store as untracked — which keeps private-slot facts. A direct load after the
+  overwrite was forwarded the stale value. Fixture `t_ptr_store_alias`
+  (`*sa = 1; p = sa + off; *p = 7; q = p + 1; read *sa`): pre-fix `1 0`,
+  LLVM `7 0`, fixed `7 0`. The retain now happens before the loop.
+- **Fences were inconsistent between the two halves.** `forward_block` stops
+  recording stores after a `fence` (they may be volatile writes) but `transfer`
+  kept recording them, so a *successor* could forward a value the same block
+  refused to. `transfer` now seals as well.
+- **Harness**: `run_once` gained `err_path` so a caller comparing *results* can
+  keep stderr out of the capture (rgbench compares stdout, notes a stderr
+  difference); rgbench totals accumulate only for searches all three backends
+  completed and matched (they used to be summed inside the per-backend loop);
+  cratebench hashes a temp *file* rather than a shell variable, since
+  substitution strips trailing newlines and drops NUL bytes; the volatile-dead
+  regression now sums the bytes each fenced region stores (16 then 40) instead
+  of accepting "any store after a fence" — verified to fail on a fixture with
+  only the 16-byte write.
+
+**Gate:** std rebuilt with the fixed pass (`rm -rf build/stdlib_target` first —
+the .so is not in cargo's fingerprint); `./y.sh test --sysroot rakit` → 65
+suites / 25,368 passed / 0 failed; `bench/regressions.sh` → all fixtures pass;
+`allaxes` 45/45 `ok`, artifact sizes byte-identical, compile wall/CPU within
+noise, run wall within ±1 ms (p8 21→20, p2 42→41).
+
 ## Session (2026-11-24, branch `rakit-exp12`) — review round 2: shared-temp trust, proof strength
 
 **Findings that were already fixed by the previous commit are marked ✓; the rest
