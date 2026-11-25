@@ -1,4 +1,77 @@
 ## Session (2026-11-24, branch `rakit-exp12`) — store-forward address memoisation; write-once rule rejected
+## Session (2026-11-24, branch `rakit-exp12`) — three real miscompiles fixed, harness audit
+
+**Three confirmed miscompiles, each reproduced before the fix and pinned by a
+new fixture (`bench/tests/`, run by `bench/regressions.sh`).**
+
+1. **Overlapping `ptr::copy` (`src/common.rs`).** `emit_const_copy`'s vector-chunk
+   path stored each 16-byte chunk as soon as it loaded it, so `ptr::copy(buf,
+   buf+1, 32)` copied chunk 0 twice (`t_copy_overlap`, 32/48/64-byte sizes both
+   directions). The chunk path now requires `non_overlapping`; `ptr::copy` keeps
+   `emit_small_memory_copy`, which loads every chunk before storing any.
+2. **Volatile write elided (`rakit-opt/.../store_forward.rs`).** Rakit has no
+   volatile bit: `volatile_store` lowers to `fence` + ordinary stores, and a
+   16-byte write's `memcpy` is inlined into two vector stores. `drop_dead_stores`
+   kept a store only when some load read its bytes, so a volatile write into a
+   local array that nothing reads was **deleted** (IR: `fence` then nothing).
+   Stores after a fence in the same block are now kept and also never recorded
+   as forwardable facts (`sealed`), because forwarding the only reader would
+   delete the write just the same. `t_volatile_dead` asserts the fixture's IR
+   dump still has a store after the `fence`.
+3. **SIMD mask width (`src/intrinsics/simd.rs`).** The comparison fast paths
+   filled the mask with one vector compare of the *input* lanes, but Rust's
+   comparison intrinsics take the mask lane type separately:
+   `simd_eq::<i32, i8, 8>` wrote 32 bytes of lanes into an 8-byte result and
+   `simd_lt::<i32, i64, 8>` read 32 bytes out of a 64-byte one (`t_simd_mask`
+   printed garbage, then wild values). Both paths now require the result's lane
+   count and lane size to match the input. `simd_half_ty` also returned a
+   non-vector / 8-byte "half" for padded and `i128`-lane layouts, and the split
+   paths plus the wide vector copy emitted `I8X16` on targets whose backend
+   cannot lower it (riscv64/s390x); both are now gated on 128-bit vector support
+   (`Arch::X86_64 | Arch::AArch64`).
+
+**ISA feature mapping (`src/lib.rs`).** `-Ctarget-feature=+avx2` was applied
+without the implied `+avx`, and Cranelift gates every VEX/EVEX encoding on
+`has_avx`, so `+avx2` silently kept the SSE2 lowering. The AVX family now
+widens to `has_avx` (AVX-512 to `has_avx2` as well), `internal_target_features`
+is consulted too, the VNNI setting is spelled `has_avx_vnni`, and RISC-V `-c`
+clears `has_zca`/`has_zcd` instead of failing on the preset name. Verified:
+baseline binary 0 VEX ops, `+avx2` binary 9 (`vpxor`/`vmovdqu`).
+
+**Harness audit (`bench/rgbench.sh`, `extbench/*`).** rgbench counted a failed
+search as a valid one (three empty captures compare equal, so a missing corpus
+printed `ok` with garbage timings), wrote its captures to predictable `/tmp`
+names, reported no run CPU/RSS, and exited 0 on a mismatch; it now checks the
+exit status, uses a private `mktemp -d`, reports run CPU/RSS, exits nonzero on
+failure, and only trusts an existing checkout that is ripgrep 14.1.1 and not
+group/world writable. `cratebench.sh` now creates `OUTDIR`, drops stale
+captures, fails the capture itself, and requires all three backends to have
+built+run+captured before comparing. `gen_corpus.sh` refuses to `rm -rf` a
+directory it did not generate; `rg_work.sh` uses `pipefail`.
+
+**Gate:** `./y.sh test --sysroot rakit` → 65 suites / **25,368 passed / 0
+failed** (exit 0); `bench/regressions.sh` → all fixtures pass (3 new);
+`bench/allaxes.sh CREPS=3 RREPS=9` → 45/45 rows `ok`, byte-identical output.
+
+| prog | Cwall L/M | size L/M | Rwall L/M |
+|---|---|---|---|
+| p1_arith | 86/**86** | 4.64/**4.16** MB | 81/**101** |
+| p2_mem | 240/**168** | 4.64/**4.16** | 16/**42** |
+| p3_calls | 97/**92** | 4.61/**4.08** | 37/**56** |
+| p4_simd | 105/**100** | 4.64/**4.17** | 55/**84** |
+| p5_inline | 81/**78** | 4.61/**4.07** | 58/**6** |
+| p6_scalar | 81/**79** | 4.61/**4.07** | 58/**6** |
+| p7_branchy | 83/**80** | 4.61/**4.07** | 43/**35** |
+| p8_minmax | 82/**81** | 4.61/**4.07** | 18/**21** |
+| p9_u64f32 | 95/**93** | 4.64/**4.16** | 30/**34** |
+
+No row regressed against the previous session. Runtime parity is still open on
+p1/p2/p3/p4/p8/p9; the vectorizer lives in `vendor/rakit-codegen/src/vectorize.rs`
+(one canonical 4-lane `I32X4` map loop, lanes taken from the loads) and rejects
+p4's `c[i] = (a[i].to_bits() ^ b[i].to_bits()) * K` because the loads are `f32`
+and the store is `u32` — the cheapest remaining runtime lever, worth ~25% of
+p4, and still short of LLVM.
+
 
 **What landed.** `provenance_slot` and `const_upper_bound` are mutually
 recursive walks over the address graph, and `analyze`/`cross_block_entry`/
