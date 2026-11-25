@@ -157,6 +157,11 @@ pub(crate) fn codegen_icmp_imm(
 /// and a 32-byte `__m256i` round-trips through such a slot on every operation,
 /// so the chunk size decides how much of an AVX2 kernel's work is memory
 /// traffic. Wider or odd sizes keep the existing lowering.
+///
+/// The chunk loop stores each chunk as soon as it is loaded, which is only
+/// correct when the ranges cannot overlap: `ptr::copy` must behave like a copy
+/// through a temporary buffer. Overlapping copies therefore stay on
+/// `emit_small_memory_copy`, which loads every chunk before storing any.
 pub(crate) fn emit_const_copy(
     fx: &mut FunctionCx<'_, '_, '_>,
     dst: Value,
@@ -164,7 +169,7 @@ pub(crate) fn emit_const_copy(
     bytes: u64,
     non_overlapping: bool,
 ) {
-    if bytes != 0 && bytes % 16 == 0 && bytes <= 64 {
+    if non_overlapping && bytes != 0 && bytes % 16 == 0 && bytes <= 64 {
         // The vector chunks make no alignment claim of their own; the callers
         // pass `MemFlagsData::new()` (unaligned, trapping) at every site.
         let flags = MemFlagsData::new();
