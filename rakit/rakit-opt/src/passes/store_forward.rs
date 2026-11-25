@@ -297,8 +297,7 @@ fn run_body(
     if !loaded.is_empty() {
         for block in func.layout.blocks().collect::<Vec<_>>() {
             cross_forwarded += forward_block(
-                func, block, &private, &ptr_bases, &loaded, &entry, endianness, &confined,
-                &prov,
+                func, block, &private, &ptr_bases, &loaded, &entry, endianness, &confined, &prov,
                 dbg,
             );
         }
@@ -715,8 +714,7 @@ fn forward_block(
             if args.len() >= 2 {
                 let (value, addr) = (args[0], args[1]);
                 let key = record_store(
-                    func, inst, value, addr, &mut avail, private, ptr_bases, loaded, confined,
-                    prov,
+                    func, inst, value, addr, &mut avail, private, ptr_bases, loaded, confined, prov,
                 );
                 if let (true, Some(key)) = (count_cross, key) {
                     locally_stored.insert(key);
@@ -784,7 +782,9 @@ fn credited(
     ty: types::Type,
 ) -> bool {
     match inherited {
-        Some(inherited) => !locally_stored.contains(&key) && inherited.get(&key) == Some(&(value, ty)),
+        Some(inherited) => {
+            !locally_stored.contains(&key) && inherited.get(&key) == Some(&(value, ty))
+        }
         None => false,
     }
 }
