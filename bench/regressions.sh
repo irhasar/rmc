@@ -371,9 +371,13 @@ if command -v objdump >/dev/null 2>&1; then
             fail=1
         fi
         # A plain copy of the read value may use 16-byte moves (the volatile
-        # accesses themselves are the `i64` loads counted above). Anything
-        # narrower than 32 bytes must not contain a vector move at all.
-        if [ "${3:-0}" != allow_vector_copy ] \
+        # accesses themselves are the `i64` loads counted above). What must never
+        # happen is a *wide* load from the volatile source itself.
+        if printf '%s\n' "$d" | grep -qE "\bmovdqu[[:space:]]+[0-9a-fx]*\(%rdi"; then
+            echo "[regression] t_volatile: $fn widened a volatile load" >&2
+            fail=1
+        fi
+        if [ "${3:-0}" != allow_vector_copy ] && [ "$want" -lt 4 ] \
             && printf '%s\n' "$d" | grep -qE "\bmovdqu\b"; then
             echo "[regression] t_volatile: $fn was vectorized" >&2
             fail=1
@@ -386,9 +390,12 @@ if command -v objdump >/dev/null 2>&1; then
     check_src_loads vol512_discard 1
     # The source here is a local stack slot whose stores are visible: store
     # forwarding must not substitute them for the volatile reads.
+    # Only the 64-bit moves are the volatile reads; a plain copy of the value may
+    # use vector moves, so those are not counted. A 40-byte copy is 16+16+8, so
+    # its tail adds exactly one 64-bit stack load on top of the five reads.
     got=$(objdump -d --disassemble=vol_stack_discard "$vv" --no-show-raw-insn 2>/dev/null \
-        | grep -cE 'mov[a-z]*[[:space:]]+[0-9a-fx]*\(%r(sp|bp)[^)]*\),')
-    if [ "$got" -ne 5 ]; then
+        | grep -cE '\bmov[q]?[[:space:]]+[0-9a-fx]*\(%r(sp|bp)[^)]*\),')
+    if [ "$got" -ne 6 ]; then
         echo "[regression] t_volatile: vol_stack_discard issued $got stack loads, want 5" >&2
         fail=1
     fi

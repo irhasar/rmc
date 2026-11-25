@@ -55,6 +55,16 @@ mostly *don't* match (rakit recomputes the idiom per access, so the `shift`
 values differ). Reverted. If retried, first canonicalise the idiom so every
 access to a slot shares one derived pointer value.
 
+**Generalised the copy inlining (LANDED):** `%Memcpy` was only inlined for
+sizes that are a multiple of 16, so 40/56/72-byte aggregate copies — which is
+what `Option<Vec>` and `RawTableInner` bookkeeping actually copy — stayed
+libcalls. `chunk_plan` now splits any constant size ≤128 into 16-byte chunks plus
+an 8/4/2/1 tail. p2_mem 46.8 → **41.2 ms (−12%)**, 23 of 35 memcpy call sites
+gone, `p3_calls` neutral. The `t_volatile` regression checks had to be made
+precise: they counted *all* stack loads and banned `movdqu` outright, so a
+vectorised **plain** copy (which their own comment allows) tripped them; they now
+count only 64-bit moves and reject a wide load from the volatile source itself.
+
 **Two more attempts at the same slot, both neutral or worse (measured):**
 
 1. *Restricted* `AlignedSlot`: only slots with **no** direct `stack_addr` access
