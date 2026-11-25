@@ -95,6 +95,8 @@ check t_volatile $'n=1000 loop=17230722056597992339\nn=17 loop=18156365728903607
 check t_copy_overlap $'N=16 shift=1 11664426682378596937\nback N=16 shift=1 12713388859568982132\nN=32 shift=1 774115827419797049\nback N=32 shift=1 5146083939088780532\nN=32 shift=7 16864641215232849398\nback N=32 shift=7 6744451032907730017\nN=48 shift=3 11240810308952937694\nback N=48 shift=3 9582033626409429593\nN=64 shift=1 4928807640131852377\nback N=64 shift=1 13460265805155334836\nN=64 shift=16 3546406609664978499\nback N=64 shift=16 14022381290388415283\nnonoverlap 1882637779704813251'
 check t_simd_mask $'i8x8 eq [-1, 0, -1, 0, -1, 0, -1, 0]\ni64x8 lt [0, 0, 0, -1, 0, -1, 0, 0]\ni32x8 lt [0, 0, 0, -1, 0, -1, 0, 0]\nu8x2 eq [255, 0]'
 check t_volatile_dead 'written'
+check t_cast_escape '127'
+check t_ptr_store_alias '7 0'
 
 # A volatile write must not be elided. `volatile_store` lowers to `fence` plus
 # ordinary stores (Rakit has no volatile bit), so a store has to survive after
@@ -109,6 +111,89 @@ if command -v objdump >/dev/null 2>&1; then
         fail=1
     elif ! awk '/fence/{f=1} f && /^[ \t]+store/{found=1} END{exit !found}' "$vdump"; then
         echo "[regression] t_volatile_dead: volatile stores were elided" >&2
+        fail=1
+    fi
+    # "some store after a fence" is too weak: the fixture performs two writes
+    # (16 and 40 bytes) and either one can disappear on its own. Sum the bytes
+    # each fenced region stores and require both writes to be present.
+    # `$TMP/vdead` is only the IR-dump target (`--emit=llvm-ir` skips the link),
+    # so the disassembly has to come from the binary `check` built.
+    vbin=$TMP/t_volatile_dead_M
+    vmain=$(nm "$vbin" 2>/dev/null | grep -E '4main$' | awk '{print $3}' | head -1)
+    objdump -d --no-show-raw-insn --disassemble="$vmain" "$vbin" 2>/dev/null \
+        >"$TMP/vdead.dis"
+    if [ -z "$vmain" ] || [ ! -s "$TMP/vdead.dis" ]; then
+        echo "[regression] t_volatile_dead: no disassembly of main" >&2
+        fail=1
+    elif ! python3 - "$TMP/vdead.dis" <<'EOF'
+import re, sys
+
+WIDE = {"movdqu": 16, "movdqa": 16, "movups": 16, "movaps": 16}
+SUFFIX = {"movq": 8, "movl": 4, "movw": 2, "movb": 1}
+REG = {}
+for names, size in ((("rax", "rcx", "rdx", "rbx", "rsi", "rdi", "rbp", "rsp"), 8),
+                    (("eax", "ecx", "edx", "ebx", "esi", "edi", "ebp", "esp"), 4),
+                    (("ax", "cx", "dx", "bx", "si", "di", "bp", "sp"), 2),
+                    (("al", "cl", "dl", "bl", "sil", "dil", "bpl", "spl"), 1)):
+    for n in names:
+        REG[n] = size
+
+
+def store_bytes(mnemonic, src):
+    if mnemonic in WIDE:
+        return WIDE[mnemonic]
+    if mnemonic in SUFFIX:
+        return SUFFIX[mnemonic]
+    if mnemonic != "mov":
+        return 0
+    src = src.strip()
+    if src.startswith("$"):
+        return 8
+    m = re.search(r"%(\w+)", src)
+    if not m:
+        return 0
+    r = m.group(1)
+    if r in REG:
+        return REG[r]
+    if re.fullmatch(r"r\d+", r):
+        return 8
+    if re.fullmatch(r"r\d+d", r):
+        return 4
+    if re.fullmatch(r"r\d+b", r):
+        return 1
+    if re.fullmatch(r"r\d+w", r):
+        return 2
+    return 0
+
+
+region = 0
+sums = {}
+for line in open(sys.argv[1]):
+    text = line.split("#")[0].strip()
+    if ":" not in text:
+        continue
+    text = text.split(":", 1)[1].strip()
+    if text == "mfence":
+        region += 1
+        sums.setdefault(region, 0)
+        continue
+    parts = text.split(None, 1)
+    if len(parts) != 2 or "(" not in parts[1]:
+        continue
+    mnemonic, operands = parts
+    src, _, dst = operands.rpartition(",")
+    if "(" not in dst:  # a load, not a store
+        continue
+    sums[region] = sums.get(region, 0) + store_bytes(mnemonic, src)
+
+# The fixture performs a 16-byte write and then a 40-byte one.
+if len(sums) != 3 or sums.get(1, 0) < 16 or sums.get(2, 0) < 40:
+    print(f"fenced store bytes per region: {sums}, want 2 regions of >=16 and >=40",
+          file=sys.stderr)
+    sys.exit(1)
+EOF
+    then
+        echo "[regression] t_volatile_dead: a volatile write is missing" >&2
         fail=1
     fi
 fi

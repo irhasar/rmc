@@ -94,17 +94,24 @@ fn provenance_rec(
         return hit;
     }
     let result = match dfg.value_def(v) {
-        ir::ValueDef::Result(inst, 0) => match &dfg.insts[inst] {
-            ir::InstructionData::StackAddr { stack_slot, .. } => Some(*stack_slot),
-            ir::InstructionData::Binary { opcode, .. } if pure_address_arith(*opcode) => {
-                dfg.insts[inst]
+        ir::ValueDef::Result(inst, 0) => {
+            let data = &dfg.insts[inst];
+            match data {
+                ir::InstructionData::StackAddr { stack_slot, .. } => Some(*stack_slot),
+                // Every format `pure_address_arith` accepts keeps the value
+                // derived from the same slot, including the conversions that are
+                // not `Binary` (`uextend`, `ireduce`, `bitcast`, …). Missing them
+                // is unsound, not merely imprecise: the cast result would then
+                // have no provenance, so passing it to a call would not mark the
+                // slot as escaping and its initialization could be dropped.
+                _ if pure_address_arith(data.opcode()) => data
                     .arguments(&dfg.value_lists)
                     .iter()
                     .filter_map(|&arg| provenance_rec(func, cache, arg, depth - 1))
-                    .next()
+                    .next(),
+                _ => None,
             }
-            _ => None,
-        },
+        }
         _ => None,
     };
     cache.prov.insert(v, result);
@@ -409,6 +416,14 @@ fn analyze(func: &ir::Function) -> Bases {
         }
     }
 
+    // A pointer that is also an operand of another address computation is not a
+    // tracked base (`record_store` treats its stores as untracked), so the
+    // tracked-access test below must see the *final* pointer set. Testing the
+    // candidate set accepted such a store as tracked, which kept the slot private
+    // while forwarding could not invalidate it: a later direct load of the slot
+    // then returned the value stored before it.
+    addr_only.retain(|v| !escaping_ptr.contains(v));
+
     // An access whose address is derived from a slot but that the pass does not
     // track reads or writes that slot without a key: a dead-store decision based
     // on the tracked loads alone would then delete a store this load needs, and a
@@ -425,7 +440,6 @@ fn analyze(func: &ir::Function) -> Bases {
     }
 
     slots.retain(|s| !escaping_slots.contains(s));
-    addr_only.retain(|v| !escaping_ptr.contains(v));
 
     let mut loaded: FxHashSet<Key> = FxHashSet::default();
     for (inst, addr) in loads {
@@ -722,13 +736,24 @@ fn transfer(
     confined: &FxHashMap<Value, Confined>,
     prov: &FxHashMap<Base, StackSlot>,
 ) -> Avail {
+    // A fence seals the block exactly as it does in `forward_block`: the stores
+    // after it may be volatile writes, so they must not become facts a successor
+    // forwards into. Recording them here while the block-local walk refuses them
+    // made the two halves of the pass disagree about the same store.
+    let mut sealed = false;
     for event in events {
         match *event {
             SfEvent::Clobber => {
                 avail.retain(|&(b, _), _| matches!(b, Base::Slot(_)));
             }
-            SfEvent::Fence => avail.clear(),
+            SfEvent::Fence => {
+                avail.clear();
+                sealed = true;
+            }
             SfEvent::Store { inst, value, addr } => {
+                if sealed {
+                    continue;
+                }
                 record_store(
                     func, inst, value, addr, &mut avail, private, ptr_bases, loaded, confined,
                     prov,
