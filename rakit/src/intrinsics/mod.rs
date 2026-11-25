@@ -409,7 +409,7 @@ fn codegen_regular_intrinsic_call<'tcx>(
 
             fx.bcx.ins().debugtrap();
         }
-        sym::copy => {
+        sym::copy | sym::copy_nonoverlapping => {
             intrinsic_args!(fx, args => (src, dst, count); intrinsic);
             let src = src.load_scalar(fx);
             let dst = dst.load_scalar(fx);
@@ -431,22 +431,17 @@ fn codegen_regular_intrinsic_call<'tcx>(
             // 8 bytes instead costs a full call + return per element and shows
             // up as a ~10x slowdown in sort-heavy code. When the byte count is a
             // small compile-time constant, inline it as load/store pairs.
+            let non_overlapping = intrinsic == sym::copy_nonoverlapping;
             match crate::unroll::const_of(&fx.bcx.func, count)
                 .and_then(|c| c.checked_mul(elem_size))
             {
                 Some(bytes) if bytes != 0 && bytes <= 8 * 8 => {
-                    fx.bcx.emit_small_memory_copy(
-                        fx.target_config,
-                        dst,
-                        src,
-                        bytes,
-                        1,
-                        1,
-                        false,
-                        MemFlagsData::new(),
-                    );
+                    crate::common::emit_const_copy(fx, dst, src, bytes, non_overlapping);
                 }
                 // FIXME emit_small_memmove
+                _ if non_overlapping => {
+                    fx.bcx.call_memcpy(fx.target_config, dst, src, byte_amount)
+                }
                 _ => fx.bcx.call_memmove(fx.target_config, dst, src, byte_amount),
             }
         }

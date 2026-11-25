@@ -149,6 +149,45 @@ pub(crate) fn codegen_icmp_imm(
     }
 }
 
+/// Copy `bytes` bytes from `src` to `dst` when the size is a compile-time
+/// constant.
+///
+/// A multiple of 16 up to 64 bytes becomes one 16-byte vector load/store per
+/// chunk. `emit_small_memory_copy` would split the same copy into `i64` pairs,
+/// and a 32-byte `__m256i` round-trips through such a slot on every operation,
+/// so the chunk size decides how much of an AVX2 kernel's work is memory
+/// traffic. Wider or odd sizes keep the existing lowering.
+pub(crate) fn emit_const_copy(
+    fx: &mut FunctionCx<'_, '_, '_>,
+    dst: Value,
+    src: Value,
+    bytes: u64,
+    non_overlapping: bool,
+) {
+    if bytes != 0 && bytes % 16 == 0 && bytes <= 64 {
+        // The vector chunks make no alignment claim of their own; the callers
+        // pass `MemFlagsData::new()` (unaligned, trapping) at every site.
+        let flags = MemFlagsData::new();
+        let mut offset = 0i32;
+        while u64::from(offset as u32) < bytes {
+            let val = fx.bcx.ins().load(types::I8X16, flags, src, offset);
+            fx.bcx.ins().store(flags, val, dst, offset);
+            offset += 16;
+        }
+        return;
+    }
+    fx.bcx.emit_small_memory_copy(
+        fx.target_config,
+        dst,
+        src,
+        bytes,
+        1,
+        1,
+        non_overlapping,
+        MemFlagsData::new(),
+    );
+}
+
 pub(crate) fn codegen_bitcast(fx: &mut FunctionCx<'_, '_, '_>, dst_ty: Type, val: Value) -> Value {
     let mut flags = MemFlagsData::new();
     flags.set_endianness(match fx.tcx.data_layout.endian {

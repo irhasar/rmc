@@ -3,6 +3,7 @@
 pub mod div_test;
 pub mod if_convert;
 pub mod inliner;
+pub mod memcpy_inline;
 pub mod rec_loop;
 pub mod rotate;
 pub mod sincos;
@@ -163,3 +164,5 @@ impl Pass for SincosPass {
         })
     }
 }
+
+pub use memcpy_inline::MemcpyInlinePass;
