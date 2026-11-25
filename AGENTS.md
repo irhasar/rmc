@@ -1,4 +1,22 @@
 ## Session (2026-11-24, branch `rakit-exp12`) — store-forward address memoisation; write-once rule rejected
+## Session (2026-11-25, branch `rakit-exp12`) — review round 11: assert the diagnostic
+
+- **Bug:** every negative self-test only asked for a nonzero exit, so a checker
+  that cannot parse a minus sign at all "passed" them: `v2-8` becomes
+  "unparsable store address" and `stack_addr ss1-8` becomes "names no stack
+  slot" — both nonzero, neither the bug the dump encodes.
+- **Fix:** `vol_reject <dump> <fragment>` requires the rejection to *say* the
+  expected thing (`8-byte store at -8 leaves the 40-byte slot`,
+  `16-byte store at 32 leaves the 40-byte slot`,
+  `no fully written 40-byte object`) and reports "rejected ... for the wrong
+  reason" otherwise; `vol_accept` does the same for dumps that must pass. The
+  fragment carries the offset, so the assertion cannot be satisfied by a
+  parse failure.
+- **Verified both ways:** with `OFFSET` reduced to `(?:\+(\d+))?` the harness
+  now fails on both negative dumps with "for the wrong reason: unparsable store
+  address 'v2-8'" and "names no stack slot" (`fail=1`); with the real checker it
+  passes (`fail=0`). Harness-only change: no compiler or std rebuild.
+
 ## Session (2026-11-25, branch `rakit-exp12`) — review round 10: negative offsets
 
 - **Bug:** the address regexes only knew `+`. A store to `v2-8` failed to match

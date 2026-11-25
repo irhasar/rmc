@@ -245,6 +245,28 @@ for reg, size in want.items():
         fail(f"region {reg}: no fully written {size}-byte object, stores per slot: {seen}")
 PYEOF
 
+# The self-tests below assert *why* the checker rejected a dump. Accepting any
+# nonzero exit would let a parse failure (say, a checker that cannot read a
+# negative offset at all) stand in for detecting the bug the dump encodes.
+vol_accept() {
+    local out
+    if ! out=$(python3 "$TMP/volcheck.py" "$1" 2>&1); then
+        echo "[regression] volatile checker rejects $1: $out" >&2
+        fail=1
+    fi
+}
+
+vol_reject() {
+    local out
+    if out=$(python3 "$TMP/volcheck.py" "$1" 2>&1); then
+        echo "[regression] volatile checker accepts $1" >&2
+        fail=1
+    elif ! printf '%s\n' "$out" | grep -qF -- "$2"; then
+        echo "[regression] volatile checker rejected $1 for the wrong reason: $out" >&2
+        fail=1
+    fi
+}
+
 if ! RAKIT_DUMP=1 env -u RAKIT_HOST_LLVM "$ROOT/rakit/dist/bin/rustc-rakit" --target "$TARGET" \
     -C opt-level=3 "$BENCH/tests/t_volatile_dead.rs" -o "$TMP/vdead" --edition 2021 \
     >"$TMP/vdead.log" 2>&1
@@ -257,15 +279,16 @@ else
     if [ -z "$vdump" ]; then
         echo "[regression] t_volatile_dead: no IR dump" >&2
         fail=1
-    elif ! python3 "$TMP/volcheck.py" "$vdump"; then
-        echo "[regression] t_volatile_dead: a volatile write is missing or partial" >&2
-        fail=1
+    else
+        vol_accept "$vdump"
     fi
     # Self-test. A width-blind checker accepts the first dump (three 8-byte
     # stores at 0/16/32 leave 16 of 40 bytes unwritten) and rejects the second
     # (one 16-byte store covers the whole 16-byte object). The third covers the
     # 40-byte object only by writing 8 bytes past its end, which a checker that
-    # only asks "does the union reach the size" accepts.
+    # only asks "does the union reach the size" accepts. The last two write
+    # before the object, one through a store offset and one through the stack
+    # address itself.
     cat > "$TMP/vol_gap.rakit" <<'RAKITEOF'
     ss0 = explicit_slot 16, align = 8
     ss1 = explicit_slot 40, align = 8
@@ -313,18 +336,9 @@ block0:
     store notrap v3, v2+24
     store notrap v4, v2+32
 RAKITEOF
-    if python3 "$TMP/volcheck.py" "$TMP/vol_gap.rakit" >/dev/null 2>&1; then
-        echo "[regression] volatile checker accepts a gapped 40-byte write" >&2
-        fail=1
-    fi
-    if ! python3 "$TMP/volcheck.py" "$TMP/vol_wide.rakit" >/dev/null 2>&1; then
-        echo "[regression] volatile checker rejects a single 16-byte write" >&2
-        fail=1
-    fi
-    if python3 "$TMP/volcheck.py" "$TMP/vol_over.rakit" >/dev/null 2>&1; then
-        echo "[regression] volatile checker accepts a write past the object" >&2
-        fail=1
-    fi
+    vol_reject "$TMP/vol_gap.rakit" "no fully written 40-byte object"
+    vol_accept "$TMP/vol_wide.rakit"
+    vol_reject "$TMP/vol_over.rakit" "16-byte store at 32 leaves the 40-byte slot"
     # A negative offset used to be dropped (`v2-8`) or read as zero (`ss1-8`),
     # so a write *before* the object went unnoticed while the rest covered it.
     cat > "$TMP/vol_neg.rakit" <<'RAKITEOF'
@@ -362,14 +376,8 @@ block0:
     store notrap v3, v2+24
     store notrap v3, v2+32
 RAKITEOF
-    if python3 "$TMP/volcheck.py" "$TMP/vol_neg.rakit" >/dev/null 2>&1; then
-        echo "[regression] volatile checker accepts a store before the object" >&2
-        fail=1
-    fi
-    if python3 "$TMP/volcheck.py" "$TMP/vol_negaddr.rakit" >/dev/null 2>&1; then
-        echo "[regression] volatile checker reads a negative stack offset as zero" >&2
-        fail=1
-    fi
+    vol_reject "$TMP/vol_neg.rakit" "8-byte store at -8 leaves the 40-byte slot"
+    vol_reject "$TMP/vol_negaddr.rakit" "8-byte store at -8 leaves the 40-byte slot"
 fi
 
 # A truncated provenance walk makes the pass leave the function alone, which is
