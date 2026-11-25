@@ -299,6 +299,15 @@ if grep -q panicked "$TMP/vol_ir.log"; then
     fail=1
 fi
 
+# The dump directory is created before any function is written, so require the
+# dumps of the functions that used to panic themselves.
+for fn in vol512_discard vol_stack_discard; do
+    if [ ! -f "$TMP/vol_ir.rakit/$fn.opt.rakit" ]; then
+        echo "[regression] t_volatile: --emit=llvm-ir produced no dump for $fn" >&2
+        fail=1
+    fi
+done
+
 # Guard rails: power-of-two maps vectorize; volatile and header-side-effect
 # loops must stay scalar. (SIMD assertions need the disassembler; the outputs
 # are checked above by `check`.)

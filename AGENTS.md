@@ -362,6 +362,16 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
     two-source `a[i] += b[i]` -> `paddd` (guard still emitted for `b`), f32
     `a[i] *= 2.0` -> `mulps`. New `t_vectorize_inplace`
     (n=1000/999/17/15/1/0); regressions asserts the four ops.
+  - **M4.14 LANDED: the IR-dump gate really checks the dumps.**
+    The previous edit left only the `panicked` grep: the per-function check was
+    dropped, so a run that exited without a panic but wrote no IR still passed.
+    `regressions.sh` now requires `vol_ir.rakit/vol512_discard.opt.rakit` and
+    `vol_ir.rakit/vol_stack_discard.opt.rakit` at top level (lines 287-309, i.e.
+    before the `objdump` guard at 314, since the gate disassembles nothing).
+    Negative check: deleting one dump makes the gate report
+    `--emit=llvm-ir produced no dump for vol512_discard` and fail; with both
+    present it passes. Test-only change, no compiler code touched (suite and
+    allaxes results from M4.13 still stand).
   - **M4.13 LANDED: IR-dump gate + fence consistency in store_forward.**
     (a) The `--emit=llvm-ir` gate sat inside the `objdump` guard even though it
     disassembles nothing, and it only checked that `<out>.rakit/` existed — a
