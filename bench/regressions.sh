@@ -122,13 +122,26 @@ import re, sys
 
 SLOT = re.compile(r"^\s*(ss\d+)\s*=\s*explicit_slot\s+(\d+)")
 ADDR = re.compile(r"^\s*(v\d+)\s*=\s*stack_addr\.i64\s+(ss\d+)(?:\+(\d+))?")
+DEF = re.compile(r"^\s*(v\d+)\s*=\s*([a-z_0-9]+)((?:\.\w+)?)\b")
 STORE_ADDR = re.compile(r"(v\d+)(?:\+(\d+))?\s*$")
+# Ops whose result has the type of its first typed operand.
+SAME_TYPE = {"iadd", "isub", "imul", "band", "bor", "bxor", "ishl", "ushr", "sshr", "select", "ireduce", "uextend", "sextend", "bint", "bnot"}
+
+
+def type_size(name):
+    m = re.fullmatch(r"([ifb])(\d+)(?:x(\d+))?", name)
+    if not m:
+        return None
+    return int(m.group(2)) * int(m.group(3) or 1) // 8
+
 
 sizes = {}
 addr = {}
+width = {}
+defs = []
 region = 0
-# (region, slot) -> byte offsets stored
-offsets = {}
+# (region, slot) -> list of [start, end) byte ranges
+spans = {}
 for line in open(sys.argv[1]):
     text = line.split(";")[0].rstrip()
     if not text.strip():
@@ -145,34 +158,75 @@ for line in open(sys.argv[1]):
     if stripped == "fence":
         region += 1
         continue
+    m = DEF.match(text)
+    if m:
+        value, opcode, suffix = m.group(1), m.group(2), m.group(3).lstrip(".")
+        # `f64const`/`vconst` carry the type in the opcode when there is no suffix.
+        size = type_size(suffix) if suffix else type_size(opcode)
+        if size:
+            width[value] = size
+        else:
+            defs.append((value, opcode, text))
+        continue
     if not stripped.startswith("store"):
         continue
-    m = STORE_ADDR.search(text)
+    lhs, _, rhs = text.rpartition(",")
+    m = STORE_ADDR.match(rhs.strip())
     if not m:
         continue
     target = addr.get(m.group(1))
-    if target is None:
+    stored = re.findall(r"v\d+", lhs)
+    if target is None or not stored:
         continue
     slot, base = target
-    offsets.setdefault((region, slot), []).append(base + int(m.group(2) or 0))
+    spans.setdefault((region, slot), []).append((base + int(m.group(2) or 0), stored[-1]))
+
+# Propagate the type through same-typed operations so every stored value has one.
+changed = True
+while changed:
+    changed = False
+    for value, opcode, text in defs:
+        if value in width or opcode not in SAME_TYPE:
+            continue
+        for operand in re.findall(r"v\d+", text.split("=", 1)[1]):
+            if operand in width:
+                width[value] = width[operand]
+                changed = True
+                break
+
+
+def covered(intervals, size):
+    """True when the ranges tile [0, size) with no gap."""
+    end = 0
+    for start, stop in sorted(intervals):
+        if start > end:
+            return False
+        end = max(end, stop)
+    return end >= size
+
 
 # The fixture writes 16 bytes to one local and then 40 to another.
 want = {1: 16, 2: 40}
 for reg, size in want.items():
-    covered = False
-    for (r, slot), offs in offsets.items():
+    ok = False
+    for (r, slot), stores in spans.items():
         if r != reg or sizes.get(slot) != size:
             continue
-        offs = sorted(offs)
-        # Starts at the object's base, reaches its last eight bytes, and leaves no
-        # gap wider than one 16-byte store: the whole object was written.
-        if offs[0] == 0 and offs[-1] >= size - 8 and all(b - a <= 16 for a, b in zip(offs, offs[1:])):
-            covered = True
-    if not covered:
-        seen = {f"{slot}({sizes.get(slot)}B)": sorted(o) for (r, slot), o in offsets.items() if r == reg}
+        ranges = []
+        for off, value in stores:
+            w = width.get(value)
+            if w is None:
+                print(f"region {reg}: unknown width for stored {value} in {slot}", file=sys.stderr)
+                sys.exit(1)
+            ranges.append((off, off + w))
+        if covered(ranges, size):
+            ok = True
+    if not ok:
+        seen = {f"{slot}({sizes.get(slot)}B)": sorted(stores) for (r, slot), stores in spans.items() if r == reg}
         print(f"region {reg}: no fully written {size}-byte object, stores per slot: {seen}",
               file=sys.stderr)
         sys.exit(1)
+
 EOF
     then
         echo "[regression] t_volatile_dead: a volatile write is missing or partial" >&2

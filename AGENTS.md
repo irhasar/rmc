@@ -1,4 +1,44 @@
 ## Session (2026-11-24, branch `rakit-exp12`) — store-forward address memoisation; write-once rule rejected
+## Session (2026-11-25, branch `rakit-exp12`) — review round 6: width-aware volatile check, shared-path fixture
+
+- **The volatile check was width-blind.** It accepted stores at offsets 0, 16 and
+  32 of a 40-byte slot whatever their width — three 8-byte stores there leave 16
+  bytes unwritten — and rejected a single 16-byte store that covers the 16-byte
+  slot. It now derives each store's width from the stored value's type
+  (`load.i8x16` → 16, `load.i64` → 8, propagated through same-typed ops) and
+  requires the resulting ranges to tile `[0, size)` with no gap. Verified on
+  synthetic dumps: 8-byte stores at 0/16/32 of a 40-byte slot fail, one 16-byte
+  store for the 16-byte slot passes, and the real dump still passes.
+- **The shared-path fixture did not share anything.** The two `read_through` calls
+  each started their own chain, and the visited set is per query, so no walk met
+  `mid` twice. `t_deep_cast_chain` now has two functions: `deep_chain` (a slot
+  reachable only through a ten-step chain — the case that was miscompiled) and
+  `shared_paths` (one argument reaching `mid` both at the end of the long chain
+  and directly). Rebuilt the round-4 pass to confirm the split still reproduces
+  the bug: `deep_chain` printed `397020275139115` while `shared_paths` printed
+  `127`; LLVM and the current pass print `127 127`.
+- **Gate:** regressions pass (4 store-forward fixtures); `./y.sh test --sysroot
+  rakit` → 65 suites / 25,368 passed / 0 failed; `allaxes` 45/45 `ok`, full
+  matrix below (`L/U/M` per cell).
+
+| prog | Cwall | Ccpu | Crss | size | Rwall | Rcpu | Rrss |
+|---|---|---|---|---|---|---|---|
+| h_arith | 118ms/90ms/101ms | 143ms/117ms/129ms | 116.7M/118.1M/119.5M | 4,617,128/5,839,120/4,091,440 | 2ms/2ms/2ms | 2ms/2ms/2ms | 11.1M/11.1M/11.0M |
+| h_branch | 114ms/90ms/100ms | 139ms/120ms/130ms | 117.1M/118.2M/119.4M | 4,616,832/5,837,264/4,089,760 | 2ms/2ms/2ms | 2ms/2ms/2ms | 10.9M/11.1M/11.0M |
+| h_calls | 115ms/88ms/100ms | 140ms/118ms/128ms | 117.3M/118.5M/119.8M | 4,616,872/5,837,792/4,090,136 | 2ms/2ms/2ms | 2ms/2ms/2ms | 11.0M/11.0M/11.1M |
+| h_float | 124ms/89ms/102ms | 148ms/117ms/128ms | 116.2M/117.7M/119.1M | 4,637,984/5,861,024/4,130,328 | 2ms/3ms/2ms | 2ms/2ms/2ms | 10.8M/11.0M/11.0M |
+| h_mem | 270ms/135ms/167ms | 430ms/192ms/239ms | 136.1M/133.6M/136.3M | 4,646,856/5,959,856/4,179,440 | 3ms/9ms/4ms | 3ms/9ms/4ms | 11.1M/10.8M/11.1M |
+| h_simd | 140ms/97ms/110ms | 162ms/130ms/138ms | 122.6M/123.7M/125.1M | 4,617,704/5,843,736/4,093,864 | 2ms/4ms/2ms | 2ms/3ms/2ms | 11.0M/11.1M/10.8M |
+| p1_arith | 83ms/80ms/85ms | 101ms/100ms/108ms | 104.9M/107.1M/108.4M | 4,635,232/5,877,944/4,159,072 | 82ms/108ms/101ms | 82ms/108ms/100ms | 11.0M/11.0M/11.0M |
+| p2_mem | 251ms/136ms/171ms | 377ms/182ms/220ms | 132.5M/130.3M/132.4M | 4,639,896/5,936,144/4,156,944 | 16ms/158ms/42ms | 16ms/157ms/41ms | 10.9M/11.0M/11.0M |
+| p3_calls | 98ms/85ms/93ms | 121ms/111ms/120ms | 114.7M/115.6M/117.2M | 4,612,368/5,820,136/4,079,800 | 37ms/116ms/55ms | 36ms/116ms/55ms | 10.9M/11.0M/11.1M |
+| p4_simd | 106ms/94ms/104ms | 125ms/119ms/130ms | 115.2M/116.0M/117.6M | 4,636,096/5,892,376/4,165,696 | 55ms/157ms/85ms | 55ms/157ms/88ms | 48.2M/49.5M/48.8M |
+| p5_inline | 80ms/77ms/82ms | 100ms/100ms/105ms | 103.9M/105.7M/107.1M | 4,609,368/5,813,704/4,072,712 | 58ms/894ms/6ms | 57ms/893ms/6ms | 10.9M/10.9M/10.9M |
+| p6_scalar | 80ms/75ms/82ms | 98ms/97ms/103ms | 99.9M/102.0M/103.2M | 4,609,368/5,813,688/4,072,712 | 58ms/901ms/6ms | 57ms/901ms/6ms | 11.0M/11.0M/11.0M |
+| p7_branchy | 83ms/79ms/84ms | 102ms/101ms/110ms | 104.1M/105.8M/107.2M | 4,609,520/5,813,800/4,072,888 | 43ms/100ms/35ms | 43ms/100ms/35ms | 11.1M/10.9M/11.1M |
+| p8_minmax | 83ms/77ms/84ms | 101ms/99ms/106ms | 104.2M/105.5M/107.0M | 4,609,544/5,813,752/4,072,872 | 18ms/39ms/21ms | 17ms/38ms/21ms | 11.0M/11.0M/11.0M |
+| p9_u64f32 | 93ms/86ms/95ms | 112ms/109ms/119ms | 109.9M/111.6M/113.4M | 4,635,448/5,886,872/4,162,704 | 30ms/76ms/33ms | 30ms/75ms/33ms | 17.8M/18.9M/18.2M |
+
 ## Session (2026-11-25, branch `rakit-exp12`) — review round 5: complete provenance walk, IR-based volatile check
 
 - **The provenance walk had a depth budget of eight nodes.** `collect_slots`
