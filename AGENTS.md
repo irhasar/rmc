@@ -1,4 +1,50 @@
 ## Session (2026-11-24, branch `rakit-exp12`) — store-forward address memoisation; write-once rule rejected
+## Session (2026-11-25, branch `rakit-exp13`) — review round 15: attribute the counter, tighten the offset
+
+- **A local store of the same value inflated the cross-block count.** `credited`
+  compared the forwarded fact against the entry snapshot, but `record_store`
+  replaces the inherited fact, so a block that re-stored the inherited value
+  credited its own store. `record_store` now returns the key it recorded and the
+  block keeps a `locally_stored` set: a load is credited only when the block never
+  stored that key itself. With the dataflow off the count is zero by construction,
+  and `regressions.sh` asserts that too.
+- **The counter needed a crate where it can only come from the shape.** Counting
+  `xblk` on the big fixture could not attribute the work to the named functions.
+  New `bench/tests/t_sf_xblk.rs` holds one merge shape and nothing else; the
+  harness builds it with the dataflow on and with `RAKIT_SF_NO_CBE=1` and requires
+  `xblk>0` and `xblk==0` respectively (measured 4 and 0). The big fixture keeps
+  the pre-pass shape check and the slot-load attribution, and no longer asserts
+  anything about `xblk`.
+- **Unknown displacements passed the volatile check.** `resolve` dropped a runtime
+  index, so `store_after_fence` could "match" an access to different bytes. It now
+  returns an offset of `None` as soon as a displacement is not constant, and the
+  check fails rather than reporting a match. Verified with a dump whose fence
+  store indexes the slot at runtime: "cannot be located after the pass".
+- **The counting cost default compile work.** `forward_block` cloned the incoming
+  facts and queried the copy on every successful rewrite even with debug off. Both
+  are gated behind the existing `dbg` flag now; with debug off the snapshot is
+  never built.
+- **Gate:** 65 suites / 25,368 passed / 0 failed; `regressions.sh` exit 0;
+  `allaxes` 45/45 `ok`, full matrix below (`L/U/M` per cell).
+
+| prog | Cwall | Ccpu | Crss | size | Rwall | Rcpu | Rrss |
+|---|---|---|---|---|---|---|---|
+| h_arith | 117ms/89ms/95ms | 142ms/115ms/122ms | 116.4M/117.5M/119.2M | 4,617,128/5,839,120/4,091,440 | 2ms/2ms/2ms | 2ms/2ms/2ms | 10.8M/10.8M/11.0M |
+| h_branch | 118ms/90ms/100ms | 142ms/118ms/126ms | 117.0M/117.7M/119.4M | 4,616,832/5,837,264/4,089,760 | 2ms/3ms/2ms | 2ms/2ms/2ms | 11.0M/10.8M/11.1M |
+| h_calls | 118ms/90ms/99ms | 143ms/119ms/128ms | 117.2M/118.1M/119.7M | 4,616,872/5,837,792/4,090,136 | 2ms/3ms/2ms | 2ms/2ms/2ms | 10.8M/11.0M/10.8M |
+| h_float | 126ms/90ms/98ms | 148ms/117ms/126ms | 115.7M/117.2M/118.7M | 4,637,984/5,861,024/4,130,328 | 3ms/3ms/3ms | 2ms/2ms/2ms | 11.0M/11.0M/11.0M |
+| h_mem | 265ms/135ms/167ms | 439ms/184ms/237ms | 136.3M/133.6M/135.9M | 4,646,856/5,959,856/4,179,440 | 3ms/10ms/4ms | 3ms/9ms/4ms | 11.0M/11.0M/11.0M |
+| h_simd | 141ms/97ms/108ms | 167ms/126ms/137ms | 122.4M/123.5M/124.6M | 4,617,704/5,843,736/4,093,864 | 2ms/4ms/2ms | 2ms/3ms/2ms | 11.0M/11.0M/11.1M |
+| p1_arith | 85ms/79ms/82ms | 105ms/103ms/104ms | 104.6M/107.0M/108.1M | 4,635,232/5,877,944/4,159,072 | 82ms/109ms/101ms | 81ms/108ms/101ms | 10.8M/10.8M/10.8M |
+| p2_mem | 246ms/128ms/156ms | 378ms/180ms/217ms | 132.4M/129.7M/131.7M | 4,639,896/5,936,144/4,156,944 | 16ms/156ms/42ms | 16ms/155ms/42ms | 11.0M/11.0M/11.0M |
+| p3_calls | 98ms/85ms/90ms | 119ms/111ms/115ms | 114.4M/115.5M/117.0M | 4,612,368/5,820,136/4,079,800 | 37ms/117ms/56ms | 37ms/116ms/55ms | 11.0M/10.8M/11.0M |
+| p4_simd | 108ms/94ms/103ms | 128ms/118ms/128ms | 115.1M/116.1M/117.5M | 4,636,096/5,892,376/4,165,696 | 57ms/158ms/85ms | 58ms/158ms/85ms | 48.2M/49.5M/48.8M |
+| p5_inline | 81ms/77ms/79ms | 101ms/100ms/104ms | 103.6M/105.8M/106.7M | 4,609,368/5,813,704/4,072,712 | 58ms/894ms/6ms | 57ms/894ms/6ms | 10.9M/11.0M/11.0M |
+| p6_scalar | 81ms/78ms/78ms | 99ms/98ms/99ms | 100.2M/102.0M/103.1M | 4,609,368/5,813,688/4,072,712 | 58ms/904ms/7ms | 58ms/903ms/6ms | 11.0M/10.8M/11.0M |
+| p7_branchy | 83ms/78ms/80ms | 101ms/100ms/109ms | 103.9M/105.8M/107.2M | 4,609,520/5,813,800/4,072,888 | 43ms/101ms/35ms | 43ms/100ms/35ms | 11.0M/11.0M/11.0M |
+| p8_minmax | 82ms/79ms/79ms | 101ms/102ms/102ms | 104.1M/105.9M/106.8M | 4,609,544/5,813,752/4,072,872 | 18ms/39ms/22ms | 17ms/38ms/21ms | 10.7M/11.1M/11.1M |
+| p9_u64f32 | 94ms/85ms/90ms | 112ms/107ms/113ms | 109.6M/111.6M/113.2M | 4,635,448/5,886,872/4,162,704 | 30ms/77ms/34ms | 30ms/76ms/34ms | 17.8M/18.8M/18.2M |
+
 ## Session (2026-11-25, branch `rakit-exp13`) — review round 14: measure the cross-block path instead of implying it
 
 - **"Fewer slot loads" was still satisfiable by a same-block rewrite.** True: the

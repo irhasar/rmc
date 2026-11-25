@@ -95,6 +95,7 @@ check t_volatile $'n=1000 loop=17230722056597992339\nn=17 loop=18156365728903607
 check t_copy_overlap $'N=16 shift=1 11664426682378596937\nback N=16 shift=1 12713388859568982132\nN=32 shift=1 774115827419797049\nback N=32 shift=1 5146083939088780532\nN=32 shift=7 16864641215232849398\nback N=32 shift=7 6744451032907730017\nN=48 shift=3 11240810308952937694\nback N=48 shift=3 9582033626409429593\nN=64 shift=1 4928807640131852377\nback N=64 shift=1 13460265805155334836\nN=64 shift=16 3546406609664978499\nback N=64 shift=16 14022381290388415283\nnonoverlap 1882637779704813251'
 check t_simd_mask $'i8x8 eq [-1, 0, -1, 0, -1, 0, -1, 0]\ni64x8 lt [0, 0, 0, -1, 0, -1, 0, 0]\ni32x8 lt [0, 0, 0, -1, 0, -1, 0, 0]\nu8x2 eq [255, 0]'
 check t_volatile_dead 'written'
+check t_sf_xblk 'h=13308043716110348864'
 check t_ptr_store_alias '7 0'
 check t_cast_escape '127'
 check t_cast_offset '127'
@@ -105,6 +106,39 @@ n=2 h=8943709728885627070
 n=3 h=290819445394666187
 n=4 h=11115180720318630965'
 
+# Cross-block forwarding has to be attributable to the shape, not to whichever
+# function in the crate happened to use it. This crate holds one such shape, so
+# the pass's own counter (`xblk`) must see it with the dataflow on and report
+# nothing with `RAKIT_SF_NO_CBE=1`.
+if [ -x "$TMP/t_sf_xblk_M" ]; then
+    mkdir -p "$TMP/xblk_on" "$TMP/xblk_off"
+    for cfg in on off; do
+        pre=(RAKIT_SF_DEBUG=1)
+        [ "$cfg" = off ] && pre=(RAKIT_SF_DEBUG=1 RAKIT_SF_NO_CBE=1)
+        if ! env "${pre[@]}" env -u RAKIT_HOST_LLVM "$ROOT/rakit/dist/bin/rustc-rakit" \
+            --target "$TARGET" -C opt-level=3 "$BENCH/tests/t_sf_xblk.rs" \
+            -o "$TMP/xblk_$cfg/sf" --edition 2021 >"$TMP/xblk_$cfg.log" 2>&1
+        then
+            echo "[regression] t_sf_xblk: compile with the dataflow $cfg failed" >&2
+            sed 's/^/    /' "$TMP/xblk_$cfg.log" | tail -5 >&2
+            fail=1
+        fi
+    done
+    xblk_sum() {
+        awk -F'xblk=' '/xblk=/ {split($2, a, " "); n += a[1]} END {print n + 0}' "$1"
+    }
+    forwarded=$(xblk_sum "$TMP/xblk_on.log")
+    without=$(xblk_sum "$TMP/xblk_off.log")
+    if [ "$forwarded" -eq 0 ]; then
+        echo "[regression] t_sf_xblk: the cross-block dataflow forwarded nothing in the shape it exists for" >&2
+        fail=1
+    fi
+    if [ "$without" -ne 0 ]; then
+        echo "[regression] t_sf_xblk: $without forwards counted with the dataflow disabled" >&2
+        fail=1
+    fi
+fi
+
 # Forwarding must be invisible, and the fixture must still reach the pass in the
 # functions it was written for. A whole-binary comparison cannot say that: the
 # pass runs over the whole crate, so some unrelated function changing keeps the
@@ -113,7 +147,7 @@ if [ -x "$TMP/t_sf_fuzz_M" ]; then
     mkdir -p "$TMP/sf_on" "$TMP/sf_off"
     dumped=1
     for cfg in on off; do
-        pre=(RAKIT_SF_DEBUG=1)
+        pre=()
         [ "$cfg" = off ] && pre=(RAKIT_NO_STORE_FWD=1)
         if ! env "${pre[@]}" RAKIT_DUMP=1 env -u RAKIT_HOST_LLVM "$ROOT/rakit/dist/bin/rustc-rakit" \
             --target "$TARGET" -C opt-level=3 "$BENCH/tests/t_sf_fuzz.rs" \
@@ -138,7 +172,7 @@ if [ -x "$TMP/t_sf_fuzz_M" ]; then
             echo "[regression] t_sf_fuzz: the pass changes nothing, fixture is insensitive" >&2
             fail=1
         fi
-        python3 - "$TMP/sf_on/sf.rakit" "$TMP/sf_off/sf.rakit" "$TMP/sf_on.log" <<'PYEOF' || fail=1
+        python3 - "$TMP/sf_on/sf.rakit" "$TMP/sf_off/sf.rakit" <<'PYEOF' || fail=1
 import os, re, sys
 
 # What each list asserts, and what it deliberately does not.
@@ -151,8 +185,8 @@ SHAPE = ["cross_block_aggregate", "cross_block_loop_carry", "loop_aggregate"]
 
 # REWRITTEN: store_forward removed a slot load in that function. The two builds
 # differ only in the pass, so the drop is attributable to it. The cross-block
-# functions are *not* listed: their drops come from same-block accesses, and
-# claiming the cross-block access here would be unproven (see XBLK).
+# functions are not listed: their drops come from same-block accesses, and
+# t_sf_xblk covers the cross-block path with the pass's own counter instead.
 REWRITTEN = [
     "branch_merge",
     "dynamic_index",
@@ -161,18 +195,12 @@ REWRITTEN = [
     "union_bits",
 ]
 
-# XBLK: the cross-block dataflow of the pass actually forwarded a load. That
-# counter comes from the pass itself (`RAKIT_SF_DEBUG=1`), because downstream
-# passes remove the same loads either way and the final IR cannot show it.
-XBLK = "xblk"
-
 # VOLATILE: the volatile write survives the pass -- same slot, same offset, same
 # block as the fence that precedes it.
 VOLATILE = "volatile_local"
 
 STACK_ADDR = re.compile(r"^\s*(v\d+) = stack_addr\.i64 (ss\d+)(?:([+-])(\d+))?")
-ICONST = re.compile(r"^\s*(v\d+) = iconst\.i64 (\d+)")
-IADD = re.compile(r"^\s*(v\d+) = iadd(?:\.i64)? (v\d+), (v\d+)")
+ICONST = re.compile(r"^\s*(v\d+) = iconst\.i64 (0x[0-9a-f_]+|\d+)")
 IADD_IMM = re.compile(r"^\s*(v\d+) = iadd_imm\.?\w* (v\d+), (-?\d+)")
 ARITH = re.compile(r"^\s*(v\d+) = (imul|iadd|isub|ishl|band|bor)(?:\.i64)? (v\d+), (v\d+)")
 ALIAS = re.compile(r"^\s*(v\d+) -> (v\d+)\s*$")
@@ -181,7 +209,6 @@ STORE = re.compile(r"^\s*store(?:\.\w+)?\s+(?:[\w.]+\s+)*?(v\d+),\s*(v\d+)(?:([+
 LOAD = re.compile(r"^\s*(?:v\d+ = )?load(?:\.\w+)?\s+(?:[\w.]+)?\s*(v\d+)(?:([+-])(\d+))?")
 BLOCK = re.compile(r"^block\d+")
 FENCE = re.compile(r"^\s*fence\b")
-XBLK_LINE = re.compile(r"\[sf\] \S+ .*xblk=(\d+)")
 
 
 def _offset(m, group):
@@ -191,8 +218,12 @@ def _offset(m, group):
     return -value if m.group(group) == "-" else value
 
 
+def _int(text):
+    return int(text.replace("_", ""), 0)
+
+
 def scan(path):
-    """Lines per block plus a resolver from a value to (slot, byte offset)."""
+    """Lines plus a resolver from a value to (slot, byte offset or None)."""
     lines, slot_of, consts, sums = [], {}, {}, {}
     for line in open(path):
         text = line.split(";")[0].rstrip()
@@ -202,7 +233,7 @@ def scan(path):
         if m := STACK_ADDR.match(text):
             slot_of[m.group(1)] = (m.group(2), _offset(m, 3))
         elif m := ICONST.match(text):
-            consts[m.group(1)] = int(m.group(2))
+            consts[m.group(1)] = _int(m.group(2))
         elif m := ARITH.match(text):
             op, left, right = m.group(2), m.group(3), m.group(4)
             if left in consts and right in consts:
@@ -221,36 +252,35 @@ def scan(path):
             slot_of.setdefault(m.group(1), ("many", re.findall(r"v\d+", m.group(2))))
 
     def resolve(value):
-        # Walk aliases and iadd chains to the slot a value addresses, adding the
-        # constant offsets so two accesses to the same field compare equal.
-        pending, seen = [(value, 0)], set()
+        # Walk aliases and iadd chains to the slot a value addresses. The offset
+        # is None as soon as a displacement is not a constant: two accesses whose
+        # offsets are unknown cannot be shown to touch the same bytes.
+        pending, seen = [(value, 0, False)], set()
         while pending:
-            current, extra = pending.pop(0)
+            current, extra, unknown = pending.pop(0)
             if current in seen:
                 continue
             seen.add(current)
             entry = slot_of.get(current)
             if isinstance(entry, tuple) and len(entry) == 2 and entry[0].startswith("ss"):
-                return (entry[0], entry[1] + extra)
+                return (entry[0], None if unknown else entry[1] + extra)
             if current in consts:
                 continue
             if current in sums:
                 left, right = sums[current]
-                # One side is the base and the other the byte offset; adding the
-                # offset is what makes two accesses to one field compare equal.
                 if isinstance(right, int):
-                    pending.append((left, extra + right))
+                    pending.append((left, extra + right, unknown))
                 elif right in consts:
-                    pending.append((left, extra + consts[right]))
+                    pending.append((left, extra + consts[right], unknown))
                 elif left in consts:
-                    pending.append((right, extra + consts[left]))
+                    pending.append((right, extra + consts[left], unknown))
                 else:
-                    pending.append((left, extra))
-                    pending.append((right, extra))
+                    pending.append((left, extra, True))
+                    pending.append((right, extra, True))
                 continue
             if isinstance(entry, tuple):
-                pending.extend([(entry[1], extra)] if entry[0] == "one"
-                               else [(o, extra) for o in entry[1]])
+                pending.extend([(entry[1], extra, unknown)] if entry[0] == "one"
+                               else [(o, extra, unknown) for o in entry[1]])
         return None
 
     return lines, resolve
@@ -267,11 +297,13 @@ def slot_accesses(path):
         if m := STORE.match(text):
             base = resolve(m.group(2))
             if base:
-                stores.append((base[0], base[1] + _offset(m, 3), block))
+                offset = None if base[1] is None else base[1] + _offset(m, 3)
+                stores.append((base[0], offset, block))
         elif m := LOAD.match(text):
             base = resolve(m.group(1))
             if base:
-                loads.append((base[0], base[1] + _offset(m, 2), block))
+                offset = None if base[1] is None else base[1] + _offset(m, 2)
+                loads.append((base[0], offset, block))
     return stores, loads
 
 
@@ -299,7 +331,8 @@ def store_after_fence(path):
         if fenced_in == block and (m := STORE.match(text)):
             base = resolve(m.group(2))
             if base:
-                return (base[0], base[1] + _offset(m, 3))
+                offset = None if base[1] is None else base[1] + _offset(m, 3)
+                return (base[0], offset)
     return None
 
 
@@ -312,7 +345,7 @@ def dumps(directory, suffix):
     return found
 
 
-on_dir, off_dir, debug_log = sys.argv[1], sys.argv[2], sys.argv[3]
+on_dir, off_dir = sys.argv[1], sys.argv[2]
 pre = dumps(on_dir, r"unopt\.rakit")
 post_on, post_off = dumps(on_dir, r"opt\.rakit"), dumps(off_dir, r"opt\.rakit")
 bad = 0
@@ -328,15 +361,6 @@ for name in SHAPE:
             file=sys.stderr,
         )
         bad = 1
-
-forwarded = sum(int(m.group(1)) for m in map(XBLK_LINE.search, open(debug_log)) if m)
-if forwarded == 0:
-    print(
-        "[regression] sf coverage: the cross-block dataflow forwarded nothing, "
-        "so the shapes above are not exercised by it",
-        file=sys.stderr,
-    )
-    bad = 1
 
 for name in REWRITTEN:
     if name not in post_on or name not in post_off:
@@ -363,6 +387,14 @@ else:
         print(
             f"[regression] sf coverage: {VOLATILE} has no store after its fence "
             f"before the pass, the volatile write is gone from the input",
+            file=sys.stderr,
+        )
+        bad = 1
+    elif expected[1] is None or actual is None or actual[1] is None:
+        print(
+            f"[regression] sf coverage: the volatile write in {VOLATILE} cannot be "
+            f"located after the pass (fence store {expected}, found {actual}); a "
+            f"runtime index into the slot is not evidence of the same bytes",
             file=sys.stderr,
         )
         bad = 1
