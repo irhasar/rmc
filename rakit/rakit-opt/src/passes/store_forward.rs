@@ -262,6 +262,9 @@ fn run_body(
     // `analyze` skips a full instruction walk over every such function, which on
     // a large crate is most of them (8843 functions, ~45 us each).
     if func.sized_stack_slots.is_empty() && func.dynamic_stack_slots.is_empty() {
+        if crate::tunables::store_forward_debug() {
+            eprintln!("[sf] {} no stack slot", func.name);
+        }
         return;
     }
     let Some(Bases { private_slots: private, ptr_bases, loaded, confined, prov }) = analyze(func)
@@ -277,6 +280,9 @@ fn run_body(
     // Nothing the pass can track: no private slot and no non-escaping pointer
     // base means no store is forwardable and no dead store can be identified.
     if private.is_empty() && ptr_bases.is_empty() {
+        if crate::tunables::store_forward_debug() {
+            eprintln!("[sf] {} nothing trackable", func.name);
+        }
         return;
     }
     // Facts that hold on every path into a block. Seeding each block with these
@@ -293,11 +299,12 @@ fn run_body(
         FxHashMap::default()
     };
     let t2 = std::time::Instant::now();
+    let mut cross_forwarded = 0;
     if !loaded.is_empty() {
         for block in func.layout.blocks().collect::<Vec<_>>() {
-            forward_block(
-                func, block, &private, &ptr_bases, &loaded, &entry, endianness, &confined,
-                &prov,
+            cross_forwarded += forward_block(
+                func, block, &private, &ptr_bases, &loaded, &entry, endianness, &confined, &prov,
+                dbg,
             );
         }
     }
@@ -305,11 +312,12 @@ fn run_body(
     drop_dead_stores(func, &private, &prov);
     if dbg {
         eprintln!(
-            "[sf] {} insts={} setup={:?} cbe={:?} fwd={:?} dead={:?}",
+            "[sf] {} insts={} setup={:?} cbe={:?} xblk={} fwd={:?} dead={:?}",
             func.name,
             func.dfg.num_insts(),
             t1 - t0,
             t2 - t1,
+            cross_forwarded,
             t3 - t2,
             t3.elapsed(),
         );
@@ -580,7 +588,7 @@ fn record_store(
     loaded: &FxHashSet<Key>,
     confined: &FxHashMap<Value, Confined>,
     prov: &FxHashMap<Base, StackSlot>,
-) {
+) -> Option<Key> {
     let ty = func.dfg.value_type(value);
     let Some((base, off)) = mem_key(func, inst, addr).filter(|k| tracked(k, private, ptr_bases))
     else {
@@ -588,7 +596,7 @@ fn record_store(
         // tracked pointer base, so every pointer fact is invalidated. A private
         // stack slot cannot be reached from an untracked address, so it stays.
         avail.retain(|&(b, _), _| matches!(b, Base::Slot(_)));
-        return;
+        return None;
     };
     // Invalidate every fact this store overwrites before deciding whether the
     // store itself is worth recording: a store the pass does not track (not in
@@ -619,13 +627,14 @@ fn record_store(
     // the invalidation above already dropped the pointer facts, so do not re-add
     // one.
     if matches!(base, Base::Ptr(_)) && func.dfg.insts[inst].opcode() != Opcode::Store {
-        return;
+        return None;
     }
     // A store no load can read is never forwarded, so it need not be recorded.
     if !loaded.contains(&(base, off)) {
-        return;
+        return None;
     }
     avail.insert((base, off), (value, ty));
+    Some((base, off))
 }
 
 /// The address operand index of a load/store, i.e. the one argument that is a
@@ -672,8 +681,16 @@ fn forward_block(
     endianness: ir::Endianness,
     confined: &FxHashMap<Value, Confined>,
     prov: &FxHashMap<Base, StackSlot>,
-) {
+    count_cross: bool,
+) -> usize {
     let mut avail: Avail = entry.get(&block).cloned().unwrap_or_default();
+    // Counting is debug output only, so it must not cost a clone per block when
+    // nobody reads the number. A load credited to the entry has to forward a fact
+    // this block never stored itself: a local store of the same value replaces
+    // the inherited fact and would have forwarded without the dataflow.
+    let inherited = count_cross.then(|| avail.clone());
+    let mut locally_stored: FxHashSet<Key> = FxHashSet::default();
+    let mut from_entry = 0;
     // Set by a fence: the rest of the block may hold volatile accesses, which
     // this pass must neither forward into nor make forwardable.
     let mut sealed = false;
@@ -702,10 +719,12 @@ fn forward_block(
             let args = func.dfg.insts[inst].arguments(&func.dfg.value_lists);
             if args.len() >= 2 {
                 let (value, addr) = (args[0], args[1]);
-                record_store(
-                    func, inst, value, addr, &mut avail, private, ptr_bases, loaded, confined,
-                    prov,
+                let key = record_store(
+                    func, inst, value, addr, &mut avail, private, ptr_bases, loaded, confined, prov,
                 );
+                if let (true, Some(key)) = (count_cross, key) {
+                    locally_stored.insert(key);
+                }
             }
         } else if opcode.can_load() {
             // A trapping load is the volatile read `volatile_load` emits;
@@ -734,6 +753,9 @@ fn forward_block(
                 func.dfg.detach_inst_results(inst);
                 func.dfg.change_to_alias(result, value);
                 func.layout.remove_inst(inst);
+                if credited(inherited.as_ref(), &locally_stored, key, value, ty) {
+                    from_entry += 1;
+                }
             } else if result_ty.bytes() == ty.bytes() && result_ty.is_vector() && ty.is_vector() {
                 // A store and a load of the same bytes but different vector types is
                 // exactly how a SIMD bitcast (`__m128i` <-> `Simd<i8, 16>`) compiles:
@@ -747,8 +769,29 @@ fn forward_block(
                 pos.func.dfg.detach_inst_results(inst);
                 pos.func.dfg.change_to_alias(result, cast);
                 pos.func.layout.remove_inst(inst);
+                if credited(inherited.as_ref(), &locally_stored, key, value, ty) {
+                    from_entry += 1;
+                }
             }
         }
+    }
+    from_entry
+}
+
+/// Whether a forwarded load used a fact the block inherited rather than one it
+/// stored itself. Only then did the cross-block dataflow do the work.
+fn credited(
+    inherited: Option<&Avail>,
+    locally_stored: &FxHashSet<Key>,
+    key: Key,
+    value: Value,
+    ty: types::Type,
+) -> bool {
+    match inherited {
+        Some(inherited) => {
+            !locally_stored.contains(&key) && inherited.get(&key) == Some(&(value, ty))
+        }
+        None => false,
     }
 }
 

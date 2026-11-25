@@ -1,4 +1,242 @@
 ## Session (2026-11-24, branch `rakit-exp12`) — store-forward address memoisation; write-once rule rejected
+## Session (2026-11-25, branch `rakit-exp13`) — review round 17: skip messages are not a summary
+
+- **The deep-cast regression accepted bail messages as proof the pass ran.** It
+  required a line starting with `[sf]`, and the debug messages added in round 16
+  (`no stack slot`, `nothing trackable`) start with exactly that: on
+  `t_deep_cast_chain` the compile prints 26 summaries *and* 7 skip lines, so the
+  check could be satisfied by the skips alone. It now requires a completed summary
+  (`[sf] <fn> insts=<n> ...`), and prints the `[sf]` lines it did see when it fails.
+- Verified in both directions: a log holding only `no stack slot` /
+  `nothing trackable` is rejected, a summary line is accepted, and the real
+  fixture still passes with 26 summaries and no truncation.
+- Harness only; no compiler change. `regressions.sh` exit 0.
+
+## Session (2026-11-25, branch `rakit-exp13`) — review round 16: the counter gate could not be attributed, so it is gone
+
+- **A positive `xblk` could come from a helper, not the shape.** Confirmed by
+  measurement: in the dedicated crate the four counted forwards all came from the
+  std glue monomorphised into it (`u0:2`, `u0:3`, `u0:9`), and the merge shape
+  contributed **zero**. Making the two arms store different values
+  (`SF_XBLK_DIFFERENT=1`) changed nothing: 4 either way. The gate is removed, and
+  `bench/tests/t_sf_xblk.rs` with it. Keeping an assertion that a helper can
+  satisfy is worse than not having it.
+- **Why the shape never forwards:** the join's meet requires every predecessor to
+  store the *same SSA value*, and rakit stores a per-arm copy of it (`store v6`
+  in one arm, `store v120` in the other). Resolving aliases in the meet does not
+  unify two `copy` instructions, and that change was measured to leave the count
+  at 4, so it was reverted: it is a forwarding opportunity with no fixture behind
+  it, which is not what a hardening PR should add. Recorded as a lead: CBE needs
+  value numbering before the meet, or a shape whose arms share one SSA value.
+- **"Missing counter reads as zero" is moot with the gate gone**, but the cause is
+  worth keeping: `xblk_sum` on a log without the field returns 0, so a build that
+  never ran the pass looked like a build that ran it and forwarded nothing. The
+  counter stays as a diagnostic (`RAKIT_SF_DEBUG`), documented as not attributable
+  to a function from the harness.
+- **Diagnostics that did stay:** `[sf] <fn> no stack slot` and `[sf] <fn> nothing
+  trackable`, which is how the missing function in that crate was found; both are
+  debug-only. Counting remains gated behind the debug flag.
+- **Gate:** 65 suites / 25,368 passed / 0 failed; `regressions.sh` exit 0;
+  `allaxes` 45/45 `ok`, full matrix below (`L/U/M` per cell).
+
+| prog | Cwall | Ccpu | Crss | size | Rwall | Rcpu | Rrss |
+|---|---|---|---|---|---|---|---|
+| h_arith | 117ms/91ms/97ms | 141ms/122ms/125ms | 116.5M/118.2M/119.2M | 4,617,128/5,839,120/4,091,440 | 2ms/2ms/2ms | 2ms/2ms/2ms | 11.0M/10.8M/11.1M |
+| h_branch | 116ms/88ms/96ms | 140ms/115ms/126ms | 116.8M/118.2M/119.2M | 4,616,832/5,837,264/4,089,760 | 2ms/2ms/2ms | 2ms/2ms/2ms | 11.0M/11.0M/11.0M |
+| h_calls | 116ms/88ms/96ms | 142ms/119ms/126ms | 117.2M/118.4M/119.6M | 4,616,872/5,837,792/4,090,136 | 2ms/2ms/2ms | 2ms/2ms/2ms | 11.0M/10.8M/10.8M |
+| h_float | 123ms/89ms/98ms | 147ms/116ms/125ms | 115.6M/117.6M/118.6M | 4,637,984/5,861,024/4,130,328 | 2ms/3ms/2ms | 2ms/2ms/2ms | 11.1M/10.8M/11.0M |
+| h_mem | 272ms/135ms/166ms | 440ms/185ms/238ms | 136.4M/133.6M/135.9M | 4,646,856/5,959,856/4,179,440 | 3ms/10ms/4ms | 3ms/9ms/4ms | 10.8M/10.8M/11.1M |
+| h_simd | 143ms/100ms/106ms | 167ms/126ms/139ms | 122.6M/123.7M/124.9M | 4,617,704/5,843,736/4,093,864 | 2ms/4ms/2ms | 2ms/3ms/2ms | 10.8M/11.0M/11.1M |
+| p1_arith | 83ms/79ms/80ms | 103ms/102ms/103ms | 104.7M/107.1M/108.2M | 4,635,232/5,877,944/4,159,072 | 82ms/108ms/101ms | 81ms/108ms/100ms | 11.0M/11.0M/11.1M |
+| p2_mem | 250ms/126ms/157ms | 377ms/169ms/216ms | 132.1M/129.8M/131.9M | 4,639,896/5,936,144/4,156,944 | 16ms/156ms/42ms | 16ms/154ms/42ms | 11.1M/11.1M/10.8M |
+| p3_calls | 98ms/87ms/93ms | 124ms/113ms/120ms | 114.8M/115.5M/117.0M | 4,612,368/5,820,136/4,079,800 | 37ms/116ms/56ms | 37ms/116ms/56ms | 10.8M/11.0M/11.0M |
+| p4_simd | 108ms/94ms/106ms | 127ms/118ms/129ms | 115.0M/116.1M/117.3M | 4,636,096/5,892,376/4,165,696 | 57ms/158ms/85ms | 57ms/158ms/86ms | 48.2M/49.5M/48.8M |
+| p5_inline | 81ms/76ms/80ms | 100ms/100ms/105ms | 103.8M/105.7M/106.8M | 4,609,368/5,813,704/4,072,712 | 58ms/895ms/6ms | 57ms/894ms/6ms | 10.8M/11.0M/10.8M |
+| p6_scalar | 80ms/77ms/77ms | 97ms/98ms/100ms | 99.9M/102.2M/103.1M | 4,609,368/5,813,688/4,072,712 | 58ms/901ms/6ms | 57ms/901ms/6ms | 11.0M/11.0M/11.0M |
+| p7_branchy | 84ms/78ms/81ms | 103ms/100ms/103ms | 103.9M/105.8M/107.0M | 4,609,520/5,813,800/4,072,888 | 43ms/101ms/35ms | 42ms/100ms/36ms | 11.0M/10.9M/11.0M |
+| p8_minmax | 82ms/77ms/81ms | 105ms/99ms/104ms | 104.1M/105.7M/106.8M | 4,609,544/5,813,752/4,072,872 | 18ms/39ms/20ms | 18ms/38ms/21ms | 11.1M/11.0M/11.0M |
+| p9_u64f32 | 93ms/88ms/92ms | 113ms/114ms/127ms | 109.8M/111.8M/113.1M | 4,635,448/5,886,872/4,162,704 | 31ms/77ms/34ms | 30ms/76ms/34ms | 17.8M/18.9M/18.2M |
+
+## Session (2026-11-25, branch `rakit-exp13`) — review round 15: attribute the counter, tighten the offset
+
+- **A local store of the same value inflated the cross-block count.** `credited`
+  compared the forwarded fact against the entry snapshot, but `record_store`
+  replaces the inherited fact, so a block that re-stored the inherited value
+  credited its own store. `record_store` now returns the key it recorded and the
+  block keeps a `locally_stored` set: a load is credited only when the block never
+  stored that key itself. With the dataflow off the count is zero by construction,
+  and `regressions.sh` asserts that too.
+- **The counter needed a crate where it can only come from the shape.** Counting
+  `xblk` on the big fixture could not attribute the work to the named functions.
+  New `bench/tests/t_sf_xblk.rs` holds one merge shape and nothing else; the
+  harness builds it with the dataflow on and with `RAKIT_SF_NO_CBE=1` and requires
+  `xblk>0` and `xblk==0` respectively (measured 4 and 0). The big fixture keeps
+  the pre-pass shape check and the slot-load attribution, and no longer asserts
+  anything about `xblk`.
+- **Unknown displacements passed the volatile check.** `resolve` dropped a runtime
+  index, so `store_after_fence` could "match" an access to different bytes. It now
+  returns an offset of `None` as soon as a displacement is not constant, and the
+  check fails rather than reporting a match. Verified with a dump whose fence
+  store indexes the slot at runtime: "cannot be located after the pass".
+- **The counting cost default compile work.** `forward_block` cloned the incoming
+  facts and queried the copy on every successful rewrite even with debug off. Both
+  are gated behind the existing `dbg` flag now; with debug off the snapshot is
+  never built.
+- **Gate:** 65 suites / 25,368 passed / 0 failed; `regressions.sh` exit 0;
+  `allaxes` 45/45 `ok`, full matrix below (`L/U/M` per cell).
+
+| prog | Cwall | Ccpu | Crss | size | Rwall | Rcpu | Rrss |
+|---|---|---|---|---|---|---|---|
+| h_arith | 117ms/89ms/95ms | 142ms/115ms/122ms | 116.4M/117.5M/119.2M | 4,617,128/5,839,120/4,091,440 | 2ms/2ms/2ms | 2ms/2ms/2ms | 10.8M/10.8M/11.0M |
+| h_branch | 118ms/90ms/100ms | 142ms/118ms/126ms | 117.0M/117.7M/119.4M | 4,616,832/5,837,264/4,089,760 | 2ms/3ms/2ms | 2ms/2ms/2ms | 11.0M/10.8M/11.1M |
+| h_calls | 118ms/90ms/99ms | 143ms/119ms/128ms | 117.2M/118.1M/119.7M | 4,616,872/5,837,792/4,090,136 | 2ms/3ms/2ms | 2ms/2ms/2ms | 10.8M/11.0M/10.8M |
+| h_float | 126ms/90ms/98ms | 148ms/117ms/126ms | 115.7M/117.2M/118.7M | 4,637,984/5,861,024/4,130,328 | 3ms/3ms/3ms | 2ms/2ms/2ms | 11.0M/11.0M/11.0M |
+| h_mem | 265ms/135ms/167ms | 439ms/184ms/237ms | 136.3M/133.6M/135.9M | 4,646,856/5,959,856/4,179,440 | 3ms/10ms/4ms | 3ms/9ms/4ms | 11.0M/11.0M/11.0M |
+| h_simd | 141ms/97ms/108ms | 167ms/126ms/137ms | 122.4M/123.5M/124.6M | 4,617,704/5,843,736/4,093,864 | 2ms/4ms/2ms | 2ms/3ms/2ms | 11.0M/11.0M/11.1M |
+| p1_arith | 85ms/79ms/82ms | 105ms/103ms/104ms | 104.6M/107.0M/108.1M | 4,635,232/5,877,944/4,159,072 | 82ms/109ms/101ms | 81ms/108ms/101ms | 10.8M/10.8M/10.8M |
+| p2_mem | 246ms/128ms/156ms | 378ms/180ms/217ms | 132.4M/129.7M/131.7M | 4,639,896/5,936,144/4,156,944 | 16ms/156ms/42ms | 16ms/155ms/42ms | 11.0M/11.0M/11.0M |
+| p3_calls | 98ms/85ms/90ms | 119ms/111ms/115ms | 114.4M/115.5M/117.0M | 4,612,368/5,820,136/4,079,800 | 37ms/117ms/56ms | 37ms/116ms/55ms | 11.0M/10.8M/11.0M |
+| p4_simd | 108ms/94ms/103ms | 128ms/118ms/128ms | 115.1M/116.1M/117.5M | 4,636,096/5,892,376/4,165,696 | 57ms/158ms/85ms | 58ms/158ms/85ms | 48.2M/49.5M/48.8M |
+| p5_inline | 81ms/77ms/79ms | 101ms/100ms/104ms | 103.6M/105.8M/106.7M | 4,609,368/5,813,704/4,072,712 | 58ms/894ms/6ms | 57ms/894ms/6ms | 10.9M/11.0M/11.0M |
+| p6_scalar | 81ms/78ms/78ms | 99ms/98ms/99ms | 100.2M/102.0M/103.1M | 4,609,368/5,813,688/4,072,712 | 58ms/904ms/7ms | 58ms/903ms/6ms | 11.0M/10.8M/11.0M |
+| p7_branchy | 83ms/78ms/80ms | 101ms/100ms/109ms | 103.9M/105.8M/107.2M | 4,609,520/5,813,800/4,072,888 | 43ms/101ms/35ms | 43ms/100ms/35ms | 11.0M/11.0M/11.0M |
+| p8_minmax | 82ms/79ms/79ms | 101ms/102ms/102ms | 104.1M/105.9M/106.8M | 4,609,544/5,813,752/4,072,872 | 18ms/39ms/22ms | 17ms/38ms/21ms | 10.7M/11.1M/11.1M |
+| p9_u64f32 | 94ms/85ms/90ms | 112ms/107ms/113ms | 109.6M/111.6M/113.2M | 4,635,448/5,886,872/4,162,704 | 30ms/77ms/34ms | 30ms/76ms/34ms | 17.8M/18.8M/18.2M |
+
+## Session (2026-11-25, branch `rakit-exp13`) — review round 14: measure the cross-block path instead of implying it
+
+- **"Fewer slot loads" was still satisfiable by a same-block rewrite.** True: the
+  aggregate functions' drops come from same-block accesses. The list is now
+  `branch_merge`, `dynamic_index`, `loop_state`, `partial_bytes`, `union_bits` —
+  functions where the removed load is the access the fixture is about — and the
+  two aggregate functions are out of it.
+- **The cross-block dataflow is now measured by the pass itself.** `store_forward`
+  gained an `xblk=<n>` field in its `RAKIT_SF_DEBUG` line: the number of loads it
+  forwarded from a fact inherited at block entry. `regressions.sh` asserts that a
+  compile of the fixture reports `xblk>0`, so the path is exercised, and the
+  pre-pass shape check still pins the input. The final IR cannot show this: the
+  same loads disappear downstream either way, which is why the earlier
+  `RAKIT_SF_NO_CBE=1` comparison found no difference.
+- **Volatile check is now slot- and block-precise.** The store that follows the
+  fence must survive with the same `(slot, offset)` and in the same block; the
+  helper resolves offsets through `iadd`/`imul` constant chains, so the message
+  names `ss0+16` (the `v[2]` write) rather than a bare slot. Stripping that store
+  from a dump reports it.
+- **Gate:** 65 suites / 25,368 passed / 0 failed; `regressions.sh` exit 0;
+  `allaxes` 45/45 `ok`, full matrix below (`L/U/M` per cell).
+
+| prog | Cwall | Ccpu | Crss | size | Rwall | Rcpu | Rrss |
+|---|---|---|---|---|---|---|---|
+| h_arith | 118ms/90ms/98ms | 141ms/120ms/126ms | 116.4M/118.1M/119.2M | 4,617,128/5,839,120/4,091,440 | 2ms/2ms/2ms | 2ms/2ms/2ms | 11.0M/10.7M/10.8M |
+| h_branch | 116ms/90ms/98ms | 140ms/118ms/127ms | 116.8M/118.2M/119.2M | 4,616,832/5,837,264/4,089,760 | 2ms/2ms/2ms | 2ms/2ms/2ms | 11.0M/10.7M/11.1M |
+| h_calls | 117ms/90ms/100ms | 141ms/118ms/129ms | 117.0M/118.3M/119.5M | 4,616,872/5,837,792/4,090,136 | 2ms/2ms/2ms | 2ms/2ms/2ms | 11.1M/11.0M/10.9M |
+| h_float | 125ms/97ms/99ms | 148ms/125ms/126ms | 115.8M/117.5M/118.7M | 4,637,984/5,861,024/4,130,328 | 2ms/3ms/2ms | 2ms/2ms/2ms | 11.1M/11.0M/11.1M |
+| h_mem | 264ms/139ms/184ms | 431ms/190ms/240ms | 135.6M/133.4M/135.8M | 4,646,856/5,959,856/4,179,440 | 3ms/9ms/4ms | 3ms/9ms/4ms | 11.0M/11.0M/11.0M |
+| h_simd | 141ms/98ms/109ms | 166ms/128ms/138ms | 122.5M/123.2M/124.9M | 4,617,704/5,843,736/4,093,864 | 2ms/4ms/2ms | 2ms/3ms/2ms | 11.0M/11.0M/11.0M |
+| p1_arith | 84ms/78ms/83ms | 104ms/100ms/108ms | 104.5M/106.5M/108.1M | 4,635,232/5,877,944/4,159,072 | 82ms/108ms/101ms | 81ms/108ms/100ms | 10.8M/11.0M/10.8M |
+| p2_mem | 246ms/126ms/162ms | 375ms/171ms/221ms | 132.1M/129.5M/131.5M | 4,639,896/5,936,144/4,156,944 | 17ms/157ms/43ms | 16ms/157ms/42ms | 11.0M/10.8M/10.8M |
+| p3_calls | 102ms/86ms/94ms | 121ms/114ms/121ms | 114.3M/115.2M/116.8M | 4,612,368/5,820,136/4,079,800 | 37ms/116ms/56ms | 37ms/116ms/55ms | 10.8M/11.0M/10.8M |
+| p4_simd | 107ms/93ms/107ms | 128ms/117ms/132ms | 115.1M/116.0M/117.5M | 4,636,096/5,892,376/4,165,696 | 56ms/156ms/84ms | 57ms/157ms/84ms | 48.2M/49.4M/48.8M |
+| p5_inline | 82ms/75ms/81ms | 101ms/101ms/106ms | 103.5M/105.6M/106.6M | 4,609,368/5,813,704/4,072,712 | 58ms/893ms/6ms | 57ms/893ms/6ms | 11.1M/11.1M/10.8M |
+| p6_scalar | 81ms/77ms/81ms | 100ms/97ms/103ms | 100.1M/101.7M/103.1M | 4,609,368/5,813,688/4,072,712 | 58ms/902ms/7ms | 57ms/901ms/6ms | 10.8M/11.0M/10.8M |
+| p7_branchy | 84ms/78ms/83ms | 103ms/100ms/106ms | 104.1M/105.7M/107.0M | 4,609,520/5,813,800/4,072,888 | 43ms/101ms/35ms | 44ms/100ms/36ms | 11.0M/10.8M/11.0M |
+| p8_minmax | 84ms/78ms/86ms | 103ms/100ms/106ms | 103.8M/105.6M/107.0M | 4,609,544/5,813,752/4,072,872 | 18ms/39ms/20ms | 18ms/38ms/20ms | 10.7M/11.1M/11.0M |
+| p9_u64f32 | 94ms/89ms/96ms | 114ms/111ms/124ms | 109.5M/111.8M/113.2M | 4,635,448/5,886,872/4,162,704 | 31ms/77ms/34ms | 31ms/77ms/33ms | 17.6M/18.8M/18.2M |
+
+## Session (2026-11-25, branch `rakit-exp13`) — review round 13: coverage claims that hold up
+
+- **Read-modify-write pairs were rejected.** `cross_block_evidence` required a
+  store block that never reads the slot, so a block that reads *and* writes it
+  contributed no evidence even though its successor reads the store. It now
+  counts loads whose slot is written in *some other* block; a synthetic
+  read-modify-write dump gives 2 with the new predicate where `written - read`
+  is empty.
+- **"Function changed" was not attributable.** A same-block rewrite satisfied it.
+  The assertion is now quantitative and attributable: the two builds differ only
+  in the pass, so each named function must show **fewer slot loads with the pass
+  on** — `branch_merge`, `cross_block_aggregate`, `dynamic_index`,
+  `loop_aggregate`, `loop_state`, `partial_bytes`, `union_bits` (measured drops
+  1→0, 2→1, 2→1, 10→9, 1→0, 4→2, 5→3). Running the check with the pass off in
+  both builds reports every one of them.
+- **Cross-block forwarding does not fire on this fixture.** Slot-load counts are
+  identical with `RAKIT_SF_NO_CBE=1` for all fourteen functions, so the fixture
+  does not exercise that path and the harness no longer implies it does. The
+  pre-pass check is documented as pinning the *shape*, not the rewrite.
+  `cross_block_loop_carry` stays as a value test only.
+- **Volatile write is now checked in IR.** `volatile_local`'s post-pass dump must
+  contain a `fence` followed by a store into a slot; stripping that store makes
+  the check report "the volatile write is gone".
+- Harness and fixture only; compiler and std untouched. `regressions.sh` exit 0.
+
+## Session (2026-11-25, branch `rakit-exp13`) — review round 12: what the fuzz was really covering
+
+- **Whole-binary `cmp` proves nothing about coverage.** store forwarding runs
+  crate-wide, so any function changing satisfies it. The harness now compiles the
+  fixture twice with `RAKIT_DUMP=1` (pass on / `RAKIT_NO_STORE_FWD=1`) and diffs
+  the **`.opt.rakit` of six named functions** — `cross_block_aggregate`,
+  `loop_aggregate`, `branch_merge`, `partial_bytes`, `loop_state`,
+  `maybe_uninit` — so "the pass leaves <name> untouched" is a failure. The
+  binary comparison stays as a coarse guard.
+- **The aggregate fixtures never reached the pass.** The pinned nightly splits a
+  two-word tuple into block parameters: `cross_block_aggregate` had no
+  `explicit_slot` at all, and in `loop_aggregate` the addresses I took for slots
+  resolved to `v7 -> v51 -> v54`, i.e. the `&mut Rng` argument. Both now use
+  `[u64; 4]`, which stays in an `explicit_slot`. New check: the *pre-pass*
+  (`.unopt.rakit`) IR of both functions must contain a slot **written in one
+  block and read in another**, resolved through aliases and `iadd` chains;
+  against the old tuple fixture the check reports both functions, so it pins the
+  shape rather than trusting it.
+- **The volatile case could hide a deleted write.** `volatile_local` read `v[2]`
+  straight back, so forwarding would have kept the hash. It now reads through
+  `opaque_read(*const u64)`: the address escapes, the read cannot be forwarded,
+  and deleting the write changes the hash (verified on a copy with the
+  `write_volatile` removed).
+- Harness-only change (plus the fixture): compiler and std untouched, so the
+  last full gate still holds. `regressions.sh` exit 0.
+
+## Session (2026-11-25, branch `rakit-exp13`) — PR #23 merged; fuzz the pass itself
+
+- **Branch:** `rakit-exp12` was merged as `b6720e3` into
+  `replace-main-with-cgclif-experiments`. New branch `rakit-exp13` from that
+  merge commit; the new PR targets `replace-main-with-cgclif-experiments`.
+- **New fixture `bench/tests/t_sf_fuzz.rs`** — the pass's own differential fuzz.
+  A runtime-seeded xorshift drives ten `#[inline(never)]` shapes into one hash:
+  field writes through `&mut` borrows read back through the whole struct,
+  runtime-offset byte stores read as wider integers, a value stored in both arms
+  of an `if` and read after the join, dynamic indices, raw-pointer aliases,
+  `write_volatile` into a local, a union written through one member and read
+  through another, `MaybeUninit`, loop-carried struct state, and an aggregate
+  re-assigned on both sides of a loop body (block parameters).
+- **`regressions.sh` runs it three ways:** `check t_sf_fuzz` (LLVM vs Rakit plus
+  the identical-binary guard), then a second compile with
+  `RAKIT_NO_STORE_FWD=1` whose output must match, and whose binary must *differ*
+  — otherwise the fixture stopped reaching the pass and the comparison means
+  nothing.
+- **The fixture has teeth.** Injecting a real bug into `mem_key` (dropping the
+  stack-slot and access offset so every access keys at offset 0) made the fuzz
+  segfault and `regressions.sh` exit 1 ("t_sf_fuzz M: run failed", "LLVM and
+  Rakit differ"). Injection reverted and std rebuilt from scratch.
+- **Gate:** 65 suites / 25,368 passed / 0 failed; regressions pass (3-way on the
+  fuzz); `allaxes` 45/45 `ok`, full matrix below (`L/U/M` per cell).
+
+| prog | Cwall | Ccpu | Crss | size | Rwall | Rcpu | Rrss |
+|---|---|---|---|---|---|---|---|
+| h_arith | 119ms/91ms/99ms | 143ms/120ms/127ms | 116.5M/118.1M/119.2M | 4,617,128/5,839,120/4,091,440 | 2ms/2ms/2ms | 2ms/2ms/2ms | 11.0M/11.0M/10.8M |
+| h_branch | 118ms/89ms/101ms | 146ms/119ms/130ms | 116.8M/118.2M/119.2M | 4,616,832/5,837,264/4,089,760 | 2ms/2ms/2ms | 2ms/2ms/2ms | 11.0M/11.0M/11.0M |
+| h_calls | 118ms/93ms/101ms | 145ms/123ms/130ms | 116.9M/118.4M/119.7M | 4,616,872/5,837,792/4,090,136 | 2ms/2ms/2ms | 2ms/2ms/2ms | 11.1M/11.0M/10.8M |
+| h_float | 127ms/91ms/100ms | 152ms/122ms/128ms | 115.4M/117.5M/118.7M | 4,637,984/5,861,024/4,130,328 | 2ms/3ms/3ms | 2ms/2ms/2ms | 11.0M/11.1M/11.0M |
+| h_mem | 272ms/138ms/174ms | 440ms/187ms/249ms | 136.5M/133.5M/136.0M | 4,646,856/5,959,856/4,179,440 | 3ms/10ms/4ms | 3ms/9ms/4ms | 11.0M/11.0M/11.1M |
+| h_simd | 148ms/100ms/111ms | 173ms/131ms/141ms | 122.6M/123.7M/125.0M | 4,617,704/5,843,736/4,093,864 | 2ms/4ms/2ms | 2ms/3ms/2ms | 11.1M/10.7M/11.0M |
+| p1_arith | 84ms/79ms/82ms | 103ms/101ms/105ms | 104.7M/106.9M/108.2M | 4,635,232/5,877,944/4,159,072 | 82ms/108ms/101ms | 81ms/108ms/100ms | 11.0M/11.0M/11.1M |
+| p2_mem | 241ms/130ms/159ms | 373ms/174ms/220ms | 132.1M/130.0M/131.9M | 4,639,896/5,936,144/4,156,944 | 17ms/157ms/45ms | 16ms/158ms/43ms | 10.8M/10.8M/10.8M |
+| p3_calls | 99ms/88ms/93ms | 123ms/115ms/118ms | 114.4M/115.4M/117.0M | 4,612,368/5,820,136/4,079,800 | 37ms/117ms/56ms | 37ms/117ms/55ms | 11.0M/11.0M/10.8M |
+| p4_simd | 109ms/94ms/103ms | 129ms/118ms/128ms | 115.1M/115.9M/117.5M | 4,636,096/5,892,376/4,165,696 | 56ms/157ms/85ms | 57ms/156ms/86ms | 48.2M/49.4M/48.8M |
+| p5_inline | 82ms/78ms/81ms | 103ms/101ms/107ms | 103.6M/105.8M/106.9M | 4,609,368/5,813,704/4,072,712 | 58ms/893ms/6ms | 58ms/892ms/6ms | 11.1M/11.0M/10.8M |
+| p6_scalar | 81ms/78ms/80ms | 101ms/100ms/103ms | 100.2M/102.0M/103.1M | 4,609,368/5,813,688/4,072,712 | 58ms/902ms/6ms | 57ms/902ms/6ms | 11.0M/11.0M/11.1M |
+| p7_branchy | 84ms/81ms/82ms | 105ms/103ms/106ms | 103.9M/105.7M/106.9M | 4,609,520/5,813,800/4,072,888 | 43ms/101ms/36ms | 42ms/100ms/35ms | 11.1M/11.1M/10.8M |
+| p8_minmax | 86ms/79ms/84ms | 105ms/101ms/111ms | 104.3M/105.3M/106.9M | 4,609,544/5,813,752/4,072,872 | 18ms/39ms/21ms | 18ms/40ms/20ms | 11.0M/11.0M/10.8M |
+| p9_u64f32 | 96ms/88ms/95ms | 117ms/111ms/119ms | 110.0M/111.6M/113.0M | 4,635,448/5,886,872/4,162,704 | 31ms/77ms/34ms | 30ms/76ms/34ms | 17.8M/18.8M/18.2M |
+
 ## Session (2026-11-25, branch `rakit-exp12`) — review round 11: assert the diagnostic
 
 - **Bug:** every negative self-test only asked for a nonzero exit, so a checker

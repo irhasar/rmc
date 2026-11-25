@@ -99,6 +99,285 @@ check t_ptr_store_alias '7 0'
 check t_cast_escape '127'
 check t_cast_offset '127'
 check t_deep_cast_chain '127 127'
+check t_sf_fuzz $'n=0 h=16744716138362834768
+n=1 h=389363493002315213
+n=2 h=8943709728885627070
+n=3 h=290819445394666187
+n=4 h=11115180720318630965'
+
+# Forwarding must be invisible, and the fixture must still reach the pass in the
+# functions it was written for. A whole-binary comparison cannot say that: the
+# pass runs over the whole crate, so some unrelated function changing keeps the
+# `cmp` happy while `cross_block_aggregate` quietly stops exercising it.
+if [ -x "$TMP/t_sf_fuzz_M" ]; then
+    mkdir -p "$TMP/sf_on" "$TMP/sf_off"
+    dumped=1
+    for cfg in on off; do
+        pre=()
+        [ "$cfg" = off ] && pre=(RAKIT_NO_STORE_FWD=1)
+        if ! env "${pre[@]}" RAKIT_DUMP=1 env -u RAKIT_HOST_LLVM "$ROOT/rakit/dist/bin/rustc-rakit" \
+            --target "$TARGET" -C opt-level=3 "$BENCH/tests/t_sf_fuzz.rs" \
+            -o "$TMP/sf_$cfg/sf" --edition 2021 >"$TMP/sf_$cfg.log" 2>&1
+        then
+            echo "[regression] t_sf_fuzz: compile with the pass $cfg failed" >&2
+            sed 's/^/    /' "$TMP/sf_$cfg.log" | tail -5 >&2
+            fail=1
+            dumped=0
+        fi
+    done
+    if [ "$dumped" = 1 ]; then
+        if ! "$TMP/sf_off/sf" >"$TMP/sf_off.out" 2>&1; then
+            echo "[regression] t_sf_fuzz: run with the pass off failed" >&2
+            fail=1
+        elif ! diff -q "$TMP/t_sf_fuzz_M.out" "$TMP/sf_off.out" >/dev/null; then
+            echo "[regression] t_sf_fuzz: forwarding changes the result" >&2
+            diff -u "$TMP/t_sf_fuzz_M.out" "$TMP/sf_off.out" >&2
+            fail=1
+        fi
+        if cmp -s "$TMP/sf_on/sf" "$TMP/sf_off/sf"; then
+            echo "[regression] t_sf_fuzz: the pass changes nothing, fixture is insensitive" >&2
+            fail=1
+        fi
+        python3 - "$TMP/sf_on/sf.rakit" "$TMP/sf_off/sf.rakit" <<'PYEOF' || fail=1
+import os, re, sys
+
+# What each list asserts, and what it deliberately does not.
+#
+# SHAPE: the pre-pass IR of these functions still holds a slot written in one
+# block and read in another. This only pins that the *input shape* survives into
+# the pass -- a lowering change that splits the aggregate into block parameters
+# would remove it -- and says nothing about what the pass rewrites.
+SHAPE = ["cross_block_aggregate", "cross_block_loop_carry", "loop_aggregate"]
+
+# REWRITTEN: store_forward removed a slot load in that function. The two builds
+# differ only in the pass, so the drop is attributable to it. The cross-block
+# functions are not listed: their drops come from same-block accesses, and this
+# fixture does not establish that the cross-block dataflow rewrote anything. See
+# AGENTS.md: the pass counts those forwards under RAKIT_SF_DEBUG (`xblk`), but
+# the count cannot be attributed to a function here.
+REWRITTEN = [
+    "branch_merge",
+    "dynamic_index",
+    "loop_state",
+    "partial_bytes",
+    "union_bits",
+]
+
+# VOLATILE: the volatile write survives the pass -- same slot, same offset, same
+# block as the fence that precedes it.
+VOLATILE = "volatile_local"
+
+STACK_ADDR = re.compile(r"^\s*(v\d+) = stack_addr\.i64 (ss\d+)(?:([+-])(\d+))?")
+ICONST = re.compile(r"^\s*(v\d+) = iconst\.i64 (0x[0-9a-f_]+|\d+)")
+IADD_IMM = re.compile(r"^\s*(v\d+) = iadd_imm\.?\w* (v\d+), (-?\d+)")
+ARITH = re.compile(r"^\s*(v\d+) = (imul|iadd|isub|ishl|band|bor)(?:\.i64)? (v\d+), (v\d+)")
+ALIAS = re.compile(r"^\s*(v\d+) -> (v\d+)\s*$")
+ASSIGN = re.compile(r"^\s*(v\d+) = (.*)$")
+STORE = re.compile(r"^\s*store(?:\.\w+)?\s+(?:[\w.]+\s+)*?(v\d+),\s*(v\d+)(?:([+-])(\d+))?")
+LOAD = re.compile(r"^\s*(?:v\d+ = )?load(?:\.\w+)?\s+(?:[\w.]+)?\s*(v\d+)(?:([+-])(\d+))?")
+BLOCK = re.compile(r"^block\d+")
+FENCE = re.compile(r"^\s*fence\b")
+
+
+def _offset(m, group):
+    if not m.group(group):
+        return 0
+    value = int(m.group(group + 1))
+    return -value if m.group(group) == "-" else value
+
+
+def _int(text):
+    return int(text.replace("_", ""), 0)
+
+
+def scan(path):
+    """Lines plus a resolver from a value to (slot, byte offset or None)."""
+    lines, slot_of, consts, sums = [], {}, {}, {}
+    for line in open(path):
+        text = line.split(";")[0].rstrip()
+        if not text.strip():
+            continue
+        lines.append(text)
+        if m := STACK_ADDR.match(text):
+            slot_of[m.group(1)] = (m.group(2), _offset(m, 3))
+        elif m := ICONST.match(text):
+            consts[m.group(1)] = _int(m.group(2))
+        elif m := ARITH.match(text):
+            op, left, right = m.group(2), m.group(3), m.group(4)
+            if left in consts and right in consts:
+                a, b = consts[left], consts[right]
+                consts[m.group(1)] = {
+                    "imul": a * b, "iadd": a + b, "isub": a - b,
+                    "ishl": a << b, "band": a & b, "bor": a | b,
+                }[op]
+            elif op == "iadd":
+                sums[m.group(1)] = (left, right)
+        elif m := IADD_IMM.match(text):
+            sums[m.group(1)] = (m.group(2), int(m.group(3)))
+        elif m := ALIAS.match(text):
+            slot_of[m.group(1)] = ("one", m.group(2))
+        elif m := ASSIGN.match(text):
+            slot_of.setdefault(m.group(1), ("many", re.findall(r"v\d+", m.group(2))))
+
+    def resolve(value):
+        # Walk aliases and iadd chains to the slot a value addresses. The offset
+        # is None as soon as a displacement is not a constant: two accesses whose
+        # offsets are unknown cannot be shown to touch the same bytes.
+        pending, seen = [(value, 0, False)], set()
+        while pending:
+            current, extra, unknown = pending.pop(0)
+            if current in seen:
+                continue
+            seen.add(current)
+            entry = slot_of.get(current)
+            if isinstance(entry, tuple) and len(entry) == 2 and entry[0].startswith("ss"):
+                return (entry[0], None if unknown else entry[1] + extra)
+            if current in consts:
+                continue
+            if current in sums:
+                left, right = sums[current]
+                if isinstance(right, int):
+                    pending.append((left, extra + right, unknown))
+                elif right in consts:
+                    pending.append((left, extra + consts[right], unknown))
+                elif left in consts:
+                    pending.append((right, extra + consts[left], unknown))
+                else:
+                    pending.append((left, extra, True))
+                    pending.append((right, extra, True))
+                continue
+            if isinstance(entry, tuple):
+                pending.extend([(entry[1], extra, unknown)] if entry[0] == "one"
+                               else [(o, extra, unknown) for o in entry[1]])
+        return None
+
+    return lines, resolve
+
+
+def slot_accesses(path):
+    """(slot, offset, block) for every slot store, and for every slot load."""
+    lines, resolve = scan(path)
+    stores, loads, block = [], [], -1
+    for text in lines:
+        if BLOCK.match(text.strip()):
+            block += 1
+            continue
+        if m := STORE.match(text):
+            base = resolve(m.group(2))
+            if base:
+                offset = None if base[1] is None else base[1] + _offset(m, 3)
+                stores.append((base[0], offset, block))
+        elif m := LOAD.match(text):
+            base = resolve(m.group(1))
+            if base:
+                offset = None if base[1] is None else base[1] + _offset(m, 2)
+                loads.append((base[0], offset, block))
+    return stores, loads
+
+
+def cross_block_loads(path):
+    """Loads whose slot is written in some *other* block.
+
+    Read-modify-write blocks are counted: a block that both reads and writes the
+    slot still reads what the block before it stored.
+    """
+    stores, loads = slot_accesses(path)
+    return sum(1 for slot, _, block in loads if any(s == slot and b != block for s, _, b in stores))
+
+
+def store_after_fence(path):
+    """(slot, offset) of the first slot store that follows a fence, if any."""
+    lines, resolve = scan(path)
+    block, fenced_in = -1, None
+    for text in lines:
+        if BLOCK.match(text.strip()):
+            block += 1
+            continue
+        if FENCE.match(text):
+            fenced_in = block
+            continue
+        if fenced_in == block and (m := STORE.match(text)):
+            base = resolve(m.group(2))
+            if base:
+                offset = None if base[1] is None else base[1] + _offset(m, 3)
+                return (base[0], offset)
+    return None
+
+
+def dumps(directory, suffix):
+    found = {}
+    for name in os.listdir(directory):
+        m = re.search(r"9t_sf_fuzz\d*([a-z_0-9]+)\." + suffix + r"$", name)
+        if m:
+            found[m.group(1)] = os.path.join(directory, name)
+    return found
+
+
+on_dir, off_dir = sys.argv[1], sys.argv[2]
+pre = dumps(on_dir, r"unopt\.rakit")
+post_on, post_off = dumps(on_dir, r"opt\.rakit"), dumps(off_dir, r"opt\.rakit")
+bad = 0
+
+for name in SHAPE:
+    if name not in pre:
+        print(f"[regression] sf coverage: no pre-pass IR for {name}", file=sys.stderr)
+        bad = 1
+    elif not cross_block_loads(pre[name]):
+        print(
+            f"[regression] sf coverage: {name} holds no cross-block store and load "
+            f"before the pass, so it no longer reaches it",
+            file=sys.stderr,
+        )
+        bad = 1
+
+for name in REWRITTEN:
+    if name not in post_on or name not in post_off:
+        print(f"[regression] sf coverage: no IR dump for {name}", file=sys.stderr)
+        bad = 1
+        continue
+    before = len(slot_accesses(post_off[name])[1])
+    after = len(slot_accesses(post_on[name])[1])
+    if after >= before:
+        print(
+            f"[regression] sf coverage: the pass removes no slot load in {name} "
+            f"({before} with it off, {after} with it on)",
+            file=sys.stderr,
+        )
+        bad = 1
+
+if VOLATILE not in pre or VOLATILE not in post_on:
+    print(f"[regression] sf coverage: no IR dump for {VOLATILE}", file=sys.stderr)
+    bad = 1
+else:
+    expected = store_after_fence(pre[VOLATILE])
+    actual = store_after_fence(post_on[VOLATILE])
+    if expected is None:
+        print(
+            f"[regression] sf coverage: {VOLATILE} has no store after its fence "
+            f"before the pass, the volatile write is gone from the input",
+            file=sys.stderr,
+        )
+        bad = 1
+    elif expected[1] is None or actual is None or actual[1] is None:
+        print(
+            f"[regression] sf coverage: the volatile write in {VOLATILE} cannot be "
+            f"located after the pass (fence store {expected}, found {actual}); a "
+            f"runtime index into the slot is not evidence of the same bytes",
+            file=sys.stderr,
+        )
+        bad = 1
+    elif actual != expected:
+        print(
+            f"[regression] sf coverage: the volatile write in {VOLATILE} is gone "
+            f"(expected a store to {expected} after the fence, found {actual})",
+            file=sys.stderr,
+        )
+        bad = 1
+
+sys.exit(bad)
+PYEOF
+    fi
+fi
 
 # Two store-forwarding properties cannot be seen in a fixture's output: a
 # volatile write has no reader, and an abandoned provenance walk only costs an
@@ -392,8 +671,12 @@ then
     printf '%s\n' "$sfout" | tail -5 >&2
     fail=1
 else
-    if ! printf '%s\n' "$sfout" | grep -q '^\[sf\]'; then
-        echo "[regression] t_deep_cast_chain: store forwarding reported nothing" >&2
+    # A completed summary (`[sf] <fn> insts=...`) is the only line that says the
+    # pass handled the function: the bail messages (`no stack slot`, `nothing
+    # trackable`) also start with `[sf]` and would otherwise satisfy this.
+    if ! printf '%s\n' "$sfout" | grep -qE '^\[sf\] \S+ insts=[0-9]+ '; then
+        echo "[regression] t_deep_cast_chain: store forwarding completed on no function" >&2
+        printf '%s\n' "$sfout" | grep '^\[sf\]' | head -5 >&2
         fail=1
     fi
     if printf '%s\n' "$sfout" | grep -q 'truncated'; then
