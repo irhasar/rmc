@@ -383,6 +383,33 @@ fn build_isa(sess: &Session, jit: bool) -> Arc<dyn TargetIsa + 'static> {
         }
     };
 
+    // Apply `-Ctarget-feature=+feat`. Without this the builder only sees the
+    // CPU name, so `+avx2`/`+bmi2`/`+fma` are silently dropped and code that
+    // relies on them (`memchr`, `aho-corasick`, `regex`) stays on the SSE2 or
+    // scalar path. Unknown names (e.g. `crt-static`) are not ISA features.
+    let mut isa_builder = isa_builder;
+    let cg_features = &sess.opts.cg.target_feature;
+    let debug = std::env::var_os("RAKIT_ISA_DEBUG").is_some();
+    for feat in sess.target.features.split(',').chain(cg_features.split(',')) {
+        // rustc spells the x86 features `avx2` / `sse4.1`; Cranelift's settings
+        // are `has_avx2` / `has_sse41`, so try both spellings.
+        let clif_name = |name: &str| format!("has_{}", name.replace('.', ""));
+        if let Some(name) = feat.strip_prefix('+') {
+            let mut res = isa_builder.enable(name);
+            if res.is_err() {
+                res = isa_builder.enable(&clif_name(name));
+            }
+            if debug {
+                eprintln!("rakit: target feature +{} -> {:?}", name, res);
+            }
+        } else if let Some(name) = feat.strip_prefix('-') {
+            let res = isa_builder.set(&clif_name(name), "false");
+            if debug {
+                eprintln!("rakit: target feature -{} -> {:?}", name, res);
+            }
+        }
+    }
+
     match isa_builder.finish(flags) {
         Ok(target_isa) => target_isa,
         Err(err) => sess.dcx().fatal(format!("failed to build TargetIsa: {}", err)),

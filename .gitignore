@@ -13,6 +13,7 @@ cg_clif_upstream/target/
 tools/sampler
 extbench/out/
 extbench/crateworks/
+extbench/ripgrep/
 rakit/rakit-ir/target/
 rakit/rakit-ir/Cargo.lock
 rakit/rakit-opt/target/

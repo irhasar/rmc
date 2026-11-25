@@ -1504,6 +1504,67 @@ cpu ms / peak RSS MB. All stdout matched LLVM.
 
 # AGENTS.md
 
+## Session (2026-11-24) — ripgrep 14.1.1: compile/size win, runtime 7.7x, root cause 256-bit SIMD
+
+**Target:** proyek nyata besar — **ripgrep 14.1.1**, 41 dependensi transitif
+(regex, memchr, aho-corasick, ignore, globset, serde, clap). Harness
+`extbench/cratebench.sh` mengukur seluruh pohon cargo (wall/CPU/peak-RSS),
+ukuran biner, dan runtime (wall/CPU/RSS) dengan validasi stdout byte-per-byte.
+Korpus deterministik `extbench/gen_corpus.sh` (2000 file x 400 baris, 40 MB);
+beban kerja `extbench/drivers/rg_work.sh` = lima pencarian (`--sort path`).
+
+**Full matrix** (CREPS=2, RREPS=5; kompilasi wall/cpu/peak-RSS/byte; runtime wall/cpu/peak-RSS):
+
+| backend | Cwall | Ccpu | Crss | size | Rwall | Rcpu | Rrss |
+|---|---|---|---|---|---|---|---|
+| L LLVM | 27065 ms | 85910 ms | 1102 MB | 30,490,856 | 411 ms | 280 ms | 9 MB |
+| U cg_clif | 9924 ms | 26930 ms | 904 MB | 35,356,496 | 4869 ms | 4720 ms | 16 MB |
+| M Rakit | 11451 ms | 32220 ms | 929 MB | 27,906,952 | 3164 ms | 3040 ms | 13 MB |
+
+M vs L: kompilasi **0.42x wall, 0.37x CPU**, RSS 0.84x, ukuran **-8.5%**,
+runtime **7.66x**. M vs U: kompilasi 1.15x, ukuran **-21%**, runtime **0.65x**.
+stdout ketiga backend identik (3,457,671 byte).
+
+**Per-pencarian** (median ms, korpus 40 MB): literal `-F` 55.0/389.2/330.4
+(L/U/M, M/L 6.01); regex ber-capture 63.3/468.2/382.9 (6.04); `-i` alternation
+173.7/2350.3/1399.3 (8.06); multi-pattern 86.1/1485.8/946.8 (10.99); walk
+4.9/14.8/9.1 (1.84). Total 383.1/4708.4/3068.5 (M/L 8.01, M/U 0.65).
+
+**Akar gap = penskalaran intrinsik 256-bit, bukan pass.** Terisolasi `memchr`
+(2 MB x 5): L 0.2 ms, U 21.1 ms, M 16.9 ms. Disasm: L 104 `%ymm` / 68
+`pcmpeqb`; U 0 / 0; M 0 `%ymm` / 19 `pcmpeqb`. Probe `_mm256_add_epi8`: L 12
+`%ymm` + 4 `vpaddb`; M 0 (badan kernel: 940 `mov`, 103 `sub` — skalar per
+byte). `is_x86_feature_detected!` (sse2/sse4.1/avx/avx2/bmi2/popcnt) **identik
+true** di ketiganya, jadi bukan deteksi CPU. Cranelift x64 tidak punya lowering
+256-bit; rakit menskalarisasi `_mm256_*` sebelum sampai ke backend.
+
+**Fix landed (`rakit/src/lib.rs`): propagasi `-Ctarget-feature`.** Sebelumnya
+flag diabaikan total: builder hanya menerima nama CPU, dan `enable("avx2")`
+malah `Err(BadName)` karena setting Cranelift bernama `has_avx2`. Sekarang
+`sess.target.features` + `sess.opts.cg.target_feature` diterapkan dengan
+pemetaan `+feat` -> `feat` atau `has_<feat tanpa titik>` (dan `-feat` ->
+`set("has_...", "false")`). `RAKIT_ISA_DEBUG=1` mencetak hasil per fitur.
+Efek: ripgrep M 3083 -> 3036 ms (**-1.5%**), output tetap identik; tanpa flag
+codegen **tidak berubah** (ukuran biner allaxes identik 61,503,384 byte).
+Gate: suite **65 suites / 25,368 passed / 0 failed**; regresi hijau; allaxes
+M/L run **1.00x**, compile 0.81x, ukuran -11.3%.
+
+**Harness fixes (dipakai ulang):** `SRC` dinormalisasi ke path absolut (dulu
+`cd $SRC` + `CARGO_TARGET_DIR` relatif membuat target bersarang); subcommand
+per backend (`build` untuk L/U, `rakit build` hanya untuk M — sebelumnya U
+gagal `exit=101`); `RUNCMD` untuk beban kerja multi-argumen; `OUTDIR`
+menyimpan stdout tiap backend dan `cmp` byte-per-byte di akhir (mismatch ->
+exit 1); baris runtime dicetak di luar cabang; `RUN_FAIL` eksplisit;
+`CARGO` env untuk biner L.
+
+**Kesimpulan untuk tujuan "unggul di semua":** pada proyek nyata M sudah
+menang kompilasi (2.4x lebih cepat, 16% RSS lebih kecil) dan ukuran (8.5%
+lebih kecil, 21% lebih kecil dari U), tetapi runtime masih 7.7x. Penutupnya
+bukan pass baru, melainkan **lowering vektor 256-bit di rakit-codegen**
+(`_mm256_*` -> 2x 128-bit atau AVX2 native); itu prasyarat agar memchr,
+aho-corasick, dan regex-automata memakai jalur cepatnya. `+target-feature`
+saja tidak cukup.
+
 ## Session (2026-11-24) — all-axes output validation, strict held-out args
 - **Bug fixed:** `allaxes.sh` timed discovered held-out programs without
   checking stdout. `bench/validate.sh` now holds the shared step: `--capture`
