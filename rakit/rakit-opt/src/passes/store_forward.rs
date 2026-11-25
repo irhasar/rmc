@@ -293,9 +293,10 @@ fn run_body(
         FxHashMap::default()
     };
     let t2 = std::time::Instant::now();
+    let mut cross_forwarded = 0;
     if !loaded.is_empty() {
         for block in func.layout.blocks().collect::<Vec<_>>() {
-            forward_block(
+            cross_forwarded += forward_block(
                 func, block, &private, &ptr_bases, &loaded, &entry, endianness, &confined,
                 &prov,
             );
@@ -305,11 +306,12 @@ fn run_body(
     drop_dead_stores(func, &private, &prov);
     if dbg {
         eprintln!(
-            "[sf] {} insts={} setup={:?} cbe={:?} fwd={:?} dead={:?}",
+            "[sf] {} insts={} setup={:?} cbe={:?} xblk={} fwd={:?} dead={:?}",
             func.name,
             func.dfg.num_insts(),
             t1 - t0,
             t2 - t1,
+            cross_forwarded,
             t3 - t2,
             t3.elapsed(),
         );
@@ -672,8 +674,12 @@ fn forward_block(
     endianness: ir::Endianness,
     confined: &FxHashMap<Value, Confined>,
     prov: &FxHashMap<Base, StackSlot>,
-) {
+) -> usize {
     let mut avail: Avail = entry.get(&block).cloned().unwrap_or_default();
+    // Facts inherited from the block entry are the cross-block ones; counting the
+    // loads they forward is the only way to tell that path is exercised at all.
+    let inherited = avail.clone();
+    let mut from_entry = 0;
     // Set by a fence: the rest of the block may hold volatile accesses, which
     // this pass must neither forward into nor make forwardable.
     let mut sealed = false;
@@ -734,6 +740,9 @@ fn forward_block(
                 func.dfg.detach_inst_results(inst);
                 func.dfg.change_to_alias(result, value);
                 func.layout.remove_inst(inst);
+                if inherited.get(&key) == Some(&(value, ty)) {
+                    from_entry += 1;
+                }
             } else if result_ty.bytes() == ty.bytes() && result_ty.is_vector() && ty.is_vector() {
                 // A store and a load of the same bytes but different vector types is
                 // exactly how a SIMD bitcast (`__m128i` <-> `Simd<i8, 16>`) compiles:
@@ -747,9 +756,13 @@ fn forward_block(
                 pos.func.dfg.detach_inst_results(inst);
                 pos.func.dfg.change_to_alias(result, cast);
                 pos.func.layout.remove_inst(inst);
+                if inherited.get(&key) == Some(&(value, ty)) {
+                    from_entry += 1;
+                }
             }
         }
     }
+    from_entry
 }
 
 /// Run the block-local store transfer over `avail` without rewriting anything.

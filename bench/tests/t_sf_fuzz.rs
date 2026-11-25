@@ -124,7 +124,9 @@ fn opaque_read(p: *const u64) -> u64 {
 
 // A volatile write must survive. The value is read back through a pointer handed
 // to another function, so the address escapes and no pass can forward the write
-// into that read: if the write disappeared, the hash would change.
+// into that read: if the write disappeared, the hash would change. regressions.sh
+// also checks the write itself in the post-pass IR, because a forwarded read plus
+// a deleted write would leave the hash intact.
 #[inline(never)]
 fn volatile_local(r: &mut Rng) -> u64 {
     let mut v = [0u64; 5];
