@@ -131,13 +131,20 @@ print(f"{'search':<24}{'L wall':>9}{'U wall':>9}{'M wall':>9}{'M/L':>7}"
       f"{'M cpu':>9}{'M rss':>9}  out")
 tot = dict.fromkeys("LUM", 0.0)
 fail = 0
+# A total only means something when every search contributed to it on every
+# backend; a partial sum would divide one workload's time by another's.
+complete = True
 for name, args in searches.items():
-    med, cpu, rss, outs, bad = {}, {}, {}, {}, []
+    med, cpu, rss, outs, errs, bad = {}, {}, {}, {}, {}, []
     for bk in "LUM":
         out = f"{tmp}/{bk}.txt"
+        err = f"{tmp}/{bk}.err"
         samples, cpus, rsss = [], [], []
         for i in range(REPS + 1):
-            r = run_once([bins[bk], "--sort", "path"] + args + [corpus], out_path=out)
+            # stderr goes to its own file: merged into the capture, a backend's
+            # diagnostics would read as a result mismatch.
+            r = run_once([bins[bk], "--sort", "path"] + args + [corpus],
+                         out_path=out, err_path=err)
             if not ok(r["exit"]):
                 bad.append(f"{bk} exit {r['exit']}")
                 break
@@ -152,26 +159,32 @@ for name, args in searches.items():
         med[bk] = statistics.median(samples)
         cpu[bk] = statistics.median(cpus)
         rss[bk] = statistics.median(rsss)
-        tot[bk] += med[bk]
         with open(out, "rb") as f:
             outs[bk] = f.read()
+        with open(err, "rb") as f:
+            errs[bk] = f.read()
 
     if bad or len(outs) != 3:
         print(f"{name:<24}{'INVALID':>9}  {'; '.join(bad) or 'incomplete'}")
         fail = 1
+        complete = False
         continue
     same = outs["L"] == outs["U"] == outs["M"]
     if not same:
         fail = 1
+        complete = False
+    for bk in "LUM":
+        tot[bk] += med[bk]
+    note = "  (stderr differs)" if len(set(errs.values())) > 1 else ""
     print(f"{name:<24}{med['L']:9.1f}{med['U']:9.1f}{med['M']:9.1f}"
           f"{med['M'] / med['L']:7.2f}{cpu['M']:9.1f}{rss['M'] / 1024:8.0f}M"
-          f"  {'ok' if same else 'MISMATCH'}")
+          f"  {'ok' if same else 'MISMATCH'}{note}")
 
-if all(tot.values()):
+if complete and all(tot.values()):
     print(f"{'TOTAL':<24}{tot['L']:9.1f}{tot['U']:9.1f}{tot['M']:9.1f}"
           f"{tot['M'] / tot['L']:7.2f}")
 else:
-    print(f"{'TOTAL':<24}  (incomplete: an invalid row has no timing)")
+    print(f"{'TOTAL':<24}  (incomplete: not every search has timings on all three backends)")
 shutil.rmtree(tmp, ignore_errors=True)
 sys.exit(1 if fail else 0)
 PY

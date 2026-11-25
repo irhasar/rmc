@@ -85,15 +85,24 @@ for bk in L U M; do
       out=$(md5sum <"$OUTDIR/out_$bk.txt" | cut -c1-8)
     else
       # `$?` after a pipeline is md5sum's, so the workload's own status has to be
-      # kept explicitly: a failed run must not contribute a hash.
-      cap=$(BIN="$bin" bash -c "$RUNCMD" 2>/dev/null) || { echo "$bk CAPTURE_FAIL"; continue; }
-      out=$(printf '%s' "$cap" | md5sum | cut -c1-8)
+      # kept explicitly: a failed run must not contribute a hash. The output goes
+      # to a file, not a shell variable: command substitution strips trailing
+      # newlines and drops NUL bytes, which would fingerprint two different
+      # outputs identically.
+      capf=$(mktemp) || exit 1
+      if ! BIN="$bin" bash -c "$RUNCMD" >"$capf" 2>/dev/null; then
+        rm -f "$capf"; echo "$bk CAPTURE_FAIL"; continue
+      fi
+      out=$(md5sum <"$capf" | cut -c1-8); rm -f "$capf"
     fi
   elif [ -n "$WORK" ]; then
     rres=$(python3 "$TM" --reps "$RREPS" --warmup 1 --json -- "$bin" "$WORK" | jf)
     read -r rw rc rr re <<<"$rres"
-    cap=$("$bin" "$WORK" 2>/dev/null) || { echo "$bk CAPTURE_FAIL"; continue; }
-    out=$(printf '%s' "$cap" | md5sum | cut -c1-8)
+    capf=$(mktemp) || exit 1
+    if ! "$bin" "$WORK" >"$capf" 2>/dev/null; then
+      rm -f "$capf"; echo "$bk CAPTURE_FAIL"; continue
+    fi
+    out=$(md5sum <"$capf" | cut -c1-8); rm -f "$capf"
   else
     printf '%-2s | %8sms %8sms %7sM | %10s | -\n' "$bk" "$cw" "$cc" "$((cr/1024))" "$sz"
     continue
