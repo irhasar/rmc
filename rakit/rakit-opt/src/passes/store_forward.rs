@@ -35,6 +35,142 @@ type Key = (Base, i64);
 /// For each byte range, the SSA value last stored to it.
 type Avail = FxHashMap<Key, (Value, types::Type)>;
 
+/// A pointer value that provably points inside one stack slot, with an upper
+/// bound on its displacement from the slot base.
+///
+/// Two such pointers derived from *different* slots cannot alias, which lets a
+/// store through one keep the facts of the other. Without the bound the
+/// displacement could leave the slot and land in a neighbour, so a fact is only
+/// trusted when its access stays inside the slot.
+#[derive(Clone, Copy)]
+struct Confined {
+    slot: StackSlot,
+    bound: u64,
+    size: u64,
+}
+
+impl Confined {
+    fn covers(&self, off: i64, ty: types::Type) -> bool {
+        off >= 0 && self.bound + off as u64 + u64::from(ty.bytes()) <= self.size
+    }
+}
+
+/// The stack slot `v` is derived from, ignoring how far it may be offset.
+///
+/// A stack address that is only ever used by integer arithmetic still does not
+/// escape the function, so the slot stays private: `sa`, `band(sa, 31)` and
+/// `iadd(sa, k)` all name the same slot. This is what lets the over-alignment
+/// idiom `iadd(sa, isub(K, band(sa, K - 1)))` keep its slot private.
+fn provenance_slot(func: &ir::Function, v: Value, depth: u32) -> Option<StackSlot> {
+    if depth == 0 {
+        return None;
+    }
+    let dfg = &func.dfg;
+    let v = dfg.resolve_aliases(v);
+    let ir::ValueDef::Result(inst, 0) = dfg.value_def(v) else { return None };
+    let data = &dfg.insts[inst];
+    match data {
+        ir::InstructionData::StackAddr { stack_slot, .. } => Some(*stack_slot),
+        ir::InstructionData::Binary { opcode, .. } => {
+            if !pure_address_arith(*opcode) {
+                return None;
+            }
+            let args = data.arguments(&dfg.value_lists);
+            args.iter()
+                .filter_map(|&arg| provenance_slot(func, arg, depth - 1))
+                .next()
+        }
+        _ => None,
+    }
+}
+
+/// Integer arithmetic that cannot leak an address out of the function: the
+/// result is another address (or a value derived from one) that the pass can
+/// still attribute to the same slot.
+fn pure_address_arith(opcode: Opcode) -> bool {
+    matches!(
+        opcode,
+        Opcode::Iadd
+            | Opcode::Isub
+            | Opcode::Imul
+            | Opcode::Band
+            | Opcode::Bor
+            | Opcode::Bxor
+            | Opcode::Uextend
+            | Opcode::Sextend
+            | Opcode::Ireduce
+            | Opcode::Bitcast
+    )
+}
+
+/// Upper bound on the value of `v` when it is built from constants, masks and
+/// add/subtract. `band(x, M)` is bounded by `M` whatever `x` is, which is what
+/// makes the over-alignment idiom `iadd(sa, isub(K, band(sa, K - 1)))` analysable.
+fn const_upper_bound(func: &ir::Function, v: Value, depth: u32) -> Option<u64> {
+    if depth == 0 {
+        return None;
+    }
+    let dfg = &func.dfg;
+    let v = dfg.resolve_aliases(v);
+    let ir::ValueDef::Result(inst, 0) = dfg.value_def(v) else { return None };
+    let data = &dfg.insts[inst];
+    match data {
+        ir::InstructionData::UnaryImm { opcode: ir::Opcode::Iconst, imm, .. } => {
+            Some(imm.bits() as u64)
+        }
+        ir::InstructionData::Binary { opcode, .. } => {
+            let args = data.arguments(&dfg.value_lists);
+            let a = *args.first()?;
+            let b = *args.get(1)?;
+            let ba = || const_upper_bound(func, a, depth - 1);
+            let bb = || const_upper_bound(func, b, depth - 1);
+            match opcode {
+                ir::Opcode::Iadd => Some(ba()?.checked_add(bb()?)?),
+                ir::Opcode::Imul => Some(ba()?.checked_mul(bb()?)?),
+                // `x & M <= M` and `x & M <= x`, so a bound on either side bounds
+                // the result.
+                ir::Opcode::Band => match (ba(), bb()) {
+                    (Some(x), Some(y)) => Some(x.min(y)),
+                    (Some(x), None) | (None, Some(x)) => Some(x),
+                    _ => None,
+                },
+                // `a - b <= a` because `b` is a non-negative integer here.
+                ir::Opcode::Isub => ba(),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The stack slot `v` provably points into, plus an upper bound on how far past
+/// the slot base it may point.
+fn confined_slot(func: &ir::Function, v: Value, depth: u32) -> Option<(StackSlot, u64)> {
+    if depth == 0 {
+        return None;
+    }
+    let dfg = &func.dfg;
+    let v = dfg.resolve_aliases(v);
+    let ir::ValueDef::Result(inst, 0) = dfg.value_def(v) else { return None };
+    let data = &dfg.insts[inst];
+    match data {
+        ir::InstructionData::StackAddr { stack_slot, offset, .. } => {
+            Some((*stack_slot, i64::from(*offset) as u64))
+        }
+        ir::InstructionData::Binary { opcode: ir::Opcode::Iadd, .. } => {
+            let args = data.arguments(&dfg.value_lists);
+            let a = *args.first()?;
+            let b = *args.get(1)?;
+            if let Some((slot, off)) = confined_slot(func, a, depth - 1) {
+                return Some((slot, off.checked_add(const_upper_bound(func, b, 8)?)?));
+            }
+            let (slot, off) = confined_slot(func, b, depth - 1)?;
+            Some((slot, off.checked_add(const_upper_bound(func, a, 8)?)?))
+        }
+        _ => None,
+    }
+}
+
 pub fn run(
     func: &mut ir::Function,
     endianness: ir::Endianness,
@@ -43,6 +179,14 @@ pub fn run(
     if !crate::tunables::store_forward_enabled() {
         return;
     }
+    run_body(func, endianness, analyses);
+}
+
+fn run_body(
+    func: &mut ir::Function,
+    endianness: ir::Endianness,
+    analyses: &mut crate::analyses::Analyses,
+) {
     let dbg = crate::tunables::store_forward_time();
     let t0 = std::time::Instant::now();
     if let Some(skip) = crate::tunables::store_forward_skip() {
@@ -57,7 +201,7 @@ pub fn run(
     if func.sized_stack_slots.is_empty() && func.dynamic_stack_slots.is_empty() {
         return;
     }
-    let Bases { private_slots: private, ptr_bases, loaded } = analyze(func);
+    let Bases { private_slots: private, ptr_bases, loaded, confined, prov } = analyze(func);
     let t1 = std::time::Instant::now();
     // Nothing the pass can track: no private slot and no non-escaping pointer
     // base means no store is forwardable and no dead store can be identified.
@@ -73,18 +217,21 @@ pub fn run(
         && crate::tunables::store_forward_cross_block()
         && cbe_within_budget(func)
     {
-        cross_block_entry(func, &private, &ptr_bases, &loaded, analyses)
+        cross_block_entry(func, &private, &ptr_bases, &loaded, &confined, &prov, analyses)
     } else {
         FxHashMap::default()
     };
     let t2 = std::time::Instant::now();
     if !loaded.is_empty() {
         for block in func.layout.blocks().collect::<Vec<_>>() {
-            forward_block(func, block, &private, &ptr_bases, &loaded, &entry, endianness);
+            forward_block(
+                func, block, &private, &ptr_bases, &loaded, &entry, endianness, &confined,
+                &prov,
+            );
         }
     }
     let t3 = std::time::Instant::now();
-    drop_dead_stores(func, &private);
+    drop_dead_stores(func, &private, &prov);
     if dbg {
         eprintln!(
             "[sf] {} insts={} setup={:?} cbe={:?} fwd={:?} dead={:?}",
@@ -140,6 +287,11 @@ struct Bases {
     ptr_bases: FxHashSet<Value>,
     /// `(base, offset)` byte ranges a load reads.
     loaded: FxHashSet<Key>,
+    /// For each tracked pointer base, the slot it provably points into.
+    confined: FxHashMap<Value, Confined>,
+    /// The slot each tracked access base addresses: a direct `stack_addr` names
+    /// its slot, a derived pointer names the slot it was computed from.
+    prov: FxHashMap<Base, StackSlot>,
 }
 
 fn analyze(func: &ir::Function) -> Bases {
@@ -150,26 +302,34 @@ fn analyze(func: &ir::Function) -> Bases {
     let mut escaping_ptr: FxHashSet<Value> = FxHashSet::default();
     // Candidate loads; filtered against the final private sets below.
     let mut loads: Vec<(Inst, Value)> = Vec::new();
+    let mut stores: Vec<(Inst, Value)> = Vec::new();
 
     for block in func.layout.blocks() {
         for inst in func.layout.block_insts(block) {
             let opcode = dfg.insts[inst].opcode();
             let addr_index = address_index(opcode);
             for (i, &arg) in dfg.insts[inst].arguments(&dfg.value_lists).iter().enumerate() {
-                // Resolve once: `slot_of` and the pointer classification both
-                // need the alias-resolved value, and resolving twice dominated
-                // the walk.
+                // Resolve once: `provenance_slot` and the pointer classification
+                // both need the alias-resolved value, and resolving twice
+                // dominated the walk.
                 let arg = dfg.resolve_aliases(arg);
-                if let Some(slot) = slot_of_resolved(dfg, arg) {
+                let is_addr = addr_index == Some(i);
+                if let Some(slot) = provenance_slot(func, arg, 8) {
                     slots.insert(slot);
-                    if addr_index != Some(i) {
+                    // Integer arithmetic on an address does not leak it out of
+                    // the function, so only a *non-arithmetic* use other than a
+                    // load/store address makes the slot observable elsewhere.
+                    if !is_addr && !pure_address_arith(opcode) {
                         escaping_slots.insert(slot);
                     }
                 }
-                if addr_index == Some(i) {
+                if is_addr {
                     addr_only.insert(arg);
                 } else {
                     escaping_ptr.insert(arg);
+                }
+                if opcode.can_store() && i == 1 {
+                    stores.push((inst, arg));
                 }
             }
             // Branch arguments are *not* part of `arguments()`. An address passed
@@ -182,7 +342,10 @@ fn analyze(func: &ir::Function) -> Bases {
                 for arg in dest.args(&dfg.value_lists) {
                     if let Some(v) = arg.as_value() {
                         let v = dfg.resolve_aliases(v);
-                        if let Some(slot) = slot_of_resolved(dfg, v) {
+                        // Provenance, not just a direct `stack_addr`: a derived
+                        // pointer reaching a phi is invisible to `mem_key` from
+                        // then on, so the slot must not be treated as private.
+                        if let Some(slot) = provenance_slot(func, v, 8) {
                             slots.insert(slot);
                             escaping_slots.insert(slot);
                         }
@@ -198,6 +361,21 @@ fn analyze(func: &ir::Function) -> Bases {
         }
     }
 
+    // An access whose address is derived from a slot but that the pass does not
+    // track reads or writes that slot without a key: a dead-store decision based
+    // on the tracked loads alone would then delete a store this load needs, and a
+    // store it cannot see would make a forwarded fact stale. Such a slot is not
+    // private.
+    for (inst, addr) in stores.iter().chain(loads.iter()) {
+        let Some(slot) = provenance_slot(func, *addr, 8) else { continue };
+        let tracked_access = mem_key(func, *inst, *addr)
+            .map(|key| tracked(&key, &slots, &addr_only))
+            .unwrap_or(false);
+        if !tracked_access {
+            escaping_slots.insert(slot);
+        }
+    }
+
     slots.retain(|s| !escaping_slots.contains(s));
     addr_only.retain(|v| !escaping_ptr.contains(v));
 
@@ -210,7 +388,34 @@ fn analyze(func: &ir::Function) -> Bases {
         }
     }
 
-    Bases { private_slots: slots, ptr_bases: addr_only, loaded }
+    // Only worth computing when a pointer base survived: a private-slot store
+    // never invalidates another slot's facts, so the alias question only comes up
+    // between derived pointers.
+    let mut confined: FxHashMap<Value, Confined> = FxHashMap::default();
+    for &base in &addr_only {
+        let Some((slot, bound)) = confined_slot(func, base, 8) else { continue };
+        let Some(data) = func.sized_stack_slots.get(slot) else { continue };
+        let size = u64::from(data.size);
+        // A bound that already leaves the slot proves nothing about neighbours.
+        if bound <= size {
+            confined.insert(base, Confined { slot, bound, size });
+        }
+    }
+
+    // Access bases, grouped by the slot they address. A slot reached through
+    // several bases is still one slot: two bases may alias, and their offsets are
+    // not comparable.
+    let mut prov: FxHashMap<Base, StackSlot> = FxHashMap::default();
+    for &slot in &slots {
+        prov.insert(Base::Slot(slot), slot);
+    }
+    for &p in &addr_only {
+        if let Some((slot, _)) = confined_slot(func, p, 8) {
+            prov.insert(Base::Ptr(p), slot);
+        }
+    }
+
+    Bases { private_slots: slots, ptr_bases: addr_only, loaded, confined, prov }
 }
 
 /// Instructions that may write memory the pass does not track: calls, atomics,
@@ -283,6 +488,8 @@ fn record_store(
     private: &FxHashSet<StackSlot>,
     ptr_bases: &FxHashSet<Value>,
     loaded: &FxHashSet<Key>,
+    confined: &FxHashMap<Value, Confined>,
+    prov: &FxHashMap<Base, StackSlot>,
 ) {
     let ty = func.dfg.value_type(value);
     let Some((base, off)) = mem_key(func, inst, addr).filter(|k| tracked(k, private, ptr_bases))
@@ -301,11 +508,21 @@ fn record_store(
     avail.retain(|&(b, o), &mut (_, prev_ty)| {
         if b == base {
             let prev_end = o + i64::from(prev_ty.bytes());
-            end <= o || prev_end <= start
-        } else {
-            // A tracked-pointer store may alias a *different* pointer base, but
-            // never a private stack slot; a private-slot store aliases nothing.
-            !(matches!(base, Base::Ptr(_)) && matches!(b, Base::Ptr(_)))
+            return end <= o || prev_end <= start;
+        }
+        // Different bases. The fact survives only when the two provably address
+        // different stack slots and neither access can leave its own slot; two
+        // bases of the same slot may alias, and their offsets are relative to
+        // different displacements so they cannot be compared.
+        match (prov.get(&base), prov.get(&b)) {
+            (Some(sb), Some(sf)) if sb != sf => {
+                let inside = |base: Base, off: i64, ty: types::Type| match base {
+                    Base::Slot(_) => true,
+                    Base::Ptr(p) => confined.get(&p).is_some_and(|c| c.covers(off, ty)),
+                };
+                inside(base, off, ty) && inside(b, o, prev_ty)
+            }
+            _ => false,
         }
     });
     // An atomic store is a synchronisation point and cannot be forwarded across;
@@ -363,6 +580,8 @@ fn forward_block(
     loaded: &FxHashSet<Key>,
     entry: &FxHashMap<Block, Avail>,
     endianness: ir::Endianness,
+    confined: &FxHashMap<Value, Confined>,
+    prov: &FxHashMap<Base, StackSlot>,
 ) {
     let mut avail: Avail = entry.get(&block).cloned().unwrap_or_default();
 
@@ -384,7 +603,10 @@ fn forward_block(
             let args = func.dfg.insts[inst].arguments(&func.dfg.value_lists);
             if args.len() >= 2 {
                 let (value, addr) = (args[0], args[1]);
-                record_store(func, inst, value, addr, &mut avail, private, ptr_bases, loaded);
+                record_store(
+                    func, inst, value, addr, &mut avail, private, ptr_bases, loaded, confined,
+                    prov,
+                );
             }
         } else if opcode.can_load() {
             // A trapping load is the volatile read `volatile_load` emits;
@@ -440,6 +662,8 @@ fn transfer(
     private: &FxHashSet<StackSlot>,
     ptr_bases: &FxHashSet<Value>,
     loaded: &FxHashSet<Key>,
+    confined: &FxHashMap<Value, Confined>,
+    prov: &FxHashMap<Base, StackSlot>,
 ) -> Avail {
     for event in events {
         match *event {
@@ -448,7 +672,10 @@ fn transfer(
             }
             SfEvent::Fence => avail.clear(),
             SfEvent::Store { inst, value, addr } => {
-                record_store(func, inst, value, addr, &mut avail, private, ptr_bases, loaded);
+                record_store(
+                    func, inst, value, addr, &mut avail, private, ptr_bases, loaded, confined,
+                    prov,
+                );
             }
         }
     }
@@ -464,6 +691,8 @@ fn cross_block_entry(
     private: &FxHashSet<StackSlot>,
     ptr_bases: &FxHashSet<Value>,
     loaded: &FxHashSet<Key>,
+    confined: &FxHashMap<Value, Confined>,
+    prov: &FxHashMap<Base, StackSlot>,
     analyses: &mut crate::analyses::Analyses,
 ) -> FxHashMap<Block, Avail> {
     // Timing is only collected when explicitly requested: `Instant::now()` in a
@@ -533,7 +762,8 @@ fn cross_block_entry(
         meet_work += in_avail.len();
         entry.insert(block, in_avail.clone());
         let t_t = now(timed);
-        let new_out = transfer(func, &events[&block], in_avail, private, ptr_bases, loaded);
+        let new_out =
+            transfer(func, &events[&block], in_avail, private, ptr_bases, loaded, confined, prov);
         trans_ns += elapsed_ns(t_t);
         out.insert(block, new_out);
     }
@@ -608,7 +838,11 @@ fn reverse_postorder(
 /// Remove stores into private slots whose bytes are not read by any surviving
 /// load. Because the slot cannot be observed from outside, such a store has no
 /// effect.
-fn drop_dead_stores(func: &mut ir::Function, private: &FxHashSet<StackSlot>) {
+fn drop_dead_stores(
+    func: &mut ir::Function,
+    private: &FxHashSet<StackSlot>,
+    prov: &FxHashMap<Base, StackSlot>,
+) {
     // Every store this pass can prove dead targets a private slot, so with none
     // the scan below would find nothing to remove.
     if private.is_empty() {
@@ -617,13 +851,21 @@ fn drop_dead_stores(func: &mut ir::Function, private: &FxHashSet<StackSlot>) {
     // Reads bucketed by slot: a store only has to be compared against the reads
     // of its own slot, not against every load in the function.
     let mut reads: FxHashMap<StackSlot, Vec<(i64, i64)>> = FxHashMap::default();
+    // Slots read through a derived pointer. Those offsets are relative to a
+    // displacement this pass does not know, so they cannot be compared with a
+    // store's offset; the slot counts as read as a whole instead.
+    let mut ptr_reads: FxHashSet<StackSlot> = FxHashSet::default();
     for block in func.layout.blocks() {
         for inst in func.layout.block_insts(block) {
             if !func.dfg.insts[inst].opcode().can_load() {
                 continue;
             }
             let addr = func.dfg.insts[inst].arguments(&func.dfg.value_lists).first().copied();
-            let Some(key) = addr.and_then(|a| stack_key(func, inst, a)) else {
+            let Some(addr) = addr else { continue };
+            let Some(key) = stack_key(func, inst, addr) else {
+                if let Some(slot) = provenance_slot(func, addr, 8) {
+                    ptr_reads.insert(slot);
+                }
                 continue;
             };
             let size = func
@@ -643,16 +885,30 @@ fn drop_dead_stores(func: &mut ir::Function, private: &FxHashSet<StackSlot>) {
                 continue;
             }
             let args = func.dfg.insts[inst].arguments(&func.dfg.value_lists);
-            let Some(key) = args.get(1).copied().and_then(|a| stack_key(func, inst, a)) else {
-                continue;
-            };
-            if !private.contains(&key.0) {
+            let Some(addr) = args.get(1).copied() else { continue };
+            let Some(key) = mem_key(func, inst, addr) else { continue };
+            let Some(&slot) = prov.get(&key.0) else { continue };
+            if !private.contains(&slot) {
                 continue;
             }
             let size = i64::from(func.dfg.value_type(args[0]).bytes());
-            let overlaps = reads.get(&key.0).is_some_and(|rs| {
-                rs.iter().any(|&(off, len)| off < key.1 + size && key.1 < off + len)
-            });
+            let overlaps = match key.0 {
+                // A direct slot access: compare byte ranges.
+                Base::Slot(_) => {
+                    ptr_reads.contains(&slot)
+                        || reads.get(&slot).is_some_and(|rs| {
+                            rs.iter().any(|&(off, len)| off < key.1 + size && key.1 < off + len)
+                        })
+                }
+                // A derived pointer: its offset is relative to an unknown
+                // displacement, so any read of the slot keeps the store alive.
+                Base::Ptr(p) => {
+                    let confined = confined_slot(func, p, 8);
+                    ptr_reads.contains(&slot)
+                        || reads.contains_key(&slot)
+                        || confined.is_none()
+                }
+            };
             if !overlaps {
                 dead.push(inst);
             }

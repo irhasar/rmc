@@ -1,3 +1,62 @@
+## Session (2026-11-24, branch `rakit-exp12`) — store forwarding through derived stack pointers (AVX2 −85%)
+
+**Root cause of the remaining 256-bit SIMD gap.** The two-half lowering makes
+every 32-byte `__m256i` a 64-byte stack slot, and rakit reaches its halves
+through an *over-aligned derived pointer*:
+
+    v76 = stack_addr ss8
+    v281 = isub(32, band(v76, 31))     ; "over-align to 32"
+    v81 = iadd(v76, v281)
+    store v82, v81 ; store v83, v81+16
+
+`store_forward::analyze` treated **any** non-address use of a stack address as
+an escape, and `band`/`isub`/`iadd` are non-address uses, so *every* 32-byte slot
+looked like it escaped. Nothing was private, nothing was forwarded, and each
+Teddy-style iteration kept ~28 slot round-trips (8 loads + 20 stores of 16 B).
+
+**Fixes (all in `rakit-opt/src/passes/store_forward.rs`):**
+- `pure_address_arith` + `provenance_slot`: integer arithmetic on an address
+  (`iadd`/`isub`/`imul`/`band`/`bor`/`bxor`/extends/reduce/`bitcast`) does not
+  leak it out of the function, so the slot stays private. A use in a call, a
+  store value, a `select` or a return still marks it as escaping.
+- Anything the pass cannot attribute to a slot (`provenance_slot` == None) but
+  that is derived from one — a phi, a `select`, an untracked load/store — makes
+  the slot non-private again. Without this, DSE deletes a store that a load
+  through a phi reads (this was a real miscompile: `regex-syntax`
+  `analysis_captures_len` failed 2 != 3).
+- `Confined` + `const_upper_bound`: two pointer bases provably inside
+  *different* stack slots cannot alias, so a store through one keeps the other's
+  facts. The displacement is bounded with `band(x, M) <= M`, which is what makes
+  `isub(32, band(sa, 31))` analysable. A fact is only trusted while
+  `bound + offset + size <= slot size`.
+- `prov: Base -> StackSlot`: bases of the *same* slot may alias (their offsets
+  are relative to different displacements), so a store through one kills the
+  other's facts.
+- `drop_dead_stores` now also removes stores through derived pointers (when the
+  slot has no reads at all) and counts derived-pointer loads as reading the whole
+  slot, because their offsets are not comparable with a direct slot offset.
+
+**Measured** (`/tmp/kern.rs`, AVX2 vs SSE2 byte count, 2 MB × 5):
+| build | avx2 | sse2 |
+|---|---|---|
+| LLVM | 0.13 ms | 1.09 ms |
+| Rakit, passes off | 6.5–7.6 ms | 5.4–8.7 ms |
+| Rakit, before this change | 2.3 ms | 1.24 ms |
+| Rakit, after | **0.78 ms** | **1.25 ms** |
+
+ripgrep 14.1.1 (`bench/rgbench.sh`): total run **2102 → 1726 ms** (M/L 5.39× →
+**4.47×**), all five search shapes byte-identical, compile 10030 ms / 28219408 B.
+
+**Gate:** `./y.sh test --sysroot rakit` → 65 suites / 25,368 passed / 0 failed;
+`bench/regressions.sh` clean; `bench/allaxes.sh` p1–p9 + h_* all `ok`.
+
+**Rejected:** a second (`LateStoreForwardPass`) run after the block-shape passes.
+It costs 2.5% compile (155.7 → 151.9 ms on `p2_mem`) and is neutral at runtime on
+p1–p9 and on the AVX2 kernel, so it was removed.
+
+**Gotcha:** `func.name.to_string()` is `u0:12`, not the mangled symbol, so
+`RAKIT_SF_SKIP=<mangled>` never matches.
+
 ## Session (2026-11-24, branch `rakit-exp12`) — small constant copies: vector chunks, `size_of` fold, `memcpy` pass
 
 **Where the 256-bit SIMD gap actually lives.** After the M4.17 two-half
