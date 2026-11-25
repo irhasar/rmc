@@ -1,4 +1,53 @@
 ## Session (2026-11-24, branch `rakit-exp12`) — store-forward address memoisation; write-once rule rejected
+## Session (2026-11-24, branch `rakit-exp12`) — review round 2: shared-temp trust, proof strength
+
+**Findings that were already fixed by the previous commit are marked ✓; the rest
+are this round's work.**
+
+- **CWE-377 in `bench/rgbench.sh`** (not fixed before, only partly). The default
+  `SRC=/tmp/rg/ripgrep-14.1.1` was a *predictable* path in a shared `/tmp`, and the
+  mode check passed for a tree another user owns but did not make world-writable.
+  The tree is **built**, so its build scripts run as the benchmark user. Now: no
+  `src-dir` argument ⇒ a fresh `mktemp -d` (0700) removed on exit; an explicit
+  `src-dir` is used only when `-O` (owned by us), not a symlink, and neither it
+  nor its parent is group/other writable. Download goes to a temp file before
+  unpacking (`curl -fsSL -o`) instead of `curl | tar`. Missing LLVM `rustc` is
+  reported instead of silently building nothing.
+- **✓ `RUSTC="rustc +toolchain"`**: already used `rustup which --toolchain`.
+- **✓ rgbench failed searches / predictable captures / missing CPU+RSS**: already
+  fixed (exit 0/1 accepted, `mkdtemp`, cpu/rss columns, nonzero exit on mismatch).
+- **✓ `extbench/cratebench.sh`** SRC validation, `mkdir -p "$OUTDIR"`, stale
+  captures, `OK[]` stage gate: already fixed. **New:** the untimed capture ran
+  inside a pipeline, so the status checked was `md5sum`'s — a failed workload
+  still produced a hash. Both capture paths keep the workload's own status, and a
+  compile-only run says "not compared" instead of `INCOMPLETE`.
+- **✓ `extbench/gen_corpus.sh`**: it probed `d0/f1.txt` for ownership, but `f1`
+  lands in `d1` (`d$((i % 20))`), so the marker never existed and regeneration
+  always refused. Now a `.gen_corpus` marker is written and checked.
+- **✓ `extbench/drivers/rg_work.sh`**: `set -euo pipefail` already propagates
+  `rg --files` failure through `wc`.
+- **✓ SIMD gating** (`simd_half_ty` size==32 + `simd_vectors_supported` + even
+  lane count + real 16-byte vector half; mask-shape match; wide copy limited to
+  `Arch::X86_64 | Arch::AArch64`). AArch64 keeps NEON baseline `I8X16`, so it is
+  safe there; riscv64/s390x fall back to the scalar paths.
+- **✓ RISC-V `-c`**: `has_zca`/`has_zcd` are plain bools (`has_c` is the preset),
+  so the explicit `set(..., "false")` does take effect.
+- **Regression proof strength** (`bench/regressions.sh`). `check_src_loads`
+  counted `mov[a-z]*` off the volatile source, so `movdqu (%rdi)` satisfied the
+  load count and the `vol256` case proved nothing: scalar mnemonics only, and any
+  SSE move of the source is now a failure. `vol_stack_discard` pooled five reads
+  with the copy tail (the tail reads the *staging* copy at `0x70(%rsp)`, not the
+  source slot), so an exact count could hide a missing read; it now requires five
+  **consecutive** 8-byte stack loads. New `t_isa_avx2` block: `+avx2` and `+fma`
+  must emit VEX (`vpxor`/`vmovdqu`/`vpad*`) while the baseline build must not —
+  the only way to observe that a flag reached the ISA builder. `t_volatile_dead`
+  also writes 40 bytes (16+16+8 stores after the fence), the shape
+  `memcpy_inline` creates, which is the finding that pass was suspected of.
+
+**Gate:** `bench/regressions.sh` → all fixtures pass (with the tightened counters
+and the new ISA block); no compiler source changed this round, so the previously
+recorded `./y.sh test` (65 suites / 25,368 / 0) and `allaxes` matrix still hold.
+
 ## Session (2026-11-24, branch `rakit-exp12`) — three real miscompiles fixed, harness audit
 
 **Three confirmed miscompiles, each reproduced before the fix and pinned by a
