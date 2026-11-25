@@ -55,6 +55,26 @@ mostly *don't* match (rakit recomputes the idiom per access, so the `shift`
 values differ). Reverted. If retried, first canonicalise the idiom so every
 access to a slot shares one derived pointer value.
 
+**Two more attempts at the same slot, both neutral or worse (measured):**
+
+1. *Restricted* `AlignedSlot`: only slots with **no** direct `stack_addr` access
+   may use the derived-pointer key space (so no plain fact can be shadowed).
+   Still **worse**: kernel 3.1 → 5.0 ms and the pass stopped forwarding
+   altogether (`load` 16 → 25, equal to `RAKIT_NO_STORE_FWD=1`). Reason found
+   afterwards: the over-align idiom is `iadd(sa, isub(K, band(sa, K-1)))`, so
+   `sa`'s *first* use is `band`, which marks the slot escaping before the `iadd`
+   rule ever applies — the slot never becomes private, and re-keying its
+   accesses away from `Ptr` destroyed the forwarding that already worked.
+2. *`may_alias` relaxation*: keep `Ptr` keys (which is what already forwards
+   these accesses) and only stop invalidating when two pointer bases are derived
+   from **different** slots. Sound, but the IR is byte-identical to the
+   baseline (`load` 16, `store` 24) and the kernel time is unchanged — i.e. the
+   pass was already extracting everything available here.
+
+Conclusion: 32-byte SIMD code is at the limit of what a store/load pass can do;
+the remaining ~12 vector memory ops per operation need 32-byte locals kept in
+two `I8X16` variables (`CPlace`/`analyze`), which is the real next project.
+
 **Harness:** `bench/rgbench.sh [src-dir] [corpus-dir]` rebuilds the matrix
 (downloads ripgrep 14.1.1 if absent, three `CARGO_TARGET_DIR`s, compile axes via
 `measure.py`, five search shapes with stdout equality).
