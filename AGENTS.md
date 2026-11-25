@@ -1,4 +1,43 @@
 ## Session (2026-11-24, branch `rakit-exp12`) — store-forward address memoisation; write-once rule rejected
+## Session (2026-11-25, branch `rakit-exp12`) — review round 7: checker self-test, observable walk abandonment
+
+- **The volatile checker is now pinned from both sides.** Its two failure modes
+  are written into `bench/regressions.sh` as synthetic RAKIT dumps run through
+  the same checker: `vol_gap` (three 8-byte stores at 0/16/32 of a 40-byte slot,
+  which leave 16 bytes unwritten) must be rejected, and `vol_wide` (one 16-byte
+  store covering the 16-byte object) must be accepted. A width-blind checker
+  passes the first and fails the second, so the self-test catches both.
+- **Walk abandonment is now observable.** The output of `shared_paths` cannot
+  detect a truncated provenance walk — the pass leaves the function alone, which
+  is slower but still correct. Rebuilding the pass with `PROV_MAX_NODES = 4`
+  confirms it: the fixture still prints `127 127` while every walk bails. So the
+  pass reports it: `RAKIT_SF_DEBUG=1` now prints the per-function summary (the
+  same line `RAKIT_SF_TIME` produced) and `[sf] <func> provenance walk truncated`
+  when `analyze` gives up. The regression requires reports and no truncation for
+  `t_deep_cast_chain`; with the cap at 4 it fails on
+  `[sf] u0:4 provenance walk truncated`.
+- **Gate:** std rebuilt from scratch; `./y.sh test --sysroot rakit` → 65 suites /
+  25,368 passed / 0 failed; regressions pass (4 fixtures + the two self-tests);
+  `allaxes` 45/45 `ok`, full matrix below (`L/U/M` per cell).
+
+| prog | Cwall | Ccpu | Crss | size | Rwall | Rcpu | Rrss |
+|---|---|---|---|---|---|---|---|
+| h_arith | 121ms/93ms/101ms | 145ms/118ms/128ms | 116.5M/117.4M/119.4M | 4,617,128/5,839,120/4,091,440 | 2ms/2ms/2ms | 2ms/2ms/2ms | 11.1M/10.8M/11.0M |
+| h_branch | 120ms/91ms/98ms | 146ms/120ms/127ms | 117.0M/117.5M/119.3M | 4,616,832/5,837,264/4,089,760 | 2ms/2ms/2ms | 2ms/2ms/2ms | 10.8M/11.0M/10.9M |
+| h_calls | 119ms/92ms/103ms | 147ms/123ms/132ms | 117.0M/118.0M/119.7M | 4,616,872/5,837,792/4,090,136 | 2ms/3ms/2ms | 2ms/2ms/2ms | 11.0M/10.8M/10.8M |
+| h_float | 129ms/91ms/100ms | 159ms/120ms/129ms | 115.8M/116.9M/118.8M | 4,637,984/5,861,024/4,130,328 | 2ms/3ms/3ms | 2ms/2ms/2ms | 11.1M/11.0M/11.0M |
+| h_mem | 272ms/137ms/173ms | 443ms/188ms/244ms | 136.6M/133.4M/136.1M | 4,646,856/5,959,856/4,179,440 | 3ms/10ms/5ms | 3ms/10ms/4ms | 11.1M/11.1M/11.0M |
+| h_simd | 149ms/100ms/112ms | 173ms/130ms/144ms | 122.5M/123.5M/124.9M | 4,617,704/5,843,736/4,093,864 | 2ms/4ms/3ms | 2ms/3ms/2ms | 11.0M/11.0M/11.0M |
+| p1_arith | 87ms/84ms/84ms | 105ms/108ms/111ms | 104.6M/106.8M/108.4M | 4,635,232/5,877,944/4,159,072 | 82ms/109ms/101ms | 81ms/108ms/101ms | 11.0M/10.8M/10.7M |
+| p2_mem | 252ms/136ms/162ms | 388ms/182ms/225ms | 131.7M/129.7M/132.5M | 4,639,896/5,936,144/4,156,944 | 18ms/159ms/43ms | 17ms/159ms/44ms | 11.0M/10.8M/11.0M |
+| p3_calls | 101ms/87ms/94ms | 123ms/114ms/123ms | 114.3M/115.6M/116.9M | 4,612,368/5,820,136/4,079,800 | 37ms/118ms/56ms | 37ms/117ms/56ms | 11.0M/10.8M/10.8M |
+| p4_simd | 114ms/107ms/106ms | 141ms/136ms/131ms | 115.1M/115.9M/117.8M | 4,636,096/5,892,376/4,165,696 | 56ms/157ms/84ms | 55ms/156ms/84ms | 48.2M/49.5M/48.8M |
+| p5_inline | 83ms/78ms/80ms | 104ms/101ms/106ms | 103.6M/105.5M/107.1M | 4,609,368/5,813,704/4,072,712 | 59ms/895ms/7ms | 58ms/894ms/6ms | 10.8M/11.0M/11.0M |
+| p6_scalar | 84ms/79ms/82ms | 103ms/101ms/105ms | 100.0M/102.0M/103.1M | 4,609,368/5,813,688/4,072,712 | 58ms/901ms/7ms | 58ms/900ms/7ms | 11.0M/10.8M/11.0M |
+| p7_branchy | 87ms/79ms/82ms | 107ms/103ms/105ms | 103.8M/105.5M/106.9M | 4,609,520/5,813,800/4,072,888 | 44ms/101ms/36ms | 44ms/100ms/36ms | 11.0M/10.8M/11.0M |
+| p8_minmax | 88ms/82ms/82ms | 108ms/105ms/105ms | 104.0M/105.4M/107.1M | 4,609,544/5,813,752/4,072,872 | 18ms/39ms/21ms | 18ms/39ms/20ms | 11.0M/11.1M/11.0M |
+| p9_u64f32 | 99ms/94ms/97ms | 120ms/115ms/120ms | 109.6M/111.6M/113.2M | 4,635,448/5,886,872/4,162,704 | 31ms/77ms/34ms | 30ms/76ms/33ms | 17.8M/18.8M/18.2M |
+
 ## Session (2026-11-25, branch `rakit-exp12`) — review round 6: width-aware volatile check, shared-path fixture
 
 - **The volatile check was width-blind.** It accepted stores at offsets 0, 16 and

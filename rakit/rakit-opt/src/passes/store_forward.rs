@@ -250,7 +250,7 @@ fn run_body(
 ) {
     ADDR_CACHE.with(|c| c.borrow_mut().bound.clear());
 
-    let dbg = crate::tunables::store_forward_time();
+    let dbg = crate::tunables::store_forward_time() || crate::tunables::store_forward_debug();
     let t0 = std::time::Instant::now();
     if let Some(skip) = crate::tunables::store_forward_skip() {
         if func.name.to_string().contains(skip) {
@@ -266,6 +266,11 @@ fn run_body(
     }
     let Some(Bases { private_slots: private, ptr_bases, loaded, confined, prov }) = analyze(func)
     else {
+        // A truncated walk leaves the function untouched: correct, but the
+        // optimization silently stops applying, so say so.
+        if crate::tunables::store_forward_debug() {
+            eprintln!("[sf] {} provenance walk truncated", func.name);
+        }
         return;
     };
     let t1 = std::time::Instant::now();
