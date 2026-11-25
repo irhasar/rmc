@@ -99,11 +99,11 @@ check t_ptr_store_alias '7 0'
 check t_cast_escape '127'
 check t_cast_offset '127'
 check t_deep_cast_chain '127 127'
-check t_sf_fuzz $'n=0 h=11618773433922901543
-n=1 h=11030753657396089081
-n=2 h=4619616040270084166
-n=3 h=2728269178181626
-n=4 h=16278372486642002221'
+check t_sf_fuzz $'n=0 h=16744716138362834768
+n=1 h=389363493002315213
+n=2 h=8943709728885627070
+n=3 h=290819445394666187
+n=4 h=11115180720318630965'
 
 # Forwarding must be invisible, and the fixture must still reach the pass in the
 # functions it was written for. A whole-binary comparison cannot say that: the
@@ -141,40 +141,51 @@ if [ -x "$TMP/t_sf_fuzz_M" ]; then
         python3 - "$TMP/sf_on/sf.rakit" "$TMP/sf_off/sf.rakit" <<'PYEOF' || fail=1
 import os, re, sys
 
-# Functions the fixture was written for. Two things are asserted, because either
-# one can rot without the differential noticing:
-#  * the pinned nightly's *pre-pass* IR still holds the cross-block store and
-#    load these functions exist for -- a shape that is split into block
-#    parameters before code generation never reaches the pass at all;
-#  * the pass still rewrites them, so the comparison is against real work.
-CROSS_BLOCK = ["cross_block_aggregate", "loop_aggregate"]
+# Three properties, each one a claim the differential alone cannot make.
+#
+# SHAPE: the pinned nightly's *pre-pass* IR still holds the cross-block store and
+# load these functions exist for. A shape that is split into block parameters
+# before code generation never reaches the pass, and the outputs then agree for
+# the wrong reason. Note this pins the shape, not that the pass rewrites it:
+# cross-block forwarding does not fire on this fixture today (measured: the slot
+# load counts are identical with RAKIT_SF_NO_CBE=1), so nothing here claims it.
+SHAPE = ["cross_block_aggregate", "cross_block_loop_carry", "loop_aggregate"]
+
+# REWRITTEN: store_forward itself removed a slot load in that function. The two
+# builds differ only in that pass, so a drop cannot come from another one. This
+# is deliberately stricter than "the function changed", which a rewrite of some
+# unrelated instruction would satisfy.
 REWRITTEN = [
-    "cross_block_aggregate",
-    "loop_aggregate",
     "branch_merge",
-    "partial_bytes",
+    "cross_block_aggregate",
+    "dynamic_index",
+    "loop_aggregate",
     "loop_state",
-    "maybe_uninit",
+    "partial_bytes",
+    "union_bits",
 ]
+
+# VOLATILE: the volatile write has to survive the pass. Its value is also hashed
+# by the fixture, but a forwarded read plus a deleted write would keep the hash,
+# so the write itself is checked in the IR.
+VOLATILE = "volatile_local"
 
 STACK_ADDR = re.compile(r"^\s*(v\d+) = stack_addr\.i64 (ss\d+)")
 ALIAS = re.compile(r"^\s*(v\d+) -> (v\d+)\s*$")
 ASSIGN = re.compile(r"^\s*(v\d+) = (.*)$")
 STORE = re.compile(r"^\s*store(?:\.\w+)?\s+(?:[\w.]+\s+)*?(v\d+),\s*(v\d+)")
 LOAD = re.compile(r"^\s*(?:v\d+ = )?load(?:\.\w+)?\s+(?:[\w.]+)?\s*(v\d+)")
+BLOCK = re.compile(r"^block\d+")
 
 
 def scan(path):
     """Lines per block plus a resolver from a value to the slot it addresses."""
-    lines, slot_of, block = [], {}, -1
+    lines, slot_of = [], {}
     for line in open(path):
         text = line.split(";")[0].rstrip()
         if not text.strip():
             continue
         lines.append(text)
-        if re.match(r"^block\d+", text.strip()):
-            block += 1
-            continue
         if m := STACK_ADDR.match(text):
             slot_of[m.group(1)] = m.group(2)
         elif m := ALIAS.match(text):
@@ -200,22 +211,46 @@ def scan(path):
     return lines, resolve
 
 
-def cross_block_evidence(path):
+def slot_accesses(path):
+    """(slot, block) for every slot store, and for every slot load."""
     lines, resolve = scan(path)
-    written, read, block = {}, {}, -1
+    stores, loads, block = [], [], -1
     for text in lines:
-        if re.match(r"^block\d+", text.strip()):
+        if BLOCK.match(text.strip()):
             block += 1
             continue
         if m := STORE.match(text):
             slot = resolve(m.group(2))
             if slot:
-                written.setdefault(slot, set()).add(block)
+                stores.append((slot, block))
         elif m := LOAD.match(text):
             slot = resolve(m.group(1))
             if slot:
-                read.setdefault(slot, set()).add(block)
-    return any(written[s] - read[s] for s in written if s in read)
+                loads.append((slot, block))
+    return stores, loads
+
+
+def cross_block_loads(path):
+    """Loads whose slot is written in some *other* block.
+
+    Read-modify-write blocks are counted: a block that both reads and writes the
+    slot still reads what the block before it stored.
+    """
+    stores, loads = slot_accesses(path)
+    return sum(1 for slot, block in loads if any(b != block for s, b in stores if s == slot))
+
+
+def volatile_store_survives(path):
+    """A fence and, after it, a store into a slot."""
+    lines, resolve = scan(path)
+    seen_fence = False
+    for text in lines:
+        if re.match(r"^\s*fence\b", text):
+            seen_fence = True
+            continue
+        if seen_fence and (m := STORE.match(text)) and resolve(m.group(2)):
+            return True
+    return False
 
 
 def dumps(directory, suffix):
@@ -232,11 +267,11 @@ pre = dumps(on_dir, r"unopt\.rakit")
 post_on, post_off = dumps(on_dir, r"opt\.rakit"), dumps(off_dir, r"opt\.rakit")
 bad = 0
 
-for name in CROSS_BLOCK:
+for name in SHAPE:
     if name not in pre:
         print(f"[regression] sf coverage: no pre-pass IR for {name}", file=sys.stderr)
         bad = 1
-    elif not cross_block_evidence(pre[name]):
+    elif not cross_block_loads(pre[name]):
         print(
             f"[regression] sf coverage: {name} holds no cross-block store and load "
             f"before the pass, so it no longer reaches it",
@@ -248,9 +283,27 @@ for name in REWRITTEN:
     if name not in post_on or name not in post_off:
         print(f"[regression] sf coverage: no IR dump for {name}", file=sys.stderr)
         bad = 1
-    elif open(post_on[name]).read() == open(post_off[name]).read():
-        print(f"[regression] sf coverage: the pass leaves {name} untouched", file=sys.stderr)
+        continue
+    before = len(slot_accesses(post_off[name])[1])
+    after = len(slot_accesses(post_on[name])[1])
+    if after >= before:
+        print(
+            f"[regression] sf coverage: the pass removes no slot load in {name} "
+            f"({before} with it off, {after} with it on)",
+            file=sys.stderr,
+        )
         bad = 1
+
+if VOLATILE in post_on:
+    if not volatile_store_survives(post_on[VOLATILE]):
+        print(
+            f"[regression] sf coverage: the volatile write is gone from {VOLATILE}",
+            file=sys.stderr,
+        )
+        bad = 1
+else:
+    print(f"[regression] sf coverage: no IR dump for {VOLATILE}", file=sys.stderr)
+    bad = 1
 
 sys.exit(bad)
 PYEOF

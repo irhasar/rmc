@@ -1,4 +1,29 @@
 ## Session (2026-11-24, branch `rakit-exp12`) — store-forward address memoisation; write-once rule rejected
+## Session (2026-11-25, branch `rakit-exp13`) — review round 13: coverage claims that hold up
+
+- **Read-modify-write pairs were rejected.** `cross_block_evidence` required a
+  store block that never reads the slot, so a block that reads *and* writes it
+  contributed no evidence even though its successor reads the store. It now
+  counts loads whose slot is written in *some other* block; a synthetic
+  read-modify-write dump gives 2 with the new predicate where `written - read`
+  is empty.
+- **"Function changed" was not attributable.** A same-block rewrite satisfied it.
+  The assertion is now quantitative and attributable: the two builds differ only
+  in the pass, so each named function must show **fewer slot loads with the pass
+  on** — `branch_merge`, `cross_block_aggregate`, `dynamic_index`,
+  `loop_aggregate`, `loop_state`, `partial_bytes`, `union_bits` (measured drops
+  1→0, 2→1, 2→1, 10→9, 1→0, 4→2, 5→3). Running the check with the pass off in
+  both builds reports every one of them.
+- **Cross-block forwarding does not fire on this fixture.** Slot-load counts are
+  identical with `RAKIT_SF_NO_CBE=1` for all fourteen functions, so the fixture
+  does not exercise that path and the harness no longer implies it does. The
+  pre-pass check is documented as pinning the *shape*, not the rewrite.
+  `cross_block_loop_carry` stays as a value test only.
+- **Volatile write is now checked in IR.** `volatile_local`'s post-pass dump must
+  contain a `fence` followed by a store into a slot; stripping that store makes
+  the check report "the volatile write is gone".
+- Harness and fixture only; compiler and std untouched. `regressions.sh` exit 0.
+
 ## Session (2026-11-25, branch `rakit-exp13`) — review round 12: what the fuzz was really covering
 
 - **Whole-binary `cmp` proves nothing about coverage.** store forwarding runs

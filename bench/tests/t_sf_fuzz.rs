@@ -217,6 +217,30 @@ fn loop_aggregate(r: &mut Rng) -> u64 {
     mix(mix(t[0], t[1]), mix(t[2], t[3]))
 }
 
+// The cross-block shape the pass is *expected* to rewrite: the stores sit in the
+// block before the loop and every read happens in the loop body, so a forwarding
+// that fires here has to cross a block boundary. The body never writes the slot,
+// so the store fact survives the back edge.
+#[inline(never)]
+fn cross_block_loop_carry(r: &mut Rng) -> u64 {
+    let mut buf = [0u64; 4];
+    let x = r.next();
+    buf[0] = x;
+    buf[1] = x.wrapping_add(1);
+    buf[2] = x.wrapping_mul(3);
+    buf[3] = x ^ 7;
+    let mut h = x;
+    // Constant indices: a dynamic one makes the loads unforwardable by design,
+    // which would leave the cross-block fact untested.
+    for _ in 0..4u64 {
+        h = mix(h, buf[0]);
+        h = mix(h, buf[1]);
+        h = mix(h, buf[2]);
+        h = mix(h, buf[3]);
+    }
+    h
+}
+
 fn main() {
     // Runtime input so nothing above folds to a constant.
     let base = std::env::args().count() as u64;
@@ -233,6 +257,7 @@ fn main() {
         h = mix(h, maybe_uninit(&mut r));
         h = mix(h, loop_state(&mut r));
         h = mix(h, cross_block_aggregate(&mut r));
+        h = mix(h, cross_block_loop_carry(&mut r));
         h = mix(h, loop_aggregate(&mut r));
         println!("n={n} h={h}");
     }
