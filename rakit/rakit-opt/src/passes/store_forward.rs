@@ -61,61 +61,63 @@ impl Confined {
 /// pass more conservative.
 #[derive(Default)]
 struct AddrCache {
-    prov: FxHashMap<Value, Option<StackSlot>>,
     bound: FxHashMap<Value, Option<u64>>,
 }
 
 thread_local! {
     static ADDR_CACHE: std::cell::RefCell<AddrCache> = std::cell::RefCell::default();
+    static PROV_SEEN: std::cell::RefCell<FxHashSet<Value>> = std::cell::RefCell::default();
 }
 
-/// The stack slot `v` is derived from, ignoring how far it may be offset.
+/// Every stack slot `v` may derive from: the union over all operands of the
+/// address arithmetic that built it.
 ///
-/// A stack address that is only ever used by integer arithmetic still does not
-/// escape the function, so the slot stays private: `sa`, `band(sa, 31)` and
-/// `iadd(sa, k)` all name the same slot. This is what lets the over-alignment
-/// idiom `iadd(sa, isub(K, band(sa, K - 1)))` keep its slot private.
-fn provenance_slot(func: &ir::Function, v: Value, depth: u32) -> Option<StackSlot> {
-    ADDR_CACHE.with(|c| provenance_rec(func, &mut c.borrow_mut(), v, depth))
-}
-
-fn provenance_rec(
+/// Answering with only the *first* slot found is not enough for an escape
+/// decision: `low + addr(b)`, where `low` is a casted offset computed from `a`'s
+/// address, derives from both `a` and `b`, and a call receiving that sum can read
+/// either slot. Attributing the value to `a` alone lets `b`'s initialization be
+/// dropped.
+fn for_each_provenance_slot(
     func: &ir::Function,
-    cache: &mut AddrCache,
     v: Value,
     depth: u32,
-) -> Option<StackSlot> {
+    mut f: impl FnMut(StackSlot),
+) {
+    PROV_SEEN.with(|seen| {
+        let mut seen = seen.borrow_mut();
+        seen.clear();
+        collect_slots(func, v, depth, &mut seen, &mut f);
+    });
+}
+
+fn collect_slots(
+    func: &ir::Function,
+    v: Value,
+    depth: u32,
+    seen: &mut FxHashSet<Value>,
+    f: &mut impl FnMut(StackSlot),
+) {
     if depth == 0 {
-        return None;
+        return;
     }
     let dfg = &func.dfg;
     let v = dfg.resolve_aliases(v);
-    if let Some(&hit) = cache.prov.get(&v) {
-        return hit;
+    // Visiting each value once keeps a diamond-shaped expression tree linear
+    // instead of exponential in `depth`.
+    if !seen.insert(v) {
+        return;
     }
-    let result = match dfg.value_def(v) {
-        ir::ValueDef::Result(inst, 0) => {
-            let data = &dfg.insts[inst];
-            match data {
-                ir::InstructionData::StackAddr { stack_slot, .. } => Some(*stack_slot),
-                // Every format `pure_address_arith` accepts keeps the value
-                // derived from the same slot, including the conversions that are
-                // not `Binary` (`uextend`, `ireduce`, `bitcast`, …). Missing them
-                // is unsound, not merely imprecise: the cast result would then
-                // have no provenance, so passing it to a call would not mark the
-                // slot as escaping and its initialization could be dropped.
-                _ if pure_address_arith(data.opcode()) => data
-                    .arguments(&dfg.value_lists)
-                    .iter()
-                    .filter_map(|&arg| provenance_rec(func, cache, arg, depth - 1))
-                    .next(),
-                _ => None,
+    let ir::ValueDef::Result(inst, 0) = dfg.value_def(v) else { return };
+    let data = &dfg.insts[inst];
+    match data {
+        ir::InstructionData::StackAddr { stack_slot, .. } => f(*stack_slot),
+        _ if pure_address_arith(data.opcode()) => {
+            for &arg in data.arguments(&dfg.value_lists) {
+                collect_slots(func, arg, depth - 1, seen, f);
             }
         }
-        _ => None,
-    };
-    cache.prov.insert(v, result);
-    result
+        _ => {}
+    }
 }
 
 /// Integer arithmetic that cannot leak an address out of the function: the
@@ -236,11 +238,7 @@ fn run_body(
     endianness: ir::Endianness,
     analyses: &mut crate::analyses::Analyses,
 ) {
-    ADDR_CACHE.with(|c| {
-        let mut c = c.borrow_mut();
-        c.prov.clear();
-        c.bound.clear();
-    });
+    ADDR_CACHE.with(|c| c.borrow_mut().bound.clear());
 
     let dbg = crate::tunables::store_forward_time();
     let t0 = std::time::Instant::now();
@@ -364,12 +362,14 @@ fn analyze(func: &ir::Function) -> Bases {
             let opcode = dfg.insts[inst].opcode();
             let addr_index = address_index(opcode);
             for (i, &arg) in dfg.insts[inst].arguments(&dfg.value_lists).iter().enumerate() {
-                // Resolve once: `provenance_slot` and the pointer classification
-                // both need the alias-resolved value, and resolving twice
-                // dominated the walk.
+                // Resolve once: the provenance walk and the pointer
+                // classification both need the alias-resolved value, and
+                // resolving twice dominated the walk.
                 let arg = dfg.resolve_aliases(arg);
                 let is_addr = addr_index == Some(i);
-                if let Some(slot) = provenance_slot(func, arg, 8) {
+                // Every slot the argument may derive from: `low + addr(b)` names
+                // both, and a call can read either.
+                for_each_provenance_slot(func, arg, 8, |slot| {
                     slots.insert(slot);
                     // Integer arithmetic on an address does not leak it out of
                     // the function, so only a *non-arithmetic* use other than a
@@ -377,7 +377,7 @@ fn analyze(func: &ir::Function) -> Bases {
                     if !is_addr && !pure_address_arith(opcode) {
                         escaping_slots.insert(slot);
                     }
-                }
+                });
                 if is_addr {
                     addr_only.insert(arg);
                 } else {
@@ -400,10 +400,10 @@ fn analyze(func: &ir::Function) -> Bases {
                         // Provenance, not just a direct `stack_addr`: a derived
                         // pointer reaching a phi is invisible to `mem_key` from
                         // then on, so the slot must not be treated as private.
-                        if let Some(slot) = provenance_slot(func, v, 8) {
+                        for_each_provenance_slot(func, v, 8, |slot| {
                             slots.insert(slot);
                             escaping_slots.insert(slot);
-                        }
+                        });
                         escaping_ptr.insert(v);
                     }
                 }
@@ -430,12 +430,13 @@ fn analyze(func: &ir::Function) -> Bases {
     // store it cannot see would make a forwarded fact stale. Such a slot is not
     // private.
     for (inst, addr) in stores.iter().chain(loads.iter()) {
-        let Some(slot) = provenance_slot(func, *addr, 8) else { continue };
         let tracked_access = mem_key(func, *inst, *addr)
             .map(|key| tracked(&key, &slots, &addr_only))
             .unwrap_or(false);
         if !tracked_access {
-            escaping_slots.insert(slot);
+            for_each_provenance_slot(func, *addr, 8, |slot| {
+                escaping_slots.insert(slot);
+            });
         }
     }
 
@@ -945,9 +946,9 @@ fn drop_dead_stores(
             let addr = func.dfg.insts[inst].arguments(&func.dfg.value_lists).first().copied();
             let Some(addr) = addr else { continue };
             let Some(key) = stack_key(func, inst, addr) else {
-                if let Some(slot) = provenance_slot(func, addr, 8) {
+                for_each_provenance_slot(func, addr, 8, |slot| {
                     ptr_reads.insert(slot);
-                }
+                });
                 continue;
             };
             let size = func

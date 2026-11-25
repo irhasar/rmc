@@ -96,6 +96,7 @@ check t_copy_overlap $'N=16 shift=1 11664426682378596937\nback N=16 shift=1 1271
 check t_simd_mask $'i8x8 eq [-1, 0, -1, 0, -1, 0, -1, 0]\ni64x8 lt [0, 0, 0, -1, 0, -1, 0, 0]\ni32x8 lt [0, 0, 0, -1, 0, -1, 0, 0]\nu8x2 eq [255, 0]'
 check t_volatile_dead 'written'
 check t_cast_escape '127'
+check t_cast_offset '127'
 check t_ptr_store_alias '7 0'
 
 # A volatile write must not be elided. `volatile_store` lowers to `fence` plus
@@ -113,9 +114,10 @@ if command -v objdump >/dev/null 2>&1; then
         echo "[regression] t_volatile_dead: volatile stores were elided" >&2
         fail=1
     fi
-    # "some store after a fence" is too weak: the fixture performs two writes
-    # (16 and 40 bytes) and either one can disappear on its own. Sum the bytes
-    # each fenced region stores and require both writes to be present.
+    # "some store after a fence" is too weak: it ignores the destination, so an
+    # unrelated spill could satisfy it for a write that lost bytes. Count a
+    # *contiguous run* per destination object instead, and require the exact
+    # sizes the fixture writes (16 then 40 bytes).
     # `$TMP/vdead` is only the IR-dump target (`--emit=llvm-ir` skips the link),
     # so the disassembly has to come from the binary `check` built.
     vbin=$TMP/t_volatile_dead_M
@@ -166,8 +168,10 @@ def store_bytes(mnemonic, src):
     return 0
 
 
+MEM = re.compile(r"^(-?0x[0-9a-f]+)?\(%([a-z0-9]+)\)$")
 region = 0
-sums = {}
+# (region, base register) -> list of [start, end) byte ranges
+spans = {}
 for line in open(sys.argv[1]):
     text = line.split("#")[0].strip()
     if ":" not in text:
@@ -175,22 +179,48 @@ for line in open(sys.argv[1]):
     text = text.split(":", 1)[1].strip()
     if text == "mfence":
         region += 1
-        sums.setdefault(region, 0)
         continue
     parts = text.split(None, 1)
     if len(parts) != 2 or "(" not in parts[1]:
         continue
     mnemonic, operands = parts
     src, _, dst = operands.rpartition(",")
-    if "(" not in dst:  # a load, not a store
+    m = MEM.match(dst.strip())
+    if not m:  # a register destination: not a store
         continue
-    sums[region] = sums.get(region, 0) + store_bytes(mnemonic, src)
+    width = store_bytes(mnemonic, src)
+    if width == 0:
+        continue
+    start = int(m.group(1), 16) if m.group(1) else 0
+    spans.setdefault((region, m.group(2)), []).append([start, start + width])
 
-# The fixture performs a 16-byte write and then a 40-byte one.
-if len(sums) != 3 or sums.get(1, 0) < 16 or sums.get(2, 0) < 40:
-    print(f"fenced store bytes per region: {sums}, want 2 regions of >=16 and >=40",
-          file=sys.stderr)
-    sys.exit(1)
+
+def runs(intervals):
+    """Length of every maximal contiguous run of stores."""
+    out = []
+    cur_start, cur_end = None, None
+    for start, end in sorted(intervals):
+        if cur_end is not None and start <= cur_end:
+            cur_end = max(cur_end, end)
+        else:
+            if cur_start is not None:
+                out.append(cur_end - cur_start)
+            cur_start, cur_end = start, end
+    if cur_start is not None:
+        out.append(cur_end - cur_start)
+    return out
+
+
+# The fixture writes 16 bytes and then 40 bytes to two different objects. Each
+# fenced region must therefore hold one object of exactly that size: a shorter
+# write, a lost write, or a stray spill merged into the run all fail here.
+want = {1: 16, 2: 40}
+for reg, size in want.items():
+    found = [run for (r, _), v in spans.items() if r == reg for run in runs(v)]
+    if size not in found:
+        print(f"region {reg}: contiguous store runs {sorted(found)}, "
+              f"want one of exactly {size}", file=sys.stderr)
+        sys.exit(1)
 EOF
     then
         echo "[regression] t_volatile_dead: a volatile write is missing" >&2

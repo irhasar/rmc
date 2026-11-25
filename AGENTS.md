@@ -1,4 +1,53 @@
 ## Session (2026-11-24, branch `rakit-exp12`) — store-forward address memoisation; write-once rule rejected
+## Session (2026-11-25, branch `rakit-exp12`) — review round 4: union provenance, destination-aware volatile check
+
+- **Provenance returned one slot, not all of them.** `provenance_rec` answered
+  with the *first* slot it found, so `low + addr(b)` — where `low` is a casted
+  offset computed from `a`'s address — was attributed to `a` alone. A call
+  receiving that sum can read either slot, but only `a` was marked escaping, so
+  `b` stayed private and its initialization was dropped. Fixture
+  `t_cast_offset` (`low = ((&a as usize as u8) & 7) as usize; p = (low +
+  &b as usize) as *const u64`) printed `1`, LLVM prints `127`; fixed prints
+  `127`. `for_each_provenance_slot` now walks the union over every operand of the
+  address arithmetic, and the escape analysis (argument uses, branch arguments,
+  untracked accesses) and `drop_dead_stores`'s `ptr_reads` consume the whole
+  set. The single-slot `provenance_slot` and its cache are gone; a per-query
+  `visited` set keeps the walk linear on diamond-shaped expression trees.
+  `prov`/`confined` stay single-slot because they are *proofs* (a missing entry
+  only makes invalidation more conservative).
+- **The volatile regression counted stores regardless of destination.** Any
+  store in a fenced region satisfied the byte sum, so a stray spill could cover
+  for a write that lost bytes. The check now builds `(region, base register)`
+  byte intervals from the disassembly, merges them into contiguous runs, and
+  requires a run of **exactly** 16 bytes in the first fenced region and one of
+  exactly 40 in the second. The fixture sources its values from `static`s in
+  `.rodata` so a region contains the write's copy rather than constant
+  materialization. Verified both ways: a fixture with only the 40-byte write
+  fails (`region 1: runs [40], want 16`) and one with only the 16-byte write
+  fails (`region 2: runs [], want 40`).
+- **Gate:** std rebuilt with the fixed pass; `./y.sh test --sysroot rakit` → 65
+  suites / 25,368 passed / 0 failed; `bench/regressions.sh` → all fixtures pass
+  (now 3 store-forward fixtures); `allaxes` 45/45 `ok` — full matrix below
+  (compile wall/CPU/RSS, artifact size, run wall/CPU/RSS; `L/U/M` per cell).
+
+| prog | Cwall | Ccpu | Crss | size | Rwall | Rcpu | Rrss |
+|---|---|---|---|---|---|---|---|
+| h_arith | 119ms/88ms/99ms | 142ms/116ms/126ms | 116.6M/118.3M/119.5M | 4,617,128/5,839,120/4,091,440 | 2ms/2ms/2ms | 2ms/2ms/2ms | 10.8M/10.8M/11.1M |
+| h_branch | 118ms/90ms/100ms | 141ms/122ms/130ms | 117.0M/118.3M/119.7M | 4,616,832/5,837,264/4,089,760 | 2ms/3ms/2ms | 2ms/2ms/2ms | 11.0M/11.0M/11.0M |
+| h_calls | 116ms/89ms/100ms | 142ms/120ms/129ms | 117.4M/118.6M/119.8M | 4,616,872/5,837,792/4,090,136 | 2ms/2ms/2ms | 2ms/2ms/2ms | 10.8M/11.1M/11.1M |
+| h_float | 126ms/92ms/102ms | 150ms/116ms/132ms | 115.8M/117.6M/118.9M | 4,637,984/5,861,024/4,130,328 | 2ms/3ms/2ms | 2ms/3ms/2ms | 11.0M/11.1M/11.1M |
+| h_mem | 268ms/133ms/173ms | 432ms/182ms/249ms | 136.3M/133.7M/136.2M | 4,646,856/5,959,856/4,179,440 | 3ms/10ms/4ms | 3ms/9ms/4ms | 11.0M/11.0M/11.0M |
+| h_simd | 143ms/97ms/110ms | 174ms/125ms/139ms | 122.7M/123.6M/125.1M | 4,617,704/5,843,736/4,093,864 | 2ms/4ms/2ms | 2ms/3ms/2ms | 11.0M/11.0M/11.0M |
+| p1_arith | 85ms/79ms/83ms | 103ms/103ms/106ms | 104.9M/107.1M/108.2M | 4,635,232/5,877,944/4,159,072 | 82ms/109ms/101ms | 81ms/108ms/101ms | 11.0M/10.6M/10.9M |
+| p2_mem | 248ms/133ms/159ms | 376ms/176ms/225ms | 132.5M/130.0M/132.4M | 4,639,896/5,936,144/4,156,944 | 17ms/158ms/43ms | 16ms/158ms/43ms | 11.1M/11.0M/10.8M |
+| p3_calls | 100ms/86ms/92ms | 119ms/114ms/120ms | 114.7M/115.6M/117.1M | 4,612,368/5,820,136/4,079,800 | 38ms/117ms/56ms | 37ms/116ms/55ms | 11.0M/10.8M/10.8M |
+| p4_simd | 108ms/94ms/102ms | 129ms/118ms/127ms | 115.2M/116.1M/117.8M | 4,636,096/5,892,376/4,165,696 | 56ms/157ms/84ms | 55ms/159ms/85ms | 48.1M/49.5M/48.8M |
+| p5_inline | 81ms/78ms/82ms | 101ms/100ms/108ms | 103.8M/105.6M/106.9M | 4,609,368/5,813,704/4,072,712 | 58ms/895ms/6ms | 57ms/895ms/6ms | 11.0M/11.0M/11.0M |
+| p6_scalar | 80ms/75ms/79ms | 100ms/97ms/100ms | 100.2M/102.0M/103.2M | 4,609,368/5,813,688/4,072,712 | 58ms/901ms/7ms | 57ms/900ms/6ms | 11.1M/11.0M/11.0M |
+| p7_branchy | 82ms/78ms/82ms | 100ms/101ms/106ms | 104.0M/105.8M/107.4M | 4,609,520/5,813,800/4,072,888 | 43ms/101ms/35ms | 43ms/101ms/35ms | 10.9M/11.0M/11.1M |
+| p8_minmax | 83ms/77ms/83ms | 101ms/101ms/105ms | 104.2M/105.7M/106.9M | 4,609,544/5,813,752/4,072,872 | 18ms/39ms/20ms | 18ms/38ms/20ms | 11.0M/10.7M/11.0M |
+| p9_u64f32 | 93ms/85ms/94ms | 113ms/108ms/118ms | 109.8M/111.7M/113.2M | 4,635,448/5,886,872/4,162,704 | 30ms/76ms/33ms | 30ms/77ms/33ms | 17.8M/18.9M/18.2M |
+
 ## Session (2026-11-25, branch `rakit-exp12`) — review round 3: three store-forward miscompiles
 
 All three were reproduced with a fixture **before** the fix, using the
