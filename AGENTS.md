@@ -1,4 +1,30 @@
 ## Session (2026-11-24, branch `rakit-exp12`) — store-forward address memoisation; write-once rule rejected
+## Session (2026-11-25, branch `rakit-exp13`) — review round 12: what the fuzz was really covering
+
+- **Whole-binary `cmp` proves nothing about coverage.** store forwarding runs
+  crate-wide, so any function changing satisfies it. The harness now compiles the
+  fixture twice with `RAKIT_DUMP=1` (pass on / `RAKIT_NO_STORE_FWD=1`) and diffs
+  the **`.opt.rakit` of six named functions** — `cross_block_aggregate`,
+  `loop_aggregate`, `branch_merge`, `partial_bytes`, `loop_state`,
+  `maybe_uninit` — so "the pass leaves <name> untouched" is a failure. The
+  binary comparison stays as a coarse guard.
+- **The aggregate fixtures never reached the pass.** The pinned nightly splits a
+  two-word tuple into block parameters: `cross_block_aggregate` had no
+  `explicit_slot` at all, and in `loop_aggregate` the addresses I took for slots
+  resolved to `v7 -> v51 -> v54`, i.e. the `&mut Rng` argument. Both now use
+  `[u64; 4]`, which stays in an `explicit_slot`. New check: the *pre-pass*
+  (`.unopt.rakit`) IR of both functions must contain a slot **written in one
+  block and read in another**, resolved through aliases and `iadd` chains;
+  against the old tuple fixture the check reports both functions, so it pins the
+  shape rather than trusting it.
+- **The volatile case could hide a deleted write.** `volatile_local` read `v[2]`
+  straight back, so forwarding would have kept the hash. It now reads through
+  `opaque_read(*const u64)`: the address escapes, the read cannot be forwarded,
+  and deleting the write changes the hash (verified on a copy with the
+  `write_volatile` removed).
+- Harness-only change (plus the fixture): compiler and std untouched, so the
+  last full gate still holds. `regressions.sh` exit 0.
+
 ## Session (2026-11-25, branch `rakit-exp13`) — PR #23 merged; fuzz the pass itself
 
 - **Branch:** `rakit-exp12` was merged as `b6720e3` into

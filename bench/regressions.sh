@@ -99,35 +99,161 @@ check t_ptr_store_alias '7 0'
 check t_cast_escape '127'
 check t_cast_offset '127'
 check t_deep_cast_chain '127 127'
-check t_sf_fuzz $'n=0 h=3935000680812775761
-n=1 h=7916603987723881180
-n=2 h=909600361322032517
-n=3 h=18408265565639120422
-n=4 h=6256700545831108142'
+check t_sf_fuzz $'n=0 h=11618773433922901543
+n=1 h=11030753657396089081
+n=2 h=4619616040270084166
+n=3 h=2728269178181626
+n=4 h=16278372486642002221'
 
-# Forwarding must be invisible. `t_sf_fuzz` folds the shapes that made earlier
-# rounds wrong (partial stores, dynamic indices, values merged across blocks,
-# raw aliases, volatile, unions) into one hash, so compile it once more with the
-# pass off and require the same answer -- and a different binary, or the fixture
-# stopped reaching the pass.
+# Forwarding must be invisible, and the fixture must still reach the pass in the
+# functions it was written for. A whole-binary comparison cannot say that: the
+# pass runs over the whole crate, so some unrelated function changing keeps the
+# `cmp` happy while `cross_block_aggregate` quietly stops exercising it.
 if [ -x "$TMP/t_sf_fuzz_M" ]; then
-    if ! env -u RAKIT_HOST_LLVM RAKIT_NO_STORE_FWD=1 "$ROOT/rakit/dist/bin/rustc-rakit" \
-        --target "$TARGET" -C opt-level=3 "$BENCH/tests/t_sf_fuzz.rs" \
-        -o "$TMP/sf_off" --edition 2021 >"$TMP/sf_off.log" 2>&1
-    then
-        echo "[regression] t_sf_fuzz: compile with the pass off failed" >&2
-        sed 's/^/    /' "$TMP/sf_off.log" | tail -5 >&2
-        fail=1
-    elif ! "$TMP/sf_off" >"$TMP/sf_off.out" 2>&1; then
-        echo "[regression] t_sf_fuzz: run with the pass off failed" >&2
-        fail=1
-    elif ! diff -q "$TMP/t_sf_fuzz_M.out" "$TMP/sf_off.out" >/dev/null; then
-        echo "[regression] t_sf_fuzz: forwarding changes the result" >&2
-        diff -u "$TMP/t_sf_fuzz_M.out" "$TMP/sf_off.out" >&2
-        fail=1
-    elif cmp -s "$TMP/t_sf_fuzz_M" "$TMP/sf_off"; then
-        echo "[regression] t_sf_fuzz: the pass changes nothing, fixture is insensitive" >&2
-        fail=1
+    mkdir -p "$TMP/sf_on" "$TMP/sf_off"
+    dumped=1
+    for cfg in on off; do
+        pre=()
+        [ "$cfg" = off ] && pre=(RAKIT_NO_STORE_FWD=1)
+        if ! env "${pre[@]}" RAKIT_DUMP=1 env -u RAKIT_HOST_LLVM "$ROOT/rakit/dist/bin/rustc-rakit" \
+            --target "$TARGET" -C opt-level=3 "$BENCH/tests/t_sf_fuzz.rs" \
+            -o "$TMP/sf_$cfg/sf" --edition 2021 >"$TMP/sf_$cfg.log" 2>&1
+        then
+            echo "[regression] t_sf_fuzz: compile with the pass $cfg failed" >&2
+            sed 's/^/    /' "$TMP/sf_$cfg.log" | tail -5 >&2
+            fail=1
+            dumped=0
+        fi
+    done
+    if [ "$dumped" = 1 ]; then
+        if ! "$TMP/sf_off/sf" >"$TMP/sf_off.out" 2>&1; then
+            echo "[regression] t_sf_fuzz: run with the pass off failed" >&2
+            fail=1
+        elif ! diff -q "$TMP/t_sf_fuzz_M.out" "$TMP/sf_off.out" >/dev/null; then
+            echo "[regression] t_sf_fuzz: forwarding changes the result" >&2
+            diff -u "$TMP/t_sf_fuzz_M.out" "$TMP/sf_off.out" >&2
+            fail=1
+        fi
+        if cmp -s "$TMP/sf_on/sf" "$TMP/sf_off/sf"; then
+            echo "[regression] t_sf_fuzz: the pass changes nothing, fixture is insensitive" >&2
+            fail=1
+        fi
+        python3 - "$TMP/sf_on/sf.rakit" "$TMP/sf_off/sf.rakit" <<'PYEOF' || fail=1
+import os, re, sys
+
+# Functions the fixture was written for. Two things are asserted, because either
+# one can rot without the differential noticing:
+#  * the pinned nightly's *pre-pass* IR still holds the cross-block store and
+#    load these functions exist for -- a shape that is split into block
+#    parameters before code generation never reaches the pass at all;
+#  * the pass still rewrites them, so the comparison is against real work.
+CROSS_BLOCK = ["cross_block_aggregate", "loop_aggregate"]
+REWRITTEN = [
+    "cross_block_aggregate",
+    "loop_aggregate",
+    "branch_merge",
+    "partial_bytes",
+    "loop_state",
+    "maybe_uninit",
+]
+
+STACK_ADDR = re.compile(r"^\s*(v\d+) = stack_addr\.i64 (ss\d+)")
+ALIAS = re.compile(r"^\s*(v\d+) -> (v\d+)\s*$")
+ASSIGN = re.compile(r"^\s*(v\d+) = (.*)$")
+STORE = re.compile(r"^\s*store(?:\.\w+)?\s+(?:[\w.]+\s+)*?(v\d+),\s*(v\d+)")
+LOAD = re.compile(r"^\s*(?:v\d+ = )?load(?:\.\w+)?\s+(?:[\w.]+)?\s*(v\d+)")
+
+
+def scan(path):
+    """Lines per block plus a resolver from a value to the slot it addresses."""
+    lines, slot_of, block = [], {}, -1
+    for line in open(path):
+        text = line.split(";")[0].rstrip()
+        if not text.strip():
+            continue
+        lines.append(text)
+        if re.match(r"^block\d+", text.strip()):
+            block += 1
+            continue
+        if m := STACK_ADDR.match(text):
+            slot_of[m.group(1)] = m.group(2)
+        elif m := ALIAS.match(text):
+            slot_of[m.group(1)] = ("one", m.group(2))
+        elif m := ASSIGN.match(text):
+            slot_of.setdefault(m.group(1), ("many", re.findall(r"v\d+", m.group(2))))
+
+    def resolve(value):
+        # Walk aliases and iadd-shaped chains to the stack slot behind a value.
+        pending, seen = [value], set()
+        while pending:
+            current = pending.pop(0)
+            if current in seen:
+                continue
+            seen.add(current)
+            entry = slot_of.get(current)
+            if isinstance(entry, str):
+                return entry
+            if isinstance(entry, tuple):
+                pending.extend([entry[1]] if entry[0] == "one" else entry[1])
+        return None
+
+    return lines, resolve
+
+
+def cross_block_evidence(path):
+    lines, resolve = scan(path)
+    written, read, block = {}, {}, -1
+    for text in lines:
+        if re.match(r"^block\d+", text.strip()):
+            block += 1
+            continue
+        if m := STORE.match(text):
+            slot = resolve(m.group(2))
+            if slot:
+                written.setdefault(slot, set()).add(block)
+        elif m := LOAD.match(text):
+            slot = resolve(m.group(1))
+            if slot:
+                read.setdefault(slot, set()).add(block)
+    return any(written[s] - read[s] for s in written if s in read)
+
+
+def dumps(directory, suffix):
+    found = {}
+    for name in os.listdir(directory):
+        m = re.search(r"9t_sf_fuzz\d*([a-z_0-9]+)\." + suffix + r"$", name)
+        if m:
+            found[m.group(1)] = os.path.join(directory, name)
+    return found
+
+
+on_dir, off_dir = sys.argv[1], sys.argv[2]
+pre = dumps(on_dir, r"unopt\.rakit")
+post_on, post_off = dumps(on_dir, r"opt\.rakit"), dumps(off_dir, r"opt\.rakit")
+bad = 0
+
+for name in CROSS_BLOCK:
+    if name not in pre:
+        print(f"[regression] sf coverage: no pre-pass IR for {name}", file=sys.stderr)
+        bad = 1
+    elif not cross_block_evidence(pre[name]):
+        print(
+            f"[regression] sf coverage: {name} holds no cross-block store and load "
+            f"before the pass, so it no longer reaches it",
+            file=sys.stderr,
+        )
+        bad = 1
+
+for name in REWRITTEN:
+    if name not in post_on or name not in post_off:
+        print(f"[regression] sf coverage: no IR dump for {name}", file=sys.stderr)
+        bad = 1
+    elif open(post_on[name]).read() == open(post_off[name]).read():
+        print(f"[regression] sf coverage: the pass leaves {name} untouched", file=sys.stderr)
+        bad = 1
+
+sys.exit(bad)
+PYEOF
     fi
 fi
 

@@ -117,13 +117,20 @@ fn alias_ptr(r: &mut Rng) -> u64 {
     mix(mix(0, y), z)
 }
 
-// A volatile write must survive even though nothing reads the slot.
+#[inline(never)]
+fn opaque_read(p: *const u64) -> u64 {
+    unsafe { core::ptr::read(p) }
+}
+
+// A volatile write must survive. The value is read back through a pointer handed
+// to another function, so the address escapes and no pass can forward the write
+// into that read: if the write disappeared, the hash would change.
 #[inline(never)]
 fn volatile_local(r: &mut Rng) -> u64 {
     let mut v = [0u64; 5];
     let x = r.next();
     unsafe { core::ptr::write_volatile(&mut v[2], x) };
-    mix(0, v[2].wrapping_add(1))
+    mix(0, opaque_read(&v[2] as *const u64).wrapping_add(1))
 }
 
 // Written through one type, read through another.
@@ -170,33 +177,44 @@ fn loop_state(r: &mut Rng) -> u64 {
 }
 
 // An aggregate assigned in both arms of an `if` and read after the join: the
-// store and the load sit in different blocks, which is the shape that made the
-// pass miscompile before cross-block forwarding became a must-analysis.
+// stores land in the arms and the loads in the join, which is the shape that
+// made the pass miscompile before cross-block forwarding became a must-analysis.
+// Four words keeps it in a stack slot; a two-word tuple is split into block
+// parameters before code generation and never reaches the pass.
 #[inline(never)]
 fn cross_block_aggregate(r: &mut Rng) -> u64 {
     let x = r.next();
-    let pair;
+    let quad: [u64; 4];
     if x & 1 == 0 {
-        pair = (x, x.wrapping_add(1));
+        quad = [x, x.wrapping_add(1), x.wrapping_mul(3), x ^ 7];
     } else {
-        pair = (x.wrapping_mul(3), x ^ 7);
+        quad = [x ^ 1, x.wrapping_add(2), x.wrapping_mul(5), x ^ 11];
     }
-    mix(mix(0, pair.0), pair.1)
+    let mut h = 0u64;
+    for i in 0..4 {
+        h = mix(h, quad[i]);
+    }
+    h
 }
 
-// The same, re-assigned on both sides of a loop body so the aggregate becomes
-// block parameters.
+// The same shape inside a loop, where the arm that runs changes per iteration.
+// Four words again, so the aggregate stays in a slot and the pass sees stores in
+// one block and loads in another.
 #[inline(never)]
 fn loop_aggregate(r: &mut Rng) -> u64 {
-    let mut t = (0u64, 0u64);
+    let mut t = [0u64; 4];
     for i in 0..4u64 {
-        t = if i & 1 == 0 {
-            (t.0.wrapping_add(r.next()), t.1)
+        if i & 1 == 0 {
+            t[0] = t[0].wrapping_add(r.next());
+            t[1] ^= r.next();
         } else {
-            (t.0, t.1 ^ r.next())
-        };
+            t[2] = t[2].wrapping_add(r.next());
+            t[3] ^= r.next();
+        }
+        let k = (i & 3) as usize;
+        t[k] = t[k].wrapping_add(1);
     }
-    mix(t.0, t.1)
+    mix(mix(t[0], t[1]), mix(t[2], t[3]))
 }
 
 fn main() {
