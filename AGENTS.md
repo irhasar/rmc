@@ -1,4 +1,28 @@
 ## Session (2026-11-24, branch `rakit-exp12`) — store-forward address memoisation; write-once rule rejected
+## Session (2026-11-25, branch `rakit-exp12`) — review round 10: negative offsets
+
+- **Bug:** the address regexes only knew `+`. A store to `v2-8` failed to match
+  and was dropped with `continue`, and `v2 = stack_addr.i64 ss1-8` was read as
+  `ss1+0` because `ADDR.match` is a prefix match. Either way a write *before*
+  the object vanished from the analysis, so a region whose remaining stores
+  covered the object passed.
+- **Fix:** one `OFFSET` fragment (`(?:([+-])\s*(\d+))?`) shared by both regexes,
+  decoded by `byte_offset`, with `ADDR` anchored so it cannot silently ignore a
+  tail. A store the checker cannot place (unparsable address, or a base that is
+  not a `stack_addr`) is now a hard error instead of being skipped: it refuses to
+  certify coverage it cannot see.
+- **Bounds are checked against the slot**, not the object, for every store in
+  every region — so an out-of-range store is caught even on a slot whose size
+  never enters the object comparison. Coverage is still measured against the
+  object size, which is now sound because no range can leave the slot.
+- **Pinned by two more self-tests:** `vol_neg` (five 8-byte stores covering the
+  40-byte object plus one at `v2-8`) and `vol_negaddr` (`stack_addr ss1-8`).
+  Both are accepted by the previous checker and rejected now
+  ("8-byte store at -8 leaves the 40-byte slot ss1"); dropping the `off < 0`
+  bound makes the harness print "accepts a store before the object" (`fail=1`).
+- The real `t_volatile_dead` dump still passes. Harness-only change: no compiler
+  or std rebuild.
+
 ## Session (2026-11-25, branch `rakit-exp12`) — review round 9: a store that leaves the object
 
 - **Bug:** `covered()` only asked whether the union of stores *reaches* the

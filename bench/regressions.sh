@@ -119,9 +119,11 @@ cat > "$TMP/volcheck.py" <<'PYEOF'
 import re, sys
 
 SLOT = re.compile(r"^\s*(ss\d+)\s*=\s*explicit_slot\s+(\d+)")
-ADDR = re.compile(r"^\s*(v\d+)\s*=\s*stack_addr\.i64\s+(ss\d+)(?:\+(\d+))?")
+# A stack address and a store address both carry an optional signed offset.
+OFFSET = r"(?:([+-])\s*(\d+))?"
+ADDR = re.compile(r"^\s*(v\d+)\s*=\s*stack_addr\.i64\s+(ss\d+)" + OFFSET + r"\s*$")
+STORE_ADDR = re.compile(r"(v\d+)\s*" + OFFSET + r"\s*$")
 DEF = re.compile(r"^\s*(v\d+)\s*=\s*([a-z_0-9]+)((?:\.\w+)?)\b")
-STORE_ADDR = re.compile(r"(v\d+)(?:\+(\d+))?\s*$")
 # Ops whose result has the type of its first typed operand.
 SAME_TYPE = {"iadd", "isub", "imul", "band", "bor", "bxor", "ishl", "ushr", "sshr", "select", "ireduce", "uextend", "sextend", "bint", "bnot"}
 
@@ -133,12 +135,25 @@ def type_size(name):
     return int(m.group(2)) * int(m.group(3) or 1) // 8
 
 
+def byte_offset(m, first):
+    """Value of OFFSET captured from group `first` (sign, digits)."""
+    if not m.group(first):
+        return 0
+    value = int(m.group(first + 1))
+    return -value if m.group(first) == "-" else value
+
+
+def fail(message):
+    print(message, file=sys.stderr)
+    sys.exit(1)
+
+
 sizes = {}
 addr = {}
 width = {}
 defs = []
 region = 0
-# (region, slot) -> list of [start, end) byte ranges
+# (region, slot) -> list of (offset in slot, stored value)
 spans = {}
 for line in open(sys.argv[1]):
     text = line.split(";")[0].rstrip()
@@ -150,7 +165,7 @@ for line in open(sys.argv[1]):
         continue
     m = ADDR.match(text)
     if m:
-        addr[m.group(1)] = (m.group(2), int(m.group(3) or 0))
+        addr[m.group(1)] = (m.group(2), byte_offset(m, 3))
         continue
     stripped = text.strip()
     if stripped == "fence":
@@ -171,13 +186,13 @@ for line in open(sys.argv[1]):
     lhs, _, rhs = text.rpartition(",")
     m = STORE_ADDR.match(rhs.strip())
     if not m:
-        continue
+        fail(f"unparsable store address {rhs.strip()!r}; the checker cannot weigh that store")
     target = addr.get(m.group(1))
     stored = re.findall(r"v\d+", lhs)
     if target is None or not stored:
-        continue
+        fail(f"store {stripped!r} names no stack slot; the checker cannot see where it goes")
     slot, base = target
-    spans.setdefault((region, slot), []).append((base + int(m.group(2) or 0), stored[-1]))
+    spans.setdefault((region, slot), []).append((base + byte_offset(m, 2), stored[-1]))
 
 # Propagate the type through same-typed operations so every stored value has one.
 changed = True
@@ -191,6 +206,18 @@ while changed:
                 width[value] = width[operand]
                 changed = True
                 break
+
+# Every store must stay inside the slot it writes. A store that leaves the
+# object is a bug of its own, so it may never help cover the object either.
+for (reg, slot), stores in spans.items():
+    if slot not in sizes:
+        fail(f"region {reg}: store to slot {slot}, which has no size")
+    for off, value in stores:
+        if value not in width:
+            fail(f"region {reg}: unknown width for stored {value} in {slot}")
+        if off < 0 or off + width[value] > sizes[slot]:
+            fail(f"region {reg}: {width[value]}-byte store at {off} leaves the "
+                 f"{sizes[slot]}-byte slot {slot}")
 
 
 def covered(intervals, size):
@@ -210,26 +237,12 @@ for reg, size in want.items():
     for (r, slot), stores in spans.items():
         if r != reg or sizes.get(slot) != size:
             continue
-        ranges = []
-        for off, value in stores:
-            w = width.get(value)
-            if w is None:
-                print(f"region {reg}: unknown width for stored {value} in {slot}", file=sys.stderr)
-                sys.exit(1)
-            if off < 0 or off + w > size:
-                # A store that leaves the object is a bug of its own; it must not
-                # be allowed to "cover" the tail it overruns.
-                print(f"region {reg}: {w}-byte store at {off} overruns the {size}-byte object in {slot}",
-                      file=sys.stderr)
-                sys.exit(1)
-            ranges.append((off, off + w))
-        if covered(ranges, size):
+        if covered([(off, off + width[value]) for off, value in stores], size):
             ok = True
     if not ok:
-        seen = {f"{slot}({sizes.get(slot)}B)": sorted(stores) for (r, slot), stores in spans.items() if r == reg}
-        print(f"region {reg}: no fully written {size}-byte object, stores per slot: {seen}",
-              file=sys.stderr)
-        sys.exit(1)
+        seen = {f"{slot}({sizes.get(slot)}B)": sorted(stores)
+                for (r, slot), stores in spans.items() if r == reg}
+        fail(f"region {reg}: no fully written {size}-byte object, stores per slot: {seen}")
 PYEOF
 
 if ! RAKIT_DUMP=1 env -u RAKIT_HOST_LLVM "$ROOT/rakit/dist/bin/rustc-rakit" --target "$TARGET" \
@@ -310,6 +323,51 @@ RAKITEOF
     fi
     if python3 "$TMP/volcheck.py" "$TMP/vol_over.rakit" >/dev/null 2>&1; then
         echo "[regression] volatile checker accepts a write past the object" >&2
+        fail=1
+    fi
+    # A negative offset used to be dropped (`v2-8`) or read as zero (`ss1-8`),
+    # so a write *before* the object went unnoticed while the rest covered it.
+    cat > "$TMP/vol_neg.rakit" <<'RAKITEOF'
+    ss0 = explicit_slot 16, align = 8
+    ss1 = explicit_slot 40, align = 8
+block0:
+    v1 = stack_addr.i64 ss0
+    v2 = stack_addr.i64 ss1
+    v3 = load.i64 v9
+    v4 = load.i8x16 v9
+    fence
+    store notrap v4, v1
+    fence
+    store notrap v3, v2
+    store notrap v3, v2+8
+    store notrap v3, v2+16
+    store notrap v3, v2+24
+    store notrap v3, v2+32
+    store notrap v3, v2-8
+RAKITEOF
+    cat > "$TMP/vol_negaddr.rakit" <<'RAKITEOF'
+    ss0 = explicit_slot 16, align = 8
+    ss1 = explicit_slot 40, align = 8
+block0:
+    v1 = stack_addr.i64 ss0
+    v2 = stack_addr.i64 ss1-8
+    v3 = load.i64 v9
+    v4 = load.i8x16 v9
+    fence
+    store notrap v4, v1
+    fence
+    store notrap v3, v2
+    store notrap v3, v2+8
+    store notrap v3, v2+16
+    store notrap v3, v2+24
+    store notrap v3, v2+32
+RAKITEOF
+    if python3 "$TMP/volcheck.py" "$TMP/vol_neg.rakit" >/dev/null 2>&1; then
+        echo "[regression] volatile checker accepts a store before the object" >&2
+        fail=1
+    fi
+    if python3 "$TMP/volcheck.py" "$TMP/vol_negaddr.rakit" >/dev/null 2>&1; then
+        echo "[regression] volatile checker reads a negative stack offset as zero" >&2
         fail=1
     fi
 fi
