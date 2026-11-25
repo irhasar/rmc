@@ -21,7 +21,13 @@ EXT=$(cd "$(dirname "$0")" && pwd)
 TM=$EXT/treemeasure.py
 # Normalise to an absolute path: the build runs with cwd=$SRC, so a relative
 # $SRC would make a relative CARGO_TARGET_DIR resolve inside $SRC twice.
-SRC=$(cd "${1:?usage: cratebench.sh <srcdir> [workload] [bin]}" && pwd)
+SRC=$(CDPATH= cd -- "${1:?usage: cratebench.sh <srcdir> [workload] [bin]}" >/dev/null && pwd) || exit 1
+# A capture directory that does not exist turns every redirect below into a
+# failure that the comparison cannot see, so create it and drop stale captures.
+if [ -n "${OUTDIR:-}" ]; then
+  mkdir -p "$OUTDIR" || exit 1
+  rm -f "$OUTDIR"/out_*.txt "$OUTDIR"/err_*.txt
+fi
 WORK=${2:-}
 BINNAME=${3:-}
 CREPS=${CREPS:-3}
@@ -34,6 +40,9 @@ declare -A BIN=(
   [M]="$EXT/../rakit/dist/bin/cargo-rakit"
 )
 declare -A TDIR=( [L]=target-bL [U]=target-bU [M]=target-bM )
+# Set only when a backend built, ran and captured its output in this run, so a
+# leftover capture can never stand in for a failed one.
+declare -A OK=()
 
 jf() { python3 -c "import sys,json;d=json.load(sys.stdin);print('%.0f %.0f %d %d'%(d['wall_med']*1000,d['cpu_med']*1000,d['peak_rss_med_kb'],d['exit']))"; }
 med() { printf '%s\n' "$@" | sort -n | awk '{a[NR]=$1} END{print (NR%2)?a[(NR+1)/2]:int((a[NR/2]+a[NR/2+1])/2)}'; }
@@ -69,7 +78,10 @@ for bk in L U M; do
     rres=$(BIN="$bin" python3 "$TM" --reps "$RREPS" --warmup 1 --json -- bash -c "$RUNCMD" | jf)
     read -r rw rc rr re <<<"$rres"
     if [ -n "${OUTDIR:-}" ]; then
-      BIN="$bin" bash -c "$RUNCMD" >"$OUTDIR/out_$bk.txt" 2>"$OUTDIR/err_$bk.txt" || true
+      if ! BIN="$bin" bash -c "$RUNCMD" >"$OUTDIR/out_$bk.txt" 2>"$OUTDIR/err_$bk.txt"; then
+        echo "$bk CAPTURE_FAIL"
+        continue
+      fi
       out=$(md5sum <"$OUTDIR/out_$bk.txt" | cut -c1-8)
     else
       out=$(BIN="$bin" bash -c "$RUNCMD" 2>/dev/null | md5sum | cut -c1-8)
@@ -89,12 +101,20 @@ for bk in L U M; do
   fi
   printf '%-2s | %8sms %8sms %7sM | %10s | %7sms %7sms %7sM  out=%s\n' \
     "$bk" "$cw" "$cc" "$((cr/1024))" "$sz" "$rw" "$rc" "$((rr/1024))" "$out"
+  OK[$bk]=1
 done
 
-if [ -n "${OUTDIR:-}" ] && [ -f "$OUTDIR/out_L.txt" ]; then
+if [ -n "${OUTDIR:-}" ]; then
   bad=0
+  for bk in L U M; do
+    if [ -z "${OK[$bk]:-}" ]; then
+      echo "INCOMPLETE: $bk did not build, run and capture"
+      bad=1
+    fi
+  done
   for bk in U M; do
-    if ! cmp -s "$OUTDIR/out_L.txt" "$OUTDIR/out_$bk.txt"; then
+    if [ -n "${OK[L]:-}" ] && [ -n "${OK[$bk]:-}" ] &&
+       ! cmp -s "$OUTDIR/out_L.txt" "$OUTDIR/out_$bk.txt"; then
       echo "MISMATCH: out_$bk.txt differs from LLVM"; bad=1
     fi
   done

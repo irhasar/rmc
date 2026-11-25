@@ -6,7 +6,15 @@ set -eu
 out=${1:?usage: gen_corpus.sh <outdir> [files] [lines]}
 files=${2:-800}
 lines=${3:-300}
-rm -rf "$out"
+# Never delete a directory this script did not generate.
+if [ -e "$out" ]; then
+  if [ -f "$out/d0/f1.txt" ]; then
+    rm -rf -- "$out"
+  else
+    echo "gen_corpus: $out exists and is not a generated corpus; refusing to delete it" >&2
+    exit 1
+  fi
+fi
 mkdir -p "$out"
 for i in $(seq 1 "$files"); do
   d="$out/d$((i % 20))"

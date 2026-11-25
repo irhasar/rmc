@@ -3,7 +3,7 @@
 # multi-pattern (Aho-Corasick) scan and a directory walk. `--sort path` keeps
 # the output independent of walk and thread order.
 # Usage: rg_work.sh <rg-binary> <corpus-dir>
-set -eu
+set -euo pipefail
 RG=$1
 C=$2
 "$RG" --sort path -c -F needle "$C"
