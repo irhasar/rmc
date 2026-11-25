@@ -55,6 +55,10 @@ mostly *don't* match (rakit recomputes the idiom per access, so the `shift`
 values differ). Reverted. If retried, first canonicalise the idiom so every
 access to a slot shares one derived pointer value.
 
+**Harness:** `bench/rgbench.sh [src-dir] [corpus-dir]` rebuilds the matrix
+(downloads ripgrep 14.1.1 if absent, three `CARGO_TARGET_DIR`s, compile axes via
+`measure.py`, five search shapes with stdout equality).
+
 **ripgrep matrix reproduced this session** (`ripgrep 14.1.1`, 2000-file / 40 MB
 corpus, M/L): literal 2.42×, captures 2.28×, `-i` alternation **6.51×**,
 multi-pattern `-F x4` **7.44×**, `--files` 1.75×, total **5.35×** (M 2076 ms,
