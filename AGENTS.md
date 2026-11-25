@@ -1,4 +1,55 @@
 ## Session (2026-11-24, branch `rakit-exp12`) — store-forward address memoisation; write-once rule rejected
+## Session (2026-11-25, branch `rakit-exp12`) — review round 5: complete provenance walk, IR-based volatile check
+
+- **The provenance walk had a depth budget of eight nodes.** `collect_slots`
+  counted the `stack_addr` itself against the budget, so eight arithmetic
+  operations exhausted it before the slot was reached: the slot looked private
+  and `drop_dead_stores` deleted its initialization. `t_deep_cast_chain` (two
+  ten-step `^=`/`wrapping_add` chains over `&a as usize`, with a shared `mid`,
+  and `n` a runtime zero) printed `835192 835192` with the budgeted walk; LLVM
+  and the fixed pass print `127 127`. The walk is now an iterative worklist over
+  SSA definitions with a per-query `seen` set: no depth limit, each value visited
+  once, so a shared subexpression is recorded no matter which path reaches it
+  first.
+- **Truncation is now explicit.** `for_each_provenance_slot` returns `false`
+  when it exceeds `PROV_MAX_NODES` (4096, only reachable on pathological input).
+  `analyze` returns `None` then and `run_body` leaves the function untouched;
+  `drop_dead_stores` adds every private slot to `ptr_reads` for an incomplete
+  read walk. An incomplete set must never be read as "the unvisited slots are
+  absent".
+- **The volatile check no longer looks at machine code.** Counting stores in the
+  disassembly cannot distinguish the write from a register spill that lands at an
+  adjacent offset, so `runs` merged them and reported a missing write. The check
+  now reads the RAKIT dump: every store names its stack slot (the register
+  allocator runs later, so spills do not exist there) and `explicit_slot` gives
+  each object's size. Each fenced region must fully cover one object of the size
+  written there — starts at offset 0, reaches the last eight bytes, no gap wider
+  than a 16-byte store. Verified with one-write variants: only-40 fails
+  (`region 1: no fully written 16-byte object, stores per slot: {ss0(40B): [0, 16,
+  32]}`) and only-16 fails (`region 2: ... {}`).
+- **Gate:** std rebuilt from scratch (`rm -rf build/stdlib_target`); `./y.sh test
+  --sysroot rakit` → 65 suites / 25,368 passed / 0 failed; `bench/regressions.sh`
+  → all fixtures pass (4 store-forward fixtures now); `allaxes` 45/45 `ok`, full
+  matrix below (`L/U/M` per cell).
+
+| prog | Cwall | Ccpu | Crss | size | Rwall | Rcpu | Rrss |
+|---|---|---|---|---|---|---|---|
+| h_arith | 117ms/89ms/99ms | 141ms/117ms/130ms | 116.6M/118.2M/119.4M | 4,617,128/5,839,120/4,091,440 | 2ms/2ms/2ms | 2ms/2ms/2ms | 10.7M/11.0M/11.0M |
+| h_branch | 118ms/90ms/100ms | 141ms/118ms/128ms | 116.9M/118.9M/119.5M | 4,616,832/5,837,264/4,089,760 | 2ms/2ms/2ms | 2ms/2ms/2ms | 11.1M/11.1M/11.0M |
+| h_calls | 116ms/90ms/100ms | 141ms/118ms/128ms | 117.5M/118.5M/120.1M | 4,616,872/5,837,792/4,090,136 | 2ms/2ms/2ms | 2ms/2ms/2ms | 10.8M/10.8M/10.8M |
+| h_float | 126ms/94ms/102ms | 149ms/122ms/132ms | 116.0M/117.3M/119.0M | 4,637,984/5,861,024/4,130,328 | 2ms/3ms/2ms | 2ms/2ms/2ms | 10.8M/11.0M/11.1M |
+| h_mem | 270ms/134ms/170ms | 431ms/184ms/244ms | 136.5M/133.7M/136.3M | 4,646,856/5,959,856/4,179,440 | 3ms/10ms/4ms | 3ms/10ms/4ms | 10.9M/11.0M/11.0M |
+| h_simd | 141ms/97ms/111ms | 164ms/126ms/137ms | 122.5M/123.9M/125.3M | 4,617,704/5,843,736/4,093,864 | 2ms/4ms/2ms | 2ms/3ms/2ms | 11.0M/11.0M/11.0M |
+| p1_arith | 84ms/78ms/89ms | 103ms/100ms/108ms | 104.9M/107.1M/108.5M | 4,635,232/5,877,944/4,159,072 | 81ms/108ms/101ms | 81ms/108ms/100ms | 11.1M/11.0M/11.1M |
+| p2_mem | 240ms/130ms/158ms | 372ms/175ms/217ms | 132.4M/129.7M/132.3M | 4,639,896/5,936,144/4,156,944 | 17ms/158ms/42ms | 16ms/157ms/42ms | 11.1M/10.9M/11.0M |
+| p3_calls | 99ms/85ms/95ms | 121ms/111ms/124ms | 114.6M/115.6M/117.2M | 4,612,368/5,820,136/4,079,800 | 37ms/117ms/55ms | 37ms/116ms/55ms | 11.0M/10.8M/11.0M |
+| p4_simd | 107ms/93ms/105ms | 128ms/117ms/128ms | 115.3M/116.1M/117.9M | 4,636,096/5,892,376/4,165,696 | 56ms/157ms/84ms | 56ms/157ms/85ms | 48.2M/49.4M/48.8M |
+| p5_inline | 80ms/75ms/83ms | 100ms/101ms/108ms | 104.0M/105.7M/107.1M | 4,609,368/5,813,704/4,072,712 | 58ms/894ms/6ms | 57ms/893ms/6ms | 11.0M/11.0M/10.7M |
+| p6_scalar | 80ms/76ms/82ms | 98ms/98ms/104ms | 100.0M/102.0M/103.4M | 4,609,368/5,813,688/4,072,712 | 58ms/901ms/6ms | 58ms/900ms/6ms | 11.0M/11.0M/11.1M |
+| p7_branchy | 82ms/77ms/85ms | 100ms/98ms/108ms | 104.4M/105.7M/107.4M | 4,609,520/5,813,800/4,072,888 | 43ms/100ms/35ms | 42ms/100ms/35ms | 11.0M/11.1M/11.0M |
+| p8_minmax | 83ms/78ms/82ms | 101ms/99ms/105ms | 104.2M/105.7M/107.1M | 4,609,544/5,813,752/4,072,872 | 18ms/39ms/21ms | 17ms/38ms/21ms | 11.0M/11.1M/11.1M |
+| p9_u64f32 | 93ms/85ms/94ms | 113ms/107ms/117ms | 109.6M/111.7M/113.2M | 4,635,448/5,886,872/4,162,704 | 30ms/76ms/33ms | 30ms/76ms/34ms | 17.8M/18.8M/18.2M |
+
 ## Session (2026-11-25, branch `rakit-exp12`) — review round 4: union provenance, destination-aware volatile check
 
 - **Provenance returned one slot, not all of them.** `provenance_rec` answered

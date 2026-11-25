@@ -64,60 +64,70 @@ struct AddrCache {
     bound: FxHashMap<Value, Option<u64>>,
 }
 
-thread_local! {
-    static ADDR_CACHE: std::cell::RefCell<AddrCache> = std::cell::RefCell::default();
-    static PROV_SEEN: std::cell::RefCell<FxHashSet<Value>> = std::cell::RefCell::default();
+#[derive(Default)]
+struct ProvScratch {
+    seen: FxHashSet<Value>,
+    work: Vec<Value>,
 }
 
-/// Every stack slot `v` may derive from: the union over all operands of the
-/// address arithmetic that built it.
+thread_local! {
+    static ADDR_CACHE: std::cell::RefCell<AddrCache> = std::cell::RefCell::default();
+    static PROV_SCRATCH: std::cell::RefCell<ProvScratch> = std::cell::RefCell::default();
+}
+
+/// Values one provenance query may visit before the pass gives up on the
+/// function. The walk follows SSA definitions, so it terminates by itself; the
+/// cap only bounds a pathological input.
+const PROV_MAX_NODES: usize = 4096;
+
+/// Visit every stack slot `v` may derive from: the union over all operands of
+/// the address arithmetic that built it.
 ///
 /// Answering with only the *first* slot found is not enough for an escape
 /// decision: `low + addr(b)`, where `low` is a casted offset computed from `a`'s
 /// address, derives from both `a` and `b`, and a call receiving that sum can read
-/// either slot. Attributing the value to `a` alone lets `b`'s initialization be
-/// dropped.
+/// either slot. A depth budget is not enough either: the walk has to reach the
+/// `stack_addr` however many operations sit between it and the use, and a shared
+/// subexpression must not be skipped because a longer path reached it first.
+/// The worklist therefore runs to completion over SSA definitions, visiting each
+/// value once.
+///
+/// Returns false when [`PROV_MAX_NODES`] was exceeded, i.e. the set is
+/// incomplete: the caller must then treat *no* slot as private rather than
+/// assume the unvisited ones are absent.
 fn for_each_provenance_slot(
     func: &ir::Function,
     v: Value,
-    depth: u32,
     mut f: impl FnMut(StackSlot),
-) {
-    PROV_SEEN.with(|seen| {
-        let mut seen = seen.borrow_mut();
+) -> bool {
+    PROV_SCRATCH.with(|cell| {
+        let mut scratch = cell.borrow_mut();
+        let ProvScratch { seen, work } = &mut *scratch;
         seen.clear();
-        collect_slots(func, v, depth, &mut seen, &mut f);
-    });
-}
-
-fn collect_slots(
-    func: &ir::Function,
-    v: Value,
-    depth: u32,
-    seen: &mut FxHashSet<Value>,
-    f: &mut impl FnMut(StackSlot),
-) {
-    if depth == 0 {
-        return;
-    }
-    let dfg = &func.dfg;
-    let v = dfg.resolve_aliases(v);
-    // Visiting each value once keeps a diamond-shaped expression tree linear
-    // instead of exponential in `depth`.
-    if !seen.insert(v) {
-        return;
-    }
-    let ir::ValueDef::Result(inst, 0) = dfg.value_def(v) else { return };
-    let data = &dfg.insts[inst];
-    match data {
-        ir::InstructionData::StackAddr { stack_slot, .. } => f(*stack_slot),
-        _ if pure_address_arith(data.opcode()) => {
-            for &arg in data.arguments(&dfg.value_lists) {
-                collect_slots(func, arg, depth - 1, seen, f);
+        work.clear();
+        work.push(v);
+        let mut visited = 0usize;
+        while let Some(v) = work.pop() {
+            let v = func.dfg.resolve_aliases(v);
+            if !seen.insert(v) {
+                continue;
+            }
+            visited += 1;
+            if visited > PROV_MAX_NODES {
+                return false;
+            }
+            let ir::ValueDef::Result(inst, 0) = func.dfg.value_def(v) else { continue };
+            let data = &func.dfg.insts[inst];
+            match data {
+                ir::InstructionData::StackAddr { stack_slot, .. } => f(*stack_slot),
+                _ if pure_address_arith(data.opcode()) => {
+                    work.extend(data.arguments(&func.dfg.value_lists).iter().copied());
+                }
+                _ => {}
             }
         }
-        _ => {}
-    }
+        true
+    })
 }
 
 /// Integer arithmetic that cannot leak an address out of the function: the
@@ -254,7 +264,10 @@ fn run_body(
     if func.sized_stack_slots.is_empty() && func.dynamic_stack_slots.is_empty() {
         return;
     }
-    let Bases { private_slots: private, ptr_bases, loaded, confined, prov } = analyze(func);
+    let Some(Bases { private_slots: private, ptr_bases, loaded, confined, prov }) = analyze(func)
+    else {
+        return;
+    };
     let t1 = std::time::Instant::now();
     // Nothing the pass can track: no private slot and no non-escaping pointer
     // base means no store is forwardable and no dead store can be identified.
@@ -347,7 +360,9 @@ struct Bases {
     prov: FxHashMap<Base, StackSlot>,
 }
 
-fn analyze(func: &ir::Function) -> Bases {
+/// `None` when a provenance walk was truncated: no slot may then be assumed
+/// private, so the pass leaves the function alone.
+fn analyze(func: &ir::Function) -> Option<Bases> {
     let dfg = &func.dfg;
     let mut escaping_slots: FxHashSet<StackSlot> = FxHashSet::default();
     let mut slots: FxHashSet<StackSlot> = FxHashSet::default();
@@ -369,7 +384,7 @@ fn analyze(func: &ir::Function) -> Bases {
                 let is_addr = addr_index == Some(i);
                 // Every slot the argument may derive from: `low + addr(b)` names
                 // both, and a call can read either.
-                for_each_provenance_slot(func, arg, 8, |slot| {
+                let complete = for_each_provenance_slot(func, arg, |slot| {
                     slots.insert(slot);
                     // Integer arithmetic on an address does not leak it out of
                     // the function, so only a *non-arithmetic* use other than a
@@ -378,6 +393,9 @@ fn analyze(func: &ir::Function) -> Bases {
                         escaping_slots.insert(slot);
                     }
                 });
+                if !complete {
+                    return None;
+                }
                 if is_addr {
                     addr_only.insert(arg);
                 } else {
@@ -400,10 +418,12 @@ fn analyze(func: &ir::Function) -> Bases {
                         // Provenance, not just a direct `stack_addr`: a derived
                         // pointer reaching a phi is invisible to `mem_key` from
                         // then on, so the slot must not be treated as private.
-                        for_each_provenance_slot(func, v, 8, |slot| {
+                        if !for_each_provenance_slot(func, v, |slot| {
                             slots.insert(slot);
                             escaping_slots.insert(slot);
-                        });
+                        }) {
+                            return None;
+                        }
                         escaping_ptr.insert(v);
                     }
                 }
@@ -433,10 +453,12 @@ fn analyze(func: &ir::Function) -> Bases {
         let tracked_access = mem_key(func, *inst, *addr)
             .map(|key| tracked(&key, &slots, &addr_only))
             .unwrap_or(false);
-        if !tracked_access {
-            for_each_provenance_slot(func, *addr, 8, |slot| {
+        if !tracked_access
+            && !for_each_provenance_slot(func, *addr, |slot| {
                 escaping_slots.insert(slot);
-            });
+            })
+        {
+            return None;
         }
     }
 
@@ -478,7 +500,7 @@ fn analyze(func: &ir::Function) -> Bases {
         }
     }
 
-    Bases { private_slots: slots, ptr_bases: addr_only, loaded, confined, prov }
+    Some(Bases { private_slots: slots, ptr_bases: addr_only, loaded, confined, prov })
 }
 
 /// Instructions that may write memory the pass does not track: calls, atomics,
@@ -946,9 +968,13 @@ fn drop_dead_stores(
             let addr = func.dfg.insts[inst].arguments(&func.dfg.value_lists).first().copied();
             let Some(addr) = addr else { continue };
             let Some(key) = stack_key(func, inst, addr) else {
-                for_each_provenance_slot(func, addr, 8, |slot| {
+                if !for_each_provenance_slot(func, addr, |slot| {
                     ptr_reads.insert(slot);
-                });
+                }) {
+                    // An incomplete walk cannot say which slot this read names,
+                    // so no store of this function may be called dead.
+                    ptr_reads.extend(private.iter().copied());
+                }
                 continue;
             };
             let size = func

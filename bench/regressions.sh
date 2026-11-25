@@ -97,6 +97,7 @@ check t_simd_mask $'i8x8 eq [-1, 0, -1, 0, -1, 0, -1, 0]\ni64x8 lt [0, 0, 0, -1,
 check t_volatile_dead 'written'
 check t_cast_escape '127'
 check t_cast_offset '127'
+check t_deep_cast_chain '127 127'
 check t_ptr_store_alias '7 0'
 
 # A volatile write must not be elided. `volatile_store` lowers to `fence` plus
@@ -110,120 +111,71 @@ if command -v objdump >/dev/null 2>&1; then
     if [ -z "$vdump" ]; then
         echo "[regression] t_volatile_dead: no IR dump" >&2
         fail=1
-    elif ! awk '/fence/{f=1} f && /^[ \t]+store/{found=1} END{exit !found}' "$vdump"; then
-        echo "[regression] t_volatile_dead: volatile stores were elided" >&2
-        fail=1
-    fi
-    # "some store after a fence" is too weak: it ignores the destination, so an
-    # unrelated spill could satisfy it for a write that lost bytes. Count a
-    # *contiguous run* per destination object instead, and require the exact
-    # sizes the fixture writes (16 then 40 bytes).
-    # `$TMP/vdead` is only the IR-dump target (`--emit=llvm-ir` skips the link),
-    # so the disassembly has to come from the binary `check` built.
-    vbin=$TMP/t_volatile_dead_M
-    vmain=$(nm "$vbin" 2>/dev/null | grep -E '4main$' | awk '{print $3}' | head -1)
-    objdump -d --no-show-raw-insn --disassemble="$vmain" "$vbin" 2>/dev/null \
-        >"$TMP/vdead.dis"
-    if [ -z "$vmain" ] || [ ! -s "$TMP/vdead.dis" ]; then
-        echo "[regression] t_volatile_dead: no disassembly of main" >&2
-        fail=1
-    elif ! python3 - "$TMP/vdead.dis" <<'EOF'
+    # "some store after a fence" is too weak, and counting stores in the machine
+    # code is unreliable: a register spill can land at an offset adjacent to the
+    # write and merge into its run. Check the RAKIT instead, where every store
+    # names its stack slot (the register allocator runs later, so spills cannot
+    # appear) and `explicit_slot` gives the object's size. Each fenced region must
+    # fully cover one object of the size the fixture writes there (16, then 40).
+    elif ! python3 - "$vdump" <<'EOF'
 import re, sys
 
-WIDE = {"movdqu": 16, "movdqa": 16, "movups": 16, "movaps": 16}
-SUFFIX = {"movq": 8, "movl": 4, "movw": 2, "movb": 1}
-REG = {}
-for names, size in ((("rax", "rcx", "rdx", "rbx", "rsi", "rdi", "rbp", "rsp"), 8),
-                    (("eax", "ecx", "edx", "ebx", "esi", "edi", "ebp", "esp"), 4),
-                    (("ax", "cx", "dx", "bx", "si", "di", "bp", "sp"), 2),
-                    (("al", "cl", "dl", "bl", "sil", "dil", "bpl", "spl"), 1)):
-    for n in names:
-        REG[n] = size
+SLOT = re.compile(r"^\s*(ss\d+)\s*=\s*explicit_slot\s+(\d+)")
+ADDR = re.compile(r"^\s*(v\d+)\s*=\s*stack_addr\.i64\s+(ss\d+)(?:\+(\d+))?")
+STORE_ADDR = re.compile(r"(v\d+)(?:\+(\d+))?\s*$")
 
-
-def store_bytes(mnemonic, src):
-    if mnemonic in WIDE:
-        return WIDE[mnemonic]
-    if mnemonic in SUFFIX:
-        return SUFFIX[mnemonic]
-    if mnemonic != "mov":
-        return 0
-    src = src.strip()
-    if src.startswith("$"):
-        return 8
-    m = re.search(r"%(\w+)", src)
-    if not m:
-        return 0
-    r = m.group(1)
-    if r in REG:
-        return REG[r]
-    if re.fullmatch(r"r\d+", r):
-        return 8
-    if re.fullmatch(r"r\d+d", r):
-        return 4
-    if re.fullmatch(r"r\d+b", r):
-        return 1
-    if re.fullmatch(r"r\d+w", r):
-        return 2
-    return 0
-
-
-MEM = re.compile(r"^(-?0x[0-9a-f]+)?\(%([a-z0-9]+)\)$")
+sizes = {}
+addr = {}
 region = 0
-# (region, base register) -> list of [start, end) byte ranges
-spans = {}
+# (region, slot) -> byte offsets stored
+offsets = {}
 for line in open(sys.argv[1]):
-    text = line.split("#")[0].strip()
-    if ":" not in text:
+    text = line.split(";")[0].rstrip()
+    if not text.strip():
         continue
-    text = text.split(":", 1)[1].strip()
-    if text == "mfence":
+    m = SLOT.match(text)
+    if m:
+        sizes[m.group(1)] = int(m.group(2))
+        continue
+    m = ADDR.match(text)
+    if m:
+        addr[m.group(1)] = (m.group(2), int(m.group(3) or 0))
+        continue
+    stripped = text.strip()
+    if stripped == "fence":
         region += 1
         continue
-    parts = text.split(None, 1)
-    if len(parts) != 2 or "(" not in parts[1]:
+    if not stripped.startswith("store"):
         continue
-    mnemonic, operands = parts
-    src, _, dst = operands.rpartition(",")
-    m = MEM.match(dst.strip())
-    if not m:  # a register destination: not a store
+    m = STORE_ADDR.search(text)
+    if not m:
         continue
-    width = store_bytes(mnemonic, src)
-    if width == 0:
+    target = addr.get(m.group(1))
+    if target is None:
         continue
-    start = int(m.group(1), 16) if m.group(1) else 0
-    spans.setdefault((region, m.group(2)), []).append([start, start + width])
+    slot, base = target
+    offsets.setdefault((region, slot), []).append(base + int(m.group(2) or 0))
 
-
-def runs(intervals):
-    """Length of every maximal contiguous run of stores."""
-    out = []
-    cur_start, cur_end = None, None
-    for start, end in sorted(intervals):
-        if cur_end is not None and start <= cur_end:
-            cur_end = max(cur_end, end)
-        else:
-            if cur_start is not None:
-                out.append(cur_end - cur_start)
-            cur_start, cur_end = start, end
-    if cur_start is not None:
-        out.append(cur_end - cur_start)
-    return out
-
-
-# The fixture writes 16 bytes and then 40 bytes to two different objects. Each
-# fenced region must therefore hold one object of exactly that size: a shorter
-# write, a lost write, or a stray spill merged into the run all fail here.
+# The fixture writes 16 bytes to one local and then 40 to another.
 want = {1: 16, 2: 40}
 for reg, size in want.items():
-    found = [run for (r, _), v in spans.items() if r == reg for run in runs(v)]
-    if size not in found:
-        print(f"region {reg}: contiguous store runs {sorted(found)}, "
-              f"want one of exactly {size}", file=sys.stderr)
+    covered = False
+    for (r, slot), offs in offsets.items():
+        if r != reg or sizes.get(slot) != size:
+            continue
+        offs = sorted(offs)
+        # Starts at the object's base, reaches its last eight bytes, and leaves no
+        # gap wider than one 16-byte store: the whole object was written.
+        if offs[0] == 0 and offs[-1] >= size - 8 and all(b - a <= 16 for a, b in zip(offs, offs[1:])):
+            covered = True
+    if not covered:
+        seen = {f"{slot}({sizes.get(slot)}B)": sorted(o) for (r, slot), o in offsets.items() if r == reg}
+        print(f"region {reg}: no fully written {size}-byte object, stores per slot: {seen}",
+              file=sys.stderr)
         sys.exit(1)
 EOF
     then
-        echo "[regression] t_volatile_dead: a volatile write is missing" >&2
+        echo "[regression] t_volatile_dead: a volatile write is missing or partial" >&2
         fail=1
     fi
 fi
