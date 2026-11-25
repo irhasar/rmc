@@ -413,7 +413,7 @@ impl WriteBackendMethods for AotDriver {
             prof,
             dcx.handle(),
             &cgcx.output_filenames,
-            config.emit_ir,
+            config.emit_ir || crate::pretty_rakit::dump_ir_enabled(),
             module.module_llvm,
             module.name,
             module.kind,

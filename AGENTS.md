@@ -1,4 +1,46 @@
 ## Session (2026-11-24, branch `rakit-exp12`) — store-forward address memoisation; write-once rule rejected
+## Session (2026-11-25, branch `rakit-exp12`) — review round 8: the checks the harness silently lost
+
+- **Round 7 deleted the volatile IR check.** Rewriting the deep-cast block by
+  slicing from `check t_deep_cast_chain` to the AVX comment also removed the
+  whole volatile section that sat between them, so only `check t_volatile_dead
+  'written'` survived — and that output cannot see a missing store. Both blocks
+  are back and now live in one place, after the fixture list.
+- **`--emit=llvm-ir` cannot be used for dumps**: rakit never writes the `.ll`
+  rustc then copies, so that emit type always exits 1. New `RAKIT_DUMP=1`
+  produces the same `.unopt`/`.opt`/`.vcode` dumps from an ordinary compile that
+  exits 0 (`pretty_rakit::dump_ir_enabled`, also consulted by the AOT `codegen`
+  for the post-pass dump). Verified codegen-neutral: `.text`, `.rodata`,
+  `.data.rel.ro`, `.eh_frame`, `.symtab`, `.strtab` are byte-identical with and
+  without it; only `.note.gnu.build-id` differs.
+- **Neither IR check depends on `objdump` any more** (they only read compiler
+  output), and both now fail on a nonzero compile status instead of passing
+  silently. Proved by sourcing the two blocks with a `PATH` that has no
+  `objdump` (both pass) and with a fixture that does not compile (`fail=1`,
+  "compile failed" printed).
+- **`t_ptr_store_alias` is registered** (`check t_ptr_store_alias '7 0'`); it
+  was written but never run.
+- **Gate:** std rebuilt from scratch; 65 suites / 25,368 passed / 0 failed;
+  regressions pass; `allaxes` 45/45 `ok`, full matrix below (`L/U/M` per cell).
+
+| prog | Cwall | Ccpu | Crss | size | Rwall | Rcpu | Rrss |
+|---|---|---|---|---|---|---|---|
+| h_arith | 123ms/87ms/99ms | 148ms/116ms/127ms | 116.3M/118.0M/119.1M | 4,617,128/5,839,120/4,091,440 | 2ms/2ms/2ms | 2ms/2ms/2ms | 10.8M/11.1M/11.0M |
+| h_branch | 116ms/87ms/96ms | 143ms/116ms/124ms | 116.7M/117.9M/119.2M | 4,616,832/5,837,264/4,089,760 | 2ms/2ms/2ms | 2ms/2ms/2ms | 11.0M/10.8M/11.0M |
+| h_calls | 115ms/89ms/96ms | 139ms/115ms/126ms | 116.9M/118.4M/119.7M | 4,616,872/5,837,792/4,090,136 | 2ms/2ms/2ms | 2ms/2ms/2ms | 11.0M/10.9M/11.0M |
+| h_float | 125ms/88ms/97ms | 150ms/115ms/126ms | 115.6M/117.2M/118.7M | 4,637,984/5,861,024/4,130,328 | 2ms/3ms/2ms | 2ms/2ms/2ms | 11.0M/11.0M/11.1M |
+| h_mem | 264ms/133ms/165ms | 430ms/186ms/234ms | 135.9M/133.5M/135.6M | 4,646,856/5,959,856/4,179,440 | 3ms/10ms/4ms | 3ms/10ms/4ms | 10.7M/11.1M/11.0M |
+| h_simd | 142ms/96ms/109ms | 166ms/123ms/141ms | 122.4M/123.5M/124.5M | 4,617,704/5,843,736/4,093,864 | 2ms/4ms/2ms | 2ms/3ms/2ms | 10.7M/10.8M/11.1M |
+| p1_arith | 83ms/79ms/81ms | 102ms/101ms/104ms | 104.5M/106.9M/108.0M | 4,635,232/5,877,944/4,159,072 | 81ms/109ms/101ms | 81ms/108ms/100ms | 11.0M/10.9M/11.0M |
+| p2_mem | 244ms/126ms/155ms | 377ms/170ms/216ms | 132.0M/129.9M/131.8M | 4,639,896/5,936,144/4,156,944 | 16ms/154ms/42ms | 16ms/154ms/42ms | 11.1M/10.8M/11.0M |
+| p3_calls | 96ms/84ms/90ms | 119ms/114ms/118ms | 114.2M/115.4M/116.9M | 4,612,368/5,820,136/4,079,800 | 37ms/116ms/55ms | 36ms/117ms/55ms | 11.0M/11.0M/11.0M |
+| p4_simd | 106ms/92ms/101ms | 126ms/120ms/125ms | 114.9M/115.8M/117.6M | 4,636,096/5,892,376/4,165,696 | 55ms/155ms/83ms | 56ms/155ms/83ms | 48.2M/49.5M/48.8M |
+| p5_inline | 82ms/75ms/78ms | 102ms/98ms/102ms | 103.6M/105.5M/106.8M | 4,609,368/5,813,704/4,072,712 | 58ms/892ms/6ms | 58ms/892ms/6ms | 11.0M/10.8M/10.8M |
+| p6_scalar | 83ms/76ms/79ms | 99ms/97ms/100ms | 99.8M/101.9M/103.0M | 4,609,368/5,813,688/4,072,712 | 58ms/900ms/7ms | 57ms/898ms/6ms | 11.1M/11.0M/10.8M |
+| p7_branchy | 83ms/78ms/81ms | 102ms/100ms/102ms | 103.8M/105.6M/106.8M | 4,609,520/5,813,800/4,072,888 | 43ms/101ms/36ms | 43ms/101ms/35ms | 10.8M/11.1M/11.1M |
+| p8_minmax | 83ms/76ms/82ms | 102ms/99ms/105ms | 103.9M/105.5M/106.6M | 4,609,544/5,813,752/4,072,872 | 18ms/38ms/20ms | 17ms/38ms/20ms | 11.0M/10.8M/11.0M |
+| p9_u64f32 | 92ms/87ms/92ms | 110ms/108ms/116ms | 109.5M/111.6M/113.1M | 4,635,448/5,886,872/4,162,704 | 31ms/76ms/34ms | 31ms/76ms/34ms | 17.8M/18.8M/18.2M |
+
 ## Session (2026-11-25, branch `rakit-exp12`) — review round 7: checker self-test, observable walk abandonment
 
 - **The volatile checker is now pinned from both sides.** Its two failure modes

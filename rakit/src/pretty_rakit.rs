@@ -260,7 +260,16 @@ pub(crate) fn format_rakit_ir_header(isa: &dyn TargetIsa, symbol_name: &str) -> 
 }
 
 pub(crate) fn should_write_ir(sess: &Session) -> bool {
-    sess.opts.output_types.contains_key(&OutputType::LlvmAssembly)
+    // `--emit=llvm-ir` is the historical trigger, but rakit never writes the
+    // `.ll` file rustc then copies, so that emit type fails the build.
+    // `RAKIT_DUMP=1` produces the same dumps from an ordinary compile.
+    sess.opts.output_types.contains_key(&OutputType::LlvmAssembly) || dump_ir_enabled()
+}
+
+/// Whether `RAKIT_DUMP` asks for the per-function RAKIT dumps.
+pub(crate) fn dump_ir_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("RAKIT_DUMP").is_some())
 }
 
 pub(crate) fn write_ir_file(

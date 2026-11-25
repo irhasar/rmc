@@ -95,18 +95,209 @@ check t_volatile $'n=1000 loop=17230722056597992339\nn=17 loop=18156365728903607
 check t_copy_overlap $'N=16 shift=1 11664426682378596937\nback N=16 shift=1 12713388859568982132\nN=32 shift=1 774115827419797049\nback N=32 shift=1 5146083939088780532\nN=32 shift=7 16864641215232849398\nback N=32 shift=7 6744451032907730017\nN=48 shift=3 11240810308952937694\nback N=48 shift=3 9582033626409429593\nN=64 shift=1 4928807640131852377\nback N=64 shift=1 13460265805155334836\nN=64 shift=16 3546406609664978499\nback N=64 shift=16 14022381290388415283\nnonoverlap 1882637779704813251'
 check t_simd_mask $'i8x8 eq [-1, 0, -1, 0, -1, 0, -1, 0]\ni64x8 lt [0, 0, 0, -1, 0, -1, 0, 0]\ni32x8 lt [0, 0, 0, -1, 0, -1, 0, 0]\nu8x2 eq [255, 0]'
 check t_volatile_dead 'written'
+check t_ptr_store_alias '7 0'
 check t_cast_escape '127'
 check t_cast_offset '127'
 check t_deep_cast_chain '127 127'
 
-# The output check above cannot see an abandoned provenance walk: a truncated
-# walk makes the pass leave the function alone, which is slow but still correct.
+# Two store-forwarding properties cannot be seen in a fixture's output: a
+# volatile write has no reader, and an abandoned provenance walk only costs an
+# optimization. Both are checked in the RAKIT dump that `RAKIT_DUMP=1` writes
+# next to the binary from an ordinary (successful) compile.
+
+# A volatile write must not be elided. `volatile_store` lowers to `fence` plus
+# ordinary stores (Rakit has no volatile bit), so a store has to survive after
+# the fence even when nothing reads the destination.
+#
+# The checker lives in its own file so the self-test below can reuse it. It
+# reads the RAKIT dump rather than the machine code: every store names its stack
+# slot (the register allocator runs later, so spills cannot appear there) and
+# `explicit_slot` gives each object's size. Each fenced region must fully cover
+# one object of the size written there, weighing every store by the width of the
+# value it stores.
+cat > "$TMP/volcheck.py" <<'PYEOF'
+import re, sys
+
+SLOT = re.compile(r"^\s*(ss\d+)\s*=\s*explicit_slot\s+(\d+)")
+ADDR = re.compile(r"^\s*(v\d+)\s*=\s*stack_addr\.i64\s+(ss\d+)(?:\+(\d+))?")
+DEF = re.compile(r"^\s*(v\d+)\s*=\s*([a-z_0-9]+)((?:\.\w+)?)\b")
+STORE_ADDR = re.compile(r"(v\d+)(?:\+(\d+))?\s*$")
+# Ops whose result has the type of its first typed operand.
+SAME_TYPE = {"iadd", "isub", "imul", "band", "bor", "bxor", "ishl", "ushr", "sshr", "select", "ireduce", "uextend", "sextend", "bint", "bnot"}
+
+
+def type_size(name):
+    m = re.fullmatch(r"([ifb])(\d+)(?:x(\d+))?", name)
+    if not m:
+        return None
+    return int(m.group(2)) * int(m.group(3) or 1) // 8
+
+
+sizes = {}
+addr = {}
+width = {}
+defs = []
+region = 0
+# (region, slot) -> list of [start, end) byte ranges
+spans = {}
+for line in open(sys.argv[1]):
+    text = line.split(";")[0].rstrip()
+    if not text.strip():
+        continue
+    m = SLOT.match(text)
+    if m:
+        sizes[m.group(1)] = int(m.group(2))
+        continue
+    m = ADDR.match(text)
+    if m:
+        addr[m.group(1)] = (m.group(2), int(m.group(3) or 0))
+        continue
+    stripped = text.strip()
+    if stripped == "fence":
+        region += 1
+        continue
+    m = DEF.match(text)
+    if m:
+        value, opcode, suffix = m.group(1), m.group(2), m.group(3).lstrip(".")
+        # `f64const`/`vconst` carry the type in the opcode when there is no suffix.
+        size = type_size(suffix) if suffix else type_size(opcode)
+        if size:
+            width[value] = size
+        else:
+            defs.append((value, opcode, text))
+        continue
+    if not stripped.startswith("store"):
+        continue
+    lhs, _, rhs = text.rpartition(",")
+    m = STORE_ADDR.match(rhs.strip())
+    if not m:
+        continue
+    target = addr.get(m.group(1))
+    stored = re.findall(r"v\d+", lhs)
+    if target is None or not stored:
+        continue
+    slot, base = target
+    spans.setdefault((region, slot), []).append((base + int(m.group(2) or 0), stored[-1]))
+
+# Propagate the type through same-typed operations so every stored value has one.
+changed = True
+while changed:
+    changed = False
+    for value, opcode, text in defs:
+        if value in width or opcode not in SAME_TYPE:
+            continue
+        for operand in re.findall(r"v\d+", text.split("=", 1)[1]):
+            if operand in width:
+                width[value] = width[operand]
+                changed = True
+                break
+
+
+def covered(intervals, size):
+    """True when the ranges tile [0, size) with no gap."""
+    end = 0
+    for start, stop in sorted(intervals):
+        if start > end:
+            return False
+        end = max(end, stop)
+    return end >= size
+
+
+# The fixture writes 16 bytes to one local and then 40 to another.
+want = {1: 16, 2: 40}
+for reg, size in want.items():
+    ok = False
+    for (r, slot), stores in spans.items():
+        if r != reg or sizes.get(slot) != size:
+            continue
+        ranges = []
+        for off, value in stores:
+            w = width.get(value)
+            if w is None:
+                print(f"region {reg}: unknown width for stored {value} in {slot}", file=sys.stderr)
+                sys.exit(1)
+            ranges.append((off, off + w))
+        if covered(ranges, size):
+            ok = True
+    if not ok:
+        seen = {f"{slot}({sizes.get(slot)}B)": sorted(stores) for (r, slot), stores in spans.items() if r == reg}
+        print(f"region {reg}: no fully written {size}-byte object, stores per slot: {seen}",
+              file=sys.stderr)
+        sys.exit(1)
+PYEOF
+
+if ! RAKIT_DUMP=1 env -u RAKIT_HOST_LLVM "$ROOT/rakit/dist/bin/rustc-rakit" --target "$TARGET" \
+    -C opt-level=3 "$BENCH/tests/t_volatile_dead.rs" -o "$TMP/vdead" --edition 2021 \
+    >"$TMP/vdead.log" 2>&1
+then
+    echo "[regression] t_volatile_dead: compile failed" >&2
+    sed 's/^/    /' "$TMP/vdead.log" | tail -5 >&2
+    fail=1
+else
+    vdump=$(ls "$TMP"/vdead.rakit/*4main.opt.rakit 2>/dev/null | head -1)
+    if [ -z "$vdump" ]; then
+        echo "[regression] t_volatile_dead: no IR dump" >&2
+        fail=1
+    elif ! python3 "$TMP/volcheck.py" "$vdump"; then
+        echo "[regression] t_volatile_dead: a volatile write is missing or partial" >&2
+        fail=1
+    fi
+    # Self-test. A width-blind checker accepts the first dump (three 8-byte
+    # stores at 0/16/32 leave 16 of 40 bytes unwritten) and rejects the second
+    # (one 16-byte store covers the whole 16-byte object), so both directions
+    # are pinned here instead of relying on what the backend happens to emit.
+    cat > "$TMP/vol_gap.rakit" <<'RAKITEOF'
+    ss0 = explicit_slot 16, align = 8
+    ss1 = explicit_slot 40, align = 8
+block0:
+    v1 = stack_addr.i64 ss0
+    v2 = stack_addr.i64 ss1
+    v3 = load.i64 v9
+    fence
+    store notrap v3, v1
+    store notrap v3, v1+8
+    fence
+    store notrap v3, v2
+    store notrap v3, v2+16
+    store notrap v3, v2+32
+RAKITEOF
+    cat > "$TMP/vol_wide.rakit" <<'RAKITEOF'
+    ss0 = explicit_slot 16, align = 8
+    ss1 = explicit_slot 40, align = 8
+block0:
+    v1 = stack_addr.i64 ss0
+    v2 = stack_addr.i64 ss1
+    v3 = load.i64 v9
+    v4 = load.i8x16 v9
+    fence
+    store notrap v4, v1
+    fence
+    store notrap v4, v2
+    store notrap v4, v2+16
+    store notrap v3, v2+32
+RAKITEOF
+    if python3 "$TMP/volcheck.py" "$TMP/vol_gap.rakit" >/dev/null 2>&1; then
+        echo "[regression] volatile checker accepts a gapped 40-byte write" >&2
+        fail=1
+    fi
+    if ! python3 "$TMP/volcheck.py" "$TMP/vol_wide.rakit" >/dev/null 2>&1; then
+        echo "[regression] volatile checker rejects a single 16-byte write" >&2
+        fail=1
+    fi
+fi
+
+# A truncated provenance walk makes the pass leave the function alone, which is
+# slow but still correct, so `t_deep_cast_chain`'s output cannot detect it.
 # `RAKIT_SF_DEBUG=1` reports every function the pass handled and every walk it
 # gave up on, so the fixture must produce reports and no truncation.
-if command -v objdump >/dev/null 2>&1; then
-    sfout=$(RAKIT_SF_DEBUG=1 env -u RAKIT_HOST_LLVM "$ROOT/rakit/dist/bin/rustc-rakit" \
-        --target "$TARGET" -C opt-level=3 "$BENCH/tests/t_deep_cast_chain.rs" \
-        -o "$TMP/dchain" --edition 2021 2>&1 >/dev/null)
+if ! sfout=$(RAKIT_SF_DEBUG=1 env -u RAKIT_HOST_LLVM "$ROOT/rakit/dist/bin/rustc-rakit" \
+    --target "$TARGET" -C opt-level=3 "$BENCH/tests/t_deep_cast_chain.rs" \
+    -o "$TMP/dchain" --edition 2021 2>&1 >/dev/null)
+then
+    echo "[regression] t_deep_cast_chain: compile failed" >&2
+    printf '%s\n' "$sfout" | tail -5 >&2
+    fail=1
+else
     if ! printf '%s\n' "$sfout" | grep -q '^\[sf\]'; then
         echo "[regression] t_deep_cast_chain: store forwarding reported nothing" >&2
         fail=1
