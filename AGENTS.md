@@ -1,3 +1,78 @@
+## Session (2026-11-24, branch `rakit-exp12`) — store-forward address memoisation; write-once rule rejected
+
+**What landed.** `provenance_slot` and `const_upper_bound` are mutually
+recursive walks over the address graph, and `analyze`/`cross_block_entry`/
+`drop_dead_stores` re-ask the same questions for every operand of every
+load/store. Both are now memoised per function in a thread-local
+`AddrCache`, cleared at the top of `run_body` (the cache key is a `Value`, so
+it must not survive a function boundary). Reuse is sound at any depth: a cached
+`Some` is a proof that does not depend on the budget, and a cached `None` only
+makes the pass more conservative.
+
+**Measured: neutral.** `p2_mem` compile 157.9/154.1 ms before vs 156.1/156.0 ms
+after (`measure.py --reps 9`, two rounds each); store-forward's own
+`RAKIT_SF_TIME` totals stay ~30 ms of which `analyze` is ~7 ms. The pass is
+allocation-bound, not recursion-bound, so the memoisation removes work without
+moving wall time. Kept because it makes the walk linear instead of re-deriving
+subterms, and it costs nothing.
+
+**Rejected: a "slot stored exactly once" fact** (`Bases::single`, a store
+counted per key, then per slot, used as a fact for any load the store block
+dominates — the case the must-analysis cannot reach across a loop back edge).
+It kept the AVX2 needle broadcast in a register (visible in the disassembly)
+but was **runtime-neutral on all 15 all-axes programs** (p1–p9 + h_*: every row
+within noise, e.g. p2 43/42 ms, p4 85/84 ms, p5 7/6 ms). It also caused two
+miscompiles before the soundness holes were closed, so it was removed rather
+than kept as a knob:
+
+1. Counting stores *per key* is wrong: a slot's bytes can be written through two
+   different keys (direct slot access vs derived pointer, or two types of the
+   same size). Fixed by counting per slot.
+2. Counting only stores with a resolvable (`prov`) base is wrong: a store at a
+   **dynamic** offset has no `prov` entry (the offset cannot be bounded) yet
+   still writes the slot. Repro `u16::extract_bits` (alloctests/coretests
+   `num::u16::test_extract_bits`): `prepare()` fills `[u16; 4]` through
+   `iadd(stack_addr, 2*stage)`, the array init is one static store, so the slot
+   looked write-once and a later `load.i64` of the whole array was replaced with
+   `iconst 0`. Fix: attribute such stores with `provenance_slot` (offset-blind).
+
+Repro programs kept in the notes: `[usize; N] -> VecDeque` (`deq.len()` read
+back as 0) and the `extract_bits` snippet; both must print the LLVM output.
+
+**Gate:** `./y.sh test --sysroot rakit` → 65 suites / 25,368 passed / 0 failed
+(run three times, twice with the rejected rule in place, once after removal).
+
+**All-axes, final tree** (`bench/allaxes.sh`, `CREPS=3 RREPS=9`; L/U/M,
+compile wall ms / artifact bytes / run wall ms, all stdout `ok`):
+
+| prog | Cwall L/U/M | size L/U/M | Rwall L/U/M |
+|---|---|---|---|
+| p1_arith | 83/76/**79** | 4.64/5.88/**4.16** MB | 81/108/**103** |
+| p2_mem | 242/126/**153** | 4.64/5.94/**4.16** | 17/154/**42** |
+| p3_calls | 98/84/**88** | 4.61/5.82/**4.08** | 37/116/**55** |
+| p4_simd | 106/92/**97** | 4.64/5.89/**4.16** | 55/157/**85** |
+| p5_inline | 79/74/**76** | 4.61/5.81/**4.07** | 58/894/**6** |
+| p6_scalar | 82/75/**77** | 4.61/5.81/**4.07** | 58/903/**6** |
+| p7_branchy | 85/77/**78** | 4.61/5.81/**4.07** | 43/100/**35** |
+| p8_minmax | 82/76/**78** | 4.61/5.81/**4.07** | 19/38/**20** |
+| p9_u64f32 | 92/85/**91** | 4.64/5.89/**4.16** | 30/76/**34** |
+| h_mem | 262/134/**164** | 4.65/5.96/**4.18** | 3/9/**4** |
+
+So M still wins compile wall vs **L** on all 15 programs and artifact size vs
+both, but loses compile wall to **U** everywhere (U has no rakit passes; ours
+cost ~25–30 ms of a ~155 ms p2_mem compile, store forwarding alone ~33 ms on its
+largest CGU). Runtime: M wins p5/p6 (~9.5x) and p7 (35 vs 43), ties p8 (20 vs
+19), loses p1/p2/p3/p4/p9.
+
+**Dead end confirmed (do not retry): the vendored vectorizer cannot fire on
+these loops.** `RAKIT_NO_VECTORIZE=1` produces a **byte-identical** binary for
+`p4_simd` (4,164,952 B both ways) and the same runtime (83.6 vs 82.8 ms), and it
+also does nothing for a pure `u32` elementwise loop over `Vec`s. `match_header`
+requires a straight-line body chain, so the bounds-check `brif` + cold panic
+block that every `a[i]` produces makes it bail. A real vectorization win needs
+bounds-check elimination first (the two length loads are not CSE'd — see the
+2026-11-22 note), not more matcher patterns.
+
 ## Session (2026-11-24, branch `rakit-exp12`) — store forwarding through derived stack pointers (AVX2 −85%)
 
 **Root cause of the remaining 256-bit SIMD gap.** The two-half lowering makes

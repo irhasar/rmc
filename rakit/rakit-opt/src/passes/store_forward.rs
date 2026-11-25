@@ -55,6 +55,20 @@ impl Confined {
     }
 }
 
+/// Memoises the recursive address queries for the function being processed.
+/// Both answers are safe to reuse at a smaller depth: a cached `Some` is a proof
+/// that does not depend on the budget, and a cached `None` only ever makes the
+/// pass more conservative.
+#[derive(Default)]
+struct AddrCache {
+    prov: FxHashMap<Value, Option<StackSlot>>,
+    bound: FxHashMap<Value, Option<u64>>,
+}
+
+thread_local! {
+    static ADDR_CACHE: std::cell::RefCell<AddrCache> = std::cell::RefCell::default();
+}
+
 /// The stack slot `v` is derived from, ignoring how far it may be offset.
 ///
 /// A stack address that is only ever used by integer arithmetic still does not
@@ -62,26 +76,39 @@ impl Confined {
 /// `iadd(sa, k)` all name the same slot. This is what lets the over-alignment
 /// idiom `iadd(sa, isub(K, band(sa, K - 1)))` keep its slot private.
 fn provenance_slot(func: &ir::Function, v: Value, depth: u32) -> Option<StackSlot> {
+    ADDR_CACHE.with(|c| provenance_rec(func, &mut c.borrow_mut(), v, depth))
+}
+
+fn provenance_rec(
+    func: &ir::Function,
+    cache: &mut AddrCache,
+    v: Value,
+    depth: u32,
+) -> Option<StackSlot> {
     if depth == 0 {
         return None;
     }
     let dfg = &func.dfg;
     let v = dfg.resolve_aliases(v);
-    let ir::ValueDef::Result(inst, 0) = dfg.value_def(v) else { return None };
-    let data = &dfg.insts[inst];
-    match data {
-        ir::InstructionData::StackAddr { stack_slot, .. } => Some(*stack_slot),
-        ir::InstructionData::Binary { opcode, .. } => {
-            if !pure_address_arith(*opcode) {
-                return None;
-            }
-            let args = data.arguments(&dfg.value_lists);
-            args.iter()
-                .filter_map(|&arg| provenance_slot(func, arg, depth - 1))
-                .next()
-        }
-        _ => None,
+    if let Some(&hit) = cache.prov.get(&v) {
+        return hit;
     }
+    let result = match dfg.value_def(v) {
+        ir::ValueDef::Result(inst, 0) => match &dfg.insts[inst] {
+            ir::InstructionData::StackAddr { stack_slot, .. } => Some(*stack_slot),
+            ir::InstructionData::Binary { opcode, .. } if pure_address_arith(*opcode) => {
+                dfg.insts[inst]
+                    .arguments(&dfg.value_lists)
+                    .iter()
+                    .filter_map(|&arg| provenance_rec(func, cache, arg, depth - 1))
+                    .next()
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    cache.prov.insert(v, result);
+    result
 }
 
 /// Integer arithmetic that cannot leak an address out of the function: the
@@ -107,40 +134,55 @@ fn pure_address_arith(opcode: Opcode) -> bool {
 /// add/subtract. `band(x, M)` is bounded by `M` whatever `x` is, which is what
 /// makes the over-alignment idiom `iadd(sa, isub(K, band(sa, K - 1)))` analysable.
 fn const_upper_bound(func: &ir::Function, v: Value, depth: u32) -> Option<u64> {
+    ADDR_CACHE.with(|c| bound_rec(func, &mut c.borrow_mut(), v, depth))
+}
+
+fn bound_rec(
+    func: &ir::Function,
+    cache: &mut AddrCache,
+    v: Value,
+    depth: u32,
+) -> Option<u64> {
     if depth == 0 {
         return None;
     }
     let dfg = &func.dfg;
     let v = dfg.resolve_aliases(v);
-    let ir::ValueDef::Result(inst, 0) = dfg.value_def(v) else { return None };
-    let data = &dfg.insts[inst];
-    match data {
-        ir::InstructionData::UnaryImm { opcode: ir::Opcode::Iconst, imm, .. } => {
-            Some(imm.bits() as u64)
-        }
-        ir::InstructionData::Binary { opcode, .. } => {
-            let args = data.arguments(&dfg.value_lists);
-            let a = *args.first()?;
-            let b = *args.get(1)?;
-            let ba = || const_upper_bound(func, a, depth - 1);
-            let bb = || const_upper_bound(func, b, depth - 1);
-            match opcode {
-                ir::Opcode::Iadd => Some(ba()?.checked_add(bb()?)?),
-                ir::Opcode::Imul => Some(ba()?.checked_mul(bb()?)?),
-                // `x & M <= M` and `x & M <= x`, so a bound on either side bounds
-                // the result.
-                ir::Opcode::Band => match (ba(), bb()) {
-                    (Some(x), Some(y)) => Some(x.min(y)),
-                    (Some(x), None) | (None, Some(x)) => Some(x),
-                    _ => None,
-                },
-                // `a - b <= a` because `b` is a non-negative integer here.
-                ir::Opcode::Isub => ba(),
-                _ => None,
-            }
-        }
-        _ => None,
+    if let Some(&hit) = cache.bound.get(&v) {
+        return hit;
     }
+    let result = match dfg.value_def(v) {
+        ir::ValueDef::Result(inst, 0) => match &dfg.insts[inst] {
+            ir::InstructionData::UnaryImm { opcode: ir::Opcode::Iconst, imm, .. } => {
+                Some(imm.bits() as u64)
+            }
+            ir::InstructionData::Binary { opcode, .. } => {
+                let args = dfg.insts[inst].arguments(&dfg.value_lists);
+                let a = *args.first()?;
+                let b = *args.get(1)?;
+                let ba = bound_rec(func, cache, a, depth - 1);
+                let bb = bound_rec(func, cache, b, depth - 1);
+                match opcode {
+                    ir::Opcode::Iadd => ba.zip(bb).and_then(|(x, y)| x.checked_add(y)),
+                    ir::Opcode::Imul => ba.zip(bb).and_then(|(x, y)| x.checked_mul(y)),
+                    // `x & M <= M` and `x & M <= x`, so a bound on either side
+                    // bounds the result.
+                    ir::Opcode::Band => match (ba, bb) {
+                        (Some(x), Some(y)) => Some(x.min(y)),
+                        (Some(x), None) | (None, Some(x)) => Some(x),
+                        _ => None,
+                    },
+                    // `a - b <= a` because `b` is a non-negative integer here.
+                    ir::Opcode::Isub => ba,
+                    _ => None,
+                }
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    cache.bound.insert(v, result);
+    result
 }
 
 /// The stack slot `v` provably points into, plus an upper bound on how far past
@@ -187,6 +229,12 @@ fn run_body(
     endianness: ir::Endianness,
     analyses: &mut crate::analyses::Analyses,
 ) {
+    ADDR_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        c.prov.clear();
+        c.bound.clear();
+    });
+
     let dbg = crate::tunables::store_forward_time();
     let t0 = std::time::Instant::now();
     if let Some(skip) = crate::tunables::store_forward_skip() {
