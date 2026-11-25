@@ -113,6 +113,43 @@ if command -v objdump >/dev/null 2>&1; then
     fi
 fi
 
+# `-Ctarget-feature=+avx2`/`+fma` must reach the ISA builder together with the
+# implied `+avx`: Cranelift gates every VEX encoding on `has_avx`, so a flag the
+# builder merely accepts still leaves the SSE2 lowering in place. The baseline
+# build must stay legacy-encoded, so this cannot be satisfied by always using VEX.
+if command -v objdump >/dev/null 2>&1; then
+    for spec in base: avx2:+avx2 fma:+fma; do
+        tag=${spec%%:*}
+        feat=${spec##*:}
+        args=()
+        [ -n "$feat" ] && args=(-Ctarget-feature="$feat")
+        if ! env -u RAKIT_HOST_LLVM "$ROOT/rakit/dist/bin/rustc-rakit" --target "$TARGET" \
+            -C opt-level=3 "${args[@]}" "$BENCH/tests/t_isa_avx2.rs" \
+            -o "$TMP/isa_$tag" --edition 2021 >"$TMP/isa_$tag.compile" 2>&1; then
+            echo "[regression] t_isa_avx2 $tag: compile failed" >&2
+            cat "$TMP/isa_$tag.compile" >&2
+            fail=1
+            continue
+        fi
+        out=$("$TMP/isa_$tag")
+        if [ "$out" != 4950 ]; then
+            echo "[regression] t_isa_avx2 $tag: printed '$out', want 4950" >&2
+            fail=1
+        fi
+        vex=$(objdump -d --no-show-raw-insn "$TMP/isa_$tag" \
+            | grep -cE '\bv(pxor|movdqu|paddd|addps|broadcast)\b')
+        if [ "$tag" = base ]; then
+            if [ "$vex" -ne 0 ]; then
+                echo "[regression] t_isa_avx2: baseline build used $vex VEX instructions" >&2
+                fail=1
+            fi
+        elif [ "$vex" -eq 0 ]; then
+            echo "[regression] t_isa_avx2 $tag: no VEX encoding (feature did not reach the ISA)" >&2
+            fail=1
+        fi
+    done
+fi
+
 # Output equality alone cannot prove the vectorizer ran. Each fixture below
 # contains exactly one xor+imul loop, so a packed multiply (SSE2 lowering of
 # i32x4.imul) in the binary proves *that* loop was vectorized (a tail loop
@@ -375,13 +412,24 @@ if command -v objdump >/dev/null 2>&1; then
     check_src_loads() {
         fn=$1
         want=$2
-        got=$(objdump -d --disassemble="$fn" "$vv" --no-show-raw-insn 2>/dev/null \
-            | grep -cE 'mov[a-z]*[[:space:]]+[0-9a-fx]*\(%rdi[^)]*\),')
+        d=$(objdump -d --disassemble="$fn" "$vv" --no-show-raw-insn 2>/dev/null)
+        # Only scalar moves off the volatile source are reads. An SSE move of the
+        # source is exactly the widening these fixtures forbid, so it is counted
+        # separately instead of being pooled into the load count.
+        wide=$(printf '%s\n' "$d" \
+            | grep -cE '\b(movdqu|movdqa|movups|movaps|movsd|movss|movhps|movlps)[[:space:]]+[0-9a-fx]*\(%rdi')
+        if [ "$wide" -ne 0 ]; then
+            echo "[regression] t_volatile: $fn widened a volatile load" >&2
+            fail=1
+        fi
+        # Scalar mnemonics only (`mov`, `movq`, `movzbl`, `movsbl`, ...); the SSE
+        # moves are the ones the widening check above forbids.
+        got=$(printf '%s\n' "$d" \
+            | grep -cE '\bmov(l|q|w|b|zbl|zwl|zbq|zwq|sbl|swl|slq)?[[:space:]]+[0-9a-fx]*\(%rdi[^)]*\),')
         if [ "$got" -ne "$want" ]; then
             echo "[regression] t_volatile: $fn issued $got source loads, want $want" >&2
             fail=1
         fi
-        d=$(objdump -d --disassemble="$fn" "$vv" --no-show-raw-insn 2>/dev/null)
         if ! printf '%s\n' "$d" | grep -q mfence; then
             echo "[regression] t_volatile: $fn lost its fence" >&2
             fail=1
@@ -409,14 +457,27 @@ if command -v objdump >/dev/null 2>&1; then
     check_src_loads vol256_discard 4 allow_vector_copy
     check_src_loads vol512_discard 1
     # The source here is a local stack slot whose stores are visible: store
-    # forwarding must not substitute them for the volatile reads.
-    # Only the 64-bit moves are the volatile reads; a plain copy of the value may
-    # use vector moves, so those are not counted. A 40-byte copy is 16+16+8, so
-    # its tail adds exactly one 64-bit stack load on top of the five reads.
-    got=$(objdump -d --disassemble=vol_stack_discard "$vv" --no-show-raw-insn 2>/dev/null \
-        | grep -cE '\bmov[q]?[[:space:]]+[0-9a-fx]*\(%r(sp|bp)[^)]*\),')
-    if [ "$got" -ne 6 ]; then
-        echo "[regression] t_volatile: vol_stack_discard issued $got stack loads, want 5" >&2
+    # forwarding must not substitute them for the volatile reads. The five
+    # 8-byte reads sit at five distinct offsets; the copy tail reloads one of
+    # them, so the count alone (6) cannot show a missing read was not traded for
+    # an extra tail load. Requiring five distinct offsets can.
+    objdump -d --disassemble=vol_stack_discard "$vv" --no-show-raw-insn 2>/dev/null \
+        | grep -oE '\bmov[q]?[[:space:]]+[0-9a-fx]*\(%r(sp|bp)\)' > "$TMP/vol_stack_loads.txt"
+    if ! python3 - "$TMP/vol_stack_loads.txt" <<'EOF'
+import re, sys
+offs = [int(re.search(r'([0-9a-fx]*)\(%r(?:sp|bp)\)', line).group(1) or '0', 0)
+        for line in open(sys.argv[1])]
+# Five 8-byte reads of one 40-byte slot are consecutive offsets; the copy tail
+# adds a sixth load from the staging copy. A pooled count could hide a missing
+# read, a consecutive run cannot.
+run = any({o + 8 * k for k in range(5)} <= set(offs) for o in offs)
+if len(offs) != 6 or not run:
+    print(f"vol_stack_discard: {len(offs)} 64-bit stack loads, offsets "
+          f"{sorted(offs)}, want 6 including five consecutive", file=sys.stderr)
+    sys.exit(1)
+EOF
+    then
+        echo "[regression] t_volatile: vol_stack_discard did not issue five distinct volatile reads" >&2
         fail=1
     fi
     d=$(objdump -d --disassemble=vol512_discard "$vv" --no-show-raw-insn 2>/dev/null)
