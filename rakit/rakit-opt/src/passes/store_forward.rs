@@ -223,6 +223,9 @@ fn clobbers_memory(opcode: Opcode) -> bool {
 enum SfEvent {
     /// A call, atomic, fence, …: drops every pointer fact.
     Clobber,
+    /// A fence: drops every fact, including stack slots, so a store is never
+    /// forwarded past the ordering point (matches `forward_block`).
+    Fence,
     /// A store of `value` to `addr`; `inst` is kept for its type and opcode.
     Store { inst: Inst, value: Value, addr: Value },
 }
@@ -234,7 +237,9 @@ fn block_events(func: &ir::Function, block: Block) -> Vec<SfEvent> {
     let mut events = Vec::new();
     for inst in func.layout.block_insts(block) {
         let opcode = func.dfg.insts[inst].opcode();
-        if clobbers_memory(opcode) {
+        if opcode == ir::Opcode::Fence {
+            events.push(SfEvent::Fence);
+        } else if clobbers_memory(opcode) {
             events.push(SfEvent::Clobber);
         } else if opcode.can_store() {
             let args = func.dfg.insts[inst].arguments(&func.dfg.value_lists);
@@ -441,6 +446,7 @@ fn transfer(
             SfEvent::Clobber => {
                 avail.retain(|&(b, _), _| matches!(b, Base::Slot(_)));
             }
+            SfEvent::Fence => avail.clear(),
             SfEvent::Store { inst, value, addr } => {
                 record_store(func, inst, value, addr, &mut avail, private, ptr_bases, loaded);
             }

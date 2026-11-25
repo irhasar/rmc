@@ -362,6 +362,41 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
     two-source `a[i] += b[i]` -> `paddd` (guard still emitted for `b`), f32
     `a[i] *= 2.0` -> `mulps`. New `t_vectorize_inplace`
     (n=1000/999/17/15/1/0); regressions asserts the four ops.
+  - **M4.13 LANDED: IR-dump gate + fence consistency in store_forward.**
+    (a) The `--emit=llvm-ir` gate sat inside the `objdump` guard even though it
+    disassembles nothing, and it only checked that `<out>.rakit/` existed — a
+    directory `write_ir_file` creates before writing any function. It now runs
+    outside the guard and requires `vol512_discard.opt.rakit` and
+    `vol_stack_discard.opt.rakit` specifically.
+    (b) `store_forward`'s cross-block dataflow decoded a fence as a plain
+    `Clobber` (which keeps stack facts) while `forward_block` cleared them, so
+    the two paths disagreed. New `SfEvent::Fence` clears the map in `transfer`
+    as well; the trapping-load guard was already protecting volatile reads.
+    Gate: suite 65/25368/0; regressions green; allaxes 15/15 ok.
+    **Full all-axes matrix** (CREPS=2 RREPS=7; compile = wall ms / cpu ms /
+    peak RSS MB / bytes, run = wall ms / cpu ms / peak RSS MB):
+
+    | prog | C L | C U | C M | R L | R U | R M | ΔR M |
+    |---|---|---|---|---|---|---|---|
+    | h_arith | 122/147/118.2/4617128 | 94/122/119.3/5839120 | 108/138/120.4/4079048 | 2/2/11.1 | 2/2/11.0 | 2/2/11.0 | +0.0% |
+    | h_branch | 123/149/118.7/4616832 | 94/124/119.6/5837264 | 110/140/120.4/4077368 | 2/2/11.1 | 3/3/11.0 | 2/2/11.1 | +0.0% |
+    | h_calls | 125/151/119.0/4616872 | 95/126/119.8/5837792 | 108/138/120.7/4077744 | 2/2/11.1 | 3/2/11.0 | 2/2/10.8 | +0.0% |
+    | h_float | 141/166/117.5/4637984 | 97/125/118.7/5861024 | 111/140/119.7/4118544 | 2/2/11.0 | 3/3/11.0 | 3/2/11.1 | +50.0% |
+    | h_mem | 278/449/137.8/4646856 | 143/196/134.9/5959856 | 181/251/137.1/4166664 | 3/3/11.1 | 10/10/11.0 | 5/4/11.0 | +0.0% |
+    | h_simd | 146/171/124.3/4617704 | 102/132/125.0/5843736 | 115/144/125.8/4081456 | 2/2/11.1 | 4/3/10.8 | 2/2/11.1 | -33.3% |
+    | p1_arith | 88/108/106.2/4635232 | 81/103/108.0/5877944 | 91/115/108.9/4146472 | 82/81/11.0 | 109/108/11.0 | 103/103/11.1 | +0.0% |
+    | p2_mem | 262/397/133.2/4639896 | 131/175/130.9/5936144 | 165/223/132.6/4143848 | 17/16/11.1 | 158/158/11.0 | 50/51/10.8 | +2.0% |
+    | p3_calls | 102/124/116.1/4612368 | 91/118/116.6/5820136 | 102/128/117.8/4067424 | 38/37/11.0 | 117/117/11.1 | 57/57/11.0 | -1.7% |
+    | p4_simd | 112/133/116.8/4636096 | 101/125/117.1/5892376 | 111/136/118.5/4153096 | 57/57/48.2 | 165/164/49.5 | 86/85/48.8 | +1.2% |
+    | p5_inline | 83/103/105.2/4609368 | 79/104/106.9/5813704 | 90/115/107.8/4060320 | 58/58/11.0 | 897/896/10.9 | 7/6/11.0 | +0.0% |
+    | p6_scalar | 82/101/101.7/4609368 | 79/100/103.0/5813688 | 89/112/103.9/4060320 | 58/57/11.0 | 906/905/10.8 | 7/6/11.1 | +0.0% |
+    | p7_branchy | 83/102/105.7/4609520 | 79/102/106.9/5813800 | 91/114/108.0/4060496 | 43/43/11.0 | 101/100/11.0 | 36/36/11.1 | +0.0% |
+    | p8_minmax | 84/103/105.5/4609544 | 80/102/106.7/5813752 | 89/112/107.9/4060464 | 18/18/11.1 | 41/41/11.0 | 21/21/11.0 | +0.0% |
+    | p9_u64f32 | 95/113/111.1/4635448 | 87/111/112.8/5886872 | 101/126/113.9/4150120 | 30/30/17.6 | 77/77/18.9 | 35/36/18.2 | +0.0% |
+    | **TOTAL** | 1926/2517/1737.0/69350216 | 1433/1865/1746.2/87847208 | 1662/2132/1763.4/61503384 | 414/410/209.5 | 2596/2589/211.0 | 418/415/210.2 | |
+
+    M vs L: compile **0.86x**, size **-11.3%**, run **1.01x**; M vs U: compile
+    1.16x, size -30.0%, run **0.16x**.
   - **M4.12 LANDED: IR-comment panic, store forwarding of volatile reads.**
     (a) `--emit=llvm-ir` panicked: the counted volatile loop left an empty exit
     block and `write_cvalue_maybe_transmute` unwraps the block's last

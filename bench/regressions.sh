@@ -284,6 +284,21 @@ if [ -z "$pm" ] || [ "$pl" != "$pm" ]; then
     fail=1
 fi
 
+# IR comments attach to a block's last instruction: the counted volatile loop
+# must not leave an empty exit block behind (`--emit=llvm-ir` used to panic).
+# The dump always exits non-zero here (it writes `<out>.rakit/`), so gate on the
+# panic message and on the dumps being produced. Needs no disassembler, so this
+# runs outside the `objdump` guard.
+rm -rf "$TMP/vol_ir.rakit"
+env -u RAKIT_HOST_LLVM "$ROOT/rakit/dist/bin/rustc-rakit" --target "$TARGET" -C opt-level=3 \
+    --emit=llvm-ir -o "$TMP/vol_ir" "$BENCH/tests/t_volatile.rs" --edition 2021 \
+    >"$TMP/vol_ir.log" 2>&1 || true
+if grep -q panicked "$TMP/vol_ir.log"; then
+    echo "[regression] t_volatile: --emit=llvm-ir panicked" >&2
+    tail -5 "$TMP/vol_ir.log" >&2
+    fail=1
+fi
+
 # Guard rails: power-of-two maps vectorize; volatile and header-side-effect
 # loops must stay scalar. (SIMD assertions need the disassembler; the outputs
 # are checked above by `check`.)
@@ -352,19 +367,6 @@ if command -v objdump >/dev/null 2>&1; then
         fail=1
     fi
 
-# IR comments attach to a block's last instruction: the counted volatile loop
-# must not leave an empty exit block behind (`--emit=llvm-ir` used to panic).
-# The dump always exits non-zero here (it writes `<out>.rakit/`), so gate on the
-# panic message and on the dump being produced.
-rm -rf "$TMP/vol_ir.rakit"
-env -u RAKIT_HOST_LLVM "$ROOT/rakit/dist/bin/rustc-rakit" --target "$TARGET" -C opt-level=3 \
-    --emit=llvm-ir -o "$TMP/vol_ir" "$BENCH/tests/t_volatile.rs" --edition 2021 \
-    >"$TMP/vol_ir.log" 2>&1 || true
-if grep -q panicked "$TMP/vol_ir.log"; then
-    echo "[regression] t_volatile: --emit=llvm-ir panicked" >&2
-    tail -5 "$TMP/vol_ir.log" >&2
-    fail=1
-fi
 if [ ! -d "$TMP/vol_ir.rakit" ]; then
     echo "[regression] t_volatile: --emit=llvm-ir produced no IR dump" >&2
     fail=1
