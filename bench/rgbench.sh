@@ -27,8 +27,11 @@ if [ ! -d "$SRC" ]; then
     tar xz -C "$(dirname "$SRC")" || exit 1
 fi
 
+# `cargo` takes RUSTC as a bare executable, so the LLVM column needs the
+# toolchain's own `rustc` path rather than a `rustc +toolchain` command line.
+RUSTC_LLVM=$(RUSTUP_HOME="$RUSTUP_HOME" "$CARGO_HOME/bin/rustup" which --toolchain "$N" rustc)
 declare -A RC=(
-  [L]="rustc +$N"
+  [L]="$RUSTC_LLVM"
   [U]="$ROOT/cg_clif_upstream/dist/bin/rustc-clif"
   [M]="$ROOT/rakit/dist/bin/rustc-rakit"
 )

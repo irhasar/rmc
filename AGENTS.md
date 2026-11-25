@@ -55,6 +55,14 @@ mostly *don't* match (rakit recomputes the idiom per access, so the `shift`
 values differ). Reverted. If retried, first canonicalise the idiom so every
 access to a slot shares one derived pointer value.
 
+**ripgrep re-measured after the copy work** (`bench/rgbench.sh`, 41 deps):
+compile M 9805 ms wall / 32.4 s cpu / 390 MB RSS / 28.2 MB binary vs L 23110 /
+83.5 s / 409 MB / 30.5 MB and U 8529 / 26.6 s / 378 MB / 35.4 MB. Runtime total
+M 2102 ms vs L 390 (**5.39x**, unchanged from 5.35x — the copy fix targets
+`p2_mem`-shaped code, not Teddy). All five search shapes byte-identical.
+`rgbench.sh` had to stop passing `RUSTC="rustc +toolchain"`: cargo wants a bare
+executable, so the LLVM column now uses `rustup which --toolchain ... rustc`.
+
 **Generalised the copy inlining (LANDED):** `%Memcpy` was only inlined for
 sizes that are a multiple of 16, so 40/56/72-byte aggregate copies — which is
 what `Option<Vec>` and `RawTableInner` bookkeeping actually copy — stayed
