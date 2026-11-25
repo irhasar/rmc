@@ -1,3 +1,52 @@
+## Session (2026-11-24, branch `rakit-exp12`) — small constant copies: vector chunks, `size_of` fold, `memcpy` pass
+
+**Where the 256-bit SIMD gap actually lives.** After the M4.17 two-half
+lowering, the AVX2 byte-count kernel was still 3.9 ms vs LLVM 0.11 ms for the
+same 32 bytes/iteration. Dumping the IR (`--emit=llvm-ir` writes `<out>.rakit/`)
+showed three separate copies per `_mm256_loadu_si256`:
+
+1. `_mm256_loadu_si256` is `#[inline]`, so it is instantiated in the *user*
+   CGU and inlined, but its body is `mem::zeroed()` + `copy_nonoverlapping(src
+   as *const u8, dst as *mut u8, size_of::<__m256i>())`.
+2. `size_of::<__m256i>()` stayed a **call** (MIR keeps it for cross-crate
+   `#[inline]` bodies), so `const_of(count)` in the copy lowering returned
+   `None` and the copy became a `%Memcpy` **libcall**.
+3. `copy_nonoverlapping` had **no arm at all** in `codegen_regular_intrinsic_call`
+   (only `sym::copy` did), so even a constant count fell through to a libcall.
+
+**Fixes (commit `89c6302`):**
+- `common::emit_const_copy` — constant-size copy in 16-byte `I8X16` chunks (up
+  to 64 B) instead of `i64` pairs; used by the `CopyNonOverlapping` statement
+  and by `sym::copy | sym::copy_nonoverlapping` (the latter now also uses
+  `call_memcpy`, not `call_memmove`).
+- `base::const_mem_fn_value` — folds a call to `core::mem::size_of`/`align_of`
+  into an `iconst`. **Gotchas:** guard with `DefKind::Fn` (closures have no
+  `item_name` and `item_name` panics), and do **not** use `def_path_str` in a
+  pass — it trips `trimmed_def_paths`/`must_produce_diag` and ICEs. Check
+  `crate_name == core` + parent module name instead.
+- New `rakit-opt` pass `memcpy_inline` (first in the pipeline, before
+  `store_forward`): rewrites `%Memcpy(dst, src, k)` with `k % 16 == 0 && k <= 64`
+  into load/store pairs. Needed because the inliner copies
+  `copy_nonoverlapping`'s body into the caller with a constant count but the
+  libcall inside that body is already emitted.
+
+**Measured:** AVX2 kernel 3.87 → 3.11 ms, SSE2 3.36 → 1.59 ms (LLVM 0.11 /
+1.22). `p4_simd` M 83 ms (L 55, U 157). Full suite 65 suites / 25,368 passed /
+0 failed; all-axes 15 programs × 3 backends all `ok`, stdout identical to LLVM.
+
+**Still open on the AVX2 kernel (3.11 vs 0.11 ms):** every `__m256i` value
+round-trips a 32-byte stack slot with the over-alignment trick
+(`stack_addr; band 31; isub; iadd`), because Cranelift has no 256-bit type and
+`CPlace` must be `ByRef`. The address arithmetic is hoisted to the preheader,
+but each op still does 2 loads + 2 stores. Closing it needs 32-byte SIMD locals
+kept in two `I8X16` variables — a `CPlace`/`analyze` change, not a lowering one.
+Note this is *not* where ripgrep's remaining gap is (memchr is ~5 ms of a
+~2.1 s run).
+
+**Push status:** `GITHUB_TOKEN` and `OH_GIT_CREDENTIAL_ACCESS_TOKEN_GITHUB` are
+both rejected for `irhasar/rmc` (403 / invalid token). Commit `89c6302` is local
+only; push with a user-supplied `repo`-scoped PAT.
+
 ## Session (2026-11-24, branch `rakit-exp12`) — lowering SIMD 256-bit (dua half 128-bit): ripgrep 7.7x -> 5.4x
 
 **Akar masalah (dari sesi sebelumnya):** rakit hanya menurunkan vektor 128-bit
