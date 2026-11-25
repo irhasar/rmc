@@ -299,14 +299,20 @@ if grep -q panicked "$TMP/vol_ir.log"; then
     fail=1
 fi
 
-# The dump directory is created before any function is written, so require the
-# dumps of the functions that used to panic themselves.
+# The dump directory is created before any function is written and
+# `write_ir_file` only warns when a write fails, so require a *non-empty* dump
+# of each function that used to panic, and no write error naming them.
 for fn in vol512_discard vol_stack_discard; do
-    if [ ! -f "$TMP/vol_ir.rakit/$fn.opt.rakit" ]; then
-        echo "[regression] t_volatile: --emit=llvm-ir produced no dump for $fn" >&2
+    if [ ! -s "$TMP/vol_ir.rakit/$fn.opt.rakit" ]; then
+        echo "[regression] t_volatile: --emit=llvm-ir produced no/empty dump for $fn" >&2
         fail=1
     fi
 done
+if grep -qE "error writing ir file.*(vol512_discard|vol_stack_discard)" "$TMP/vol_ir.log"; then
+    echo "[regression] t_volatile: --emit=llvm-ir could not write a dump" >&2
+    grep -m3 "error writing ir file" "$TMP/vol_ir.log" >&2
+    fail=1
+fi
 
 # Guard rails: power-of-two maps vectorize; volatile and header-side-effect
 # loops must stay scalar. (SIMD assertions need the disassembler; the outputs

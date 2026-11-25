@@ -362,6 +362,15 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
     two-source `a[i] += b[i]` -> `paddd` (guard still emitted for `b`), f32
     `a[i] *= 2.0` -> `mulps`. New `t_vectorize_inplace`
     (n=1000/999/17/15/1/0); regressions asserts the four ops.
+  - **M4.15 LANDED: the IR-dump gate rejects empty dumps.**
+    `-f` accepted a zero-byte file, and `write_ir_file` only *warns* when a
+    write fails, so a failed dump could still satisfy the gate. It now requires
+    `-s` (non-empty) for `vol512_discard.opt.rakit` and
+    `vol_stack_discard.opt.rakit`, and fails on any `error writing ir file`
+    line that names one of them (other functions legitimately hit
+    `File name too long`, so the match is scoped to the fixture names).
+    Checked: positive passes; truncating a dump or appending a scoped write
+    error both fail the gate. Test-only change.
   - **M4.14 LANDED: the IR-dump gate really checks the dumps.**
     The previous edit left only the `panicked` grep: the per-function check was
     dropped, so a run that exited without a panic but wrote no IR still passed.
