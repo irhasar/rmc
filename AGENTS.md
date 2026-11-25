@@ -1,4 +1,47 @@
 ## Session (2026-11-24, branch `rakit-exp12`) — store-forward address memoisation; write-once rule rejected
+## Session (2026-11-25, branch `rakit-exp13`) — PR #23 merged; fuzz the pass itself
+
+- **Branch:** `rakit-exp12` was merged as `b6720e3` into
+  `replace-main-with-cgclif-experiments`. New branch `rakit-exp13` from that
+  merge commit; the new PR targets `replace-main-with-cgclif-experiments`.
+- **New fixture `bench/tests/t_sf_fuzz.rs`** — the pass's own differential fuzz.
+  A runtime-seeded xorshift drives ten `#[inline(never)]` shapes into one hash:
+  field writes through `&mut` borrows read back through the whole struct,
+  runtime-offset byte stores read as wider integers, a value stored in both arms
+  of an `if` and read after the join, dynamic indices, raw-pointer aliases,
+  `write_volatile` into a local, a union written through one member and read
+  through another, `MaybeUninit`, loop-carried struct state, and an aggregate
+  re-assigned on both sides of a loop body (block parameters).
+- **`regressions.sh` runs it three ways:** `check t_sf_fuzz` (LLVM vs Rakit plus
+  the identical-binary guard), then a second compile with
+  `RAKIT_NO_STORE_FWD=1` whose output must match, and whose binary must *differ*
+  — otherwise the fixture stopped reaching the pass and the comparison means
+  nothing.
+- **The fixture has teeth.** Injecting a real bug into `mem_key` (dropping the
+  stack-slot and access offset so every access keys at offset 0) made the fuzz
+  segfault and `regressions.sh` exit 1 ("t_sf_fuzz M: run failed", "LLVM and
+  Rakit differ"). Injection reverted and std rebuilt from scratch.
+- **Gate:** 65 suites / 25,368 passed / 0 failed; regressions pass (3-way on the
+  fuzz); `allaxes` 45/45 `ok`, full matrix below (`L/U/M` per cell).
+
+| prog | Cwall | Ccpu | Crss | size | Rwall | Rcpu | Rrss |
+|---|---|---|---|---|---|---|---|
+| h_arith | 119ms/91ms/99ms | 143ms/120ms/127ms | 116.5M/118.1M/119.2M | 4,617,128/5,839,120/4,091,440 | 2ms/2ms/2ms | 2ms/2ms/2ms | 11.0M/11.0M/10.8M |
+| h_branch | 118ms/89ms/101ms | 146ms/119ms/130ms | 116.8M/118.2M/119.2M | 4,616,832/5,837,264/4,089,760 | 2ms/2ms/2ms | 2ms/2ms/2ms | 11.0M/11.0M/11.0M |
+| h_calls | 118ms/93ms/101ms | 145ms/123ms/130ms | 116.9M/118.4M/119.7M | 4,616,872/5,837,792/4,090,136 | 2ms/2ms/2ms | 2ms/2ms/2ms | 11.1M/11.0M/10.8M |
+| h_float | 127ms/91ms/100ms | 152ms/122ms/128ms | 115.4M/117.5M/118.7M | 4,637,984/5,861,024/4,130,328 | 2ms/3ms/3ms | 2ms/2ms/2ms | 11.0M/11.1M/11.0M |
+| h_mem | 272ms/138ms/174ms | 440ms/187ms/249ms | 136.5M/133.5M/136.0M | 4,646,856/5,959,856/4,179,440 | 3ms/10ms/4ms | 3ms/9ms/4ms | 11.0M/11.0M/11.1M |
+| h_simd | 148ms/100ms/111ms | 173ms/131ms/141ms | 122.6M/123.7M/125.0M | 4,617,704/5,843,736/4,093,864 | 2ms/4ms/2ms | 2ms/3ms/2ms | 11.1M/10.7M/11.0M |
+| p1_arith | 84ms/79ms/82ms | 103ms/101ms/105ms | 104.7M/106.9M/108.2M | 4,635,232/5,877,944/4,159,072 | 82ms/108ms/101ms | 81ms/108ms/100ms | 11.0M/11.0M/11.1M |
+| p2_mem | 241ms/130ms/159ms | 373ms/174ms/220ms | 132.1M/130.0M/131.9M | 4,639,896/5,936,144/4,156,944 | 17ms/157ms/45ms | 16ms/158ms/43ms | 10.8M/10.8M/10.8M |
+| p3_calls | 99ms/88ms/93ms | 123ms/115ms/118ms | 114.4M/115.4M/117.0M | 4,612,368/5,820,136/4,079,800 | 37ms/117ms/56ms | 37ms/117ms/55ms | 11.0M/11.0M/10.8M |
+| p4_simd | 109ms/94ms/103ms | 129ms/118ms/128ms | 115.1M/115.9M/117.5M | 4,636,096/5,892,376/4,165,696 | 56ms/157ms/85ms | 57ms/156ms/86ms | 48.2M/49.4M/48.8M |
+| p5_inline | 82ms/78ms/81ms | 103ms/101ms/107ms | 103.6M/105.8M/106.9M | 4,609,368/5,813,704/4,072,712 | 58ms/893ms/6ms | 58ms/892ms/6ms | 11.1M/11.0M/10.8M |
+| p6_scalar | 81ms/78ms/80ms | 101ms/100ms/103ms | 100.2M/102.0M/103.1M | 4,609,368/5,813,688/4,072,712 | 58ms/902ms/6ms | 57ms/902ms/6ms | 11.0M/11.0M/11.1M |
+| p7_branchy | 84ms/81ms/82ms | 105ms/103ms/106ms | 103.9M/105.7M/106.9M | 4,609,520/5,813,800/4,072,888 | 43ms/101ms/36ms | 42ms/100ms/35ms | 11.1M/11.1M/10.8M |
+| p8_minmax | 86ms/79ms/84ms | 105ms/101ms/111ms | 104.3M/105.3M/106.9M | 4,609,544/5,813,752/4,072,872 | 18ms/39ms/21ms | 18ms/40ms/20ms | 11.0M/11.0M/10.8M |
+| p9_u64f32 | 96ms/88ms/95ms | 117ms/111ms/119ms | 110.0M/111.6M/113.0M | 4,635,448/5,886,872/4,162,704 | 31ms/77ms/34ms | 30ms/76ms/34ms | 17.8M/18.8M/18.2M |
+
 ## Session (2026-11-25, branch `rakit-exp12`) — review round 11: assert the diagnostic
 
 - **Bug:** every negative self-test only asked for a nonzero exit, so a checker

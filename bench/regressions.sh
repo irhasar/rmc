@@ -99,6 +99,37 @@ check t_ptr_store_alias '7 0'
 check t_cast_escape '127'
 check t_cast_offset '127'
 check t_deep_cast_chain '127 127'
+check t_sf_fuzz $'n=0 h=3935000680812775761
+n=1 h=7916603987723881180
+n=2 h=909600361322032517
+n=3 h=18408265565639120422
+n=4 h=6256700545831108142'
+
+# Forwarding must be invisible. `t_sf_fuzz` folds the shapes that made earlier
+# rounds wrong (partial stores, dynamic indices, values merged across blocks,
+# raw aliases, volatile, unions) into one hash, so compile it once more with the
+# pass off and require the same answer -- and a different binary, or the fixture
+# stopped reaching the pass.
+if [ -x "$TMP/t_sf_fuzz_M" ]; then
+    if ! env -u RAKIT_HOST_LLVM RAKIT_NO_STORE_FWD=1 "$ROOT/rakit/dist/bin/rustc-rakit" \
+        --target "$TARGET" -C opt-level=3 "$BENCH/tests/t_sf_fuzz.rs" \
+        -o "$TMP/sf_off" --edition 2021 >"$TMP/sf_off.log" 2>&1
+    then
+        echo "[regression] t_sf_fuzz: compile with the pass off failed" >&2
+        sed 's/^/    /' "$TMP/sf_off.log" | tail -5 >&2
+        fail=1
+    elif ! "$TMP/sf_off" >"$TMP/sf_off.out" 2>&1; then
+        echo "[regression] t_sf_fuzz: run with the pass off failed" >&2
+        fail=1
+    elif ! diff -q "$TMP/t_sf_fuzz_M.out" "$TMP/sf_off.out" >/dev/null; then
+        echo "[regression] t_sf_fuzz: forwarding changes the result" >&2
+        diff -u "$TMP/t_sf_fuzz_M.out" "$TMP/sf_off.out" >&2
+        fail=1
+    elif cmp -s "$TMP/t_sf_fuzz_M" "$TMP/sf_off"; then
+        echo "[regression] t_sf_fuzz: the pass changes nothing, fixture is insensitive" >&2
+        fail=1
+    fi
+fi
 
 # Two store-forwarding properties cannot be seen in a fixture's output: a
 # volatile write has no reader, and an abandoned provenance walk only costs an
