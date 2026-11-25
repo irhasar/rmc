@@ -366,7 +366,15 @@ if command -v objdump >/dev/null 2>&1; then
             echo "[regression] t_volatile: $fn lost its fence" >&2
             fail=1
         fi
-        if printf '%s\n' "$d" | grep -qE "\b(paddb|paddd|movdqu)\b"; then
+        if printf '%s\n' "$d" | grep -qE "\b(paddb|paddd)\b"; then
+            echo "[regression] t_volatile: $fn was vectorized" >&2
+            fail=1
+        fi
+        # A plain copy of the read value may use 16-byte moves (the volatile
+        # accesses themselves are the `i64` loads counted above). Anything
+        # narrower than 32 bytes must not contain a vector move at all.
+        if [ "${3:-0}" != allow_vector_copy ] \
+            && printf '%s\n' "$d" | grep -qE "\bmovdqu\b"; then
             echo "[regression] t_volatile: $fn was vectorized" >&2
             fail=1
         fi
@@ -374,7 +382,7 @@ if command -v objdump >/dev/null 2>&1; then
     check_src_loads vol_discard_u8 1
     check_src_loads vol12_discard 3
     check_src_loads vol40_discard 5
-    check_src_loads vol256_discard 4
+    check_src_loads vol256_discard 4 allow_vector_copy
     check_src_loads vol512_discard 1
     # The source here is a local stack slot whose stores are visible: store
     # forwarding must not substitute them for the volatile reads.

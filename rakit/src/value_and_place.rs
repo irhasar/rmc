@@ -634,9 +634,23 @@ impl<'tcx> CPlace<'tcx> {
                             // through such a stack slot, so the difference is paid
                             // on each operation. Wider vectors (`__m256i` without
                             // AVX) have no single store, so they keep the memcpy.
-                            BackendRepr::SimdVector { .. } if dst_layout.size == Size::from_bytes(16) => {
-                                let val = from.load_scalar(fx);
-                                to_ptr.store(fx, val, flags);
+                            BackendRepr::SimdVector { .. }
+                                if dst_layout.size.bytes().is_multiple_of(16)
+                                    && dst_layout.size.bytes() <= 64 =>
+                            {
+                                // Copy 16 bytes per instruction. Wider vectors have no
+                                // single load/store on the x64 baseline, and
+                                // `emit_small_memory_copy` would split the copy into
+                                // `i64` pairs; a 32-byte `__m256i` round-trips through
+                                // such a slot on every operation.
+                                let from_addr = from_ptr.get_addr(fx);
+                                let to_addr = to_ptr.get_addr(fx);
+                                let mut offset = 0i32;
+                                while offset < i32::try_from(dst_layout.size.bytes()).unwrap() {
+                                    let val = fx.bcx.ins().load(types::I8X16, flags, from_addr, offset);
+                                    fx.bcx.ins().store(flags, val, to_addr, offset);
+                                    offset += 16;
+                                }
                                 return;
                             }
                             BackendRepr::SimdVector { .. } => {}

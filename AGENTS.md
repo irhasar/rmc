@@ -1,3 +1,80 @@
+## Session (2026-11-24, branch `rakit-exp12`) — lowering SIMD 256-bit (dua half 128-bit): ripgrep 7.7x -> 5.4x
+
+**Akar masalah (dari sesi sebelumnya):** rakit hanya menurunkan vektor 128-bit
+(`I8X16/I16X8/I32X4/I64X2`); `Type::by` tidak bisa membangun tipe 32 byte.
+Akibatnya `_mm256_*` di memchr/aho-corasick/regex diskalarisasi jadi salinan
+`i64` per 8 byte, sehingga kernel AVX2 jalan skalar.
+
+**Bug yang menghabiskan satu putaran:** `codegen_simd_intrinsic_call` meng-emit
+`jump` ke blok target **di akhir fungsi**. Arm baru saya melakukan `return`
+lebih awal, jadi blok IR kehilangan terminator dan Cranelift panik di
+`machinst/blockorder.rs:271` (`opcode.is_terminator`). Cara menemukannya yang
+cepat: jalankan dengan `RAKIT_ENABLE_VERIFIER=1` — verifier langsung menunjuk
+`block1: block does not end in a terminator instruction` beserta IR-nya, jauh
+lebih cepat daripada menebak lewat dump. Perbaikan: jangan pernah `return` dari
+dalam arm; pakai rantai `if/else if/else` supaya alur jatuh ke `jump` bersama.
+
+**Desain lowering (`src/intrinsics/simd.rs`):** nilai SIMD 32 byte diproses
+sebagai **dua half 16 byte** yang memakai ulang lowering 128-bit yang sudah ada
+(`simd_half_ty`, `simd_load_halves`, `simd_write_halves`). Cakupan: `simd_splat`,
+perbandingan integer (`simd_eq/ne/lt/le/gt/ge`), `simd_and/or/xor/add/sub`, dan
+`simd_bitmask`. Hasil ditulis langsung ke `ret` (bukan lewat
+`CValue::by_ref` + `write_cvalue`) agar tidak ada slot 32 byte tambahan per op.
+
+**Dua bug semantik yang tertangkap differential test (`/tmp/p_all256.rs`,
+i8x32/i16x16/i32x8/i64x4 vs LLVM):**
+1. `vhigh_bits` menghasilkan satu bit per lane, jadi tipe hasil per half harus
+   `ceil((lane_count/2)/8)` byte — bukan `lane_count/16` (yang jadi 0 byte untuk
+   i32x8/i64x4 dan `unwrap()` panik).
+2. `uextend` hanya boleh dikerjakan bila tipe half lebih sempit dari tipe hasil;
+   untuk i32x8/i64x4 keduanya `i8` dan `uextend.i8 i8` melanggar verifier.
+
+**Salinan 32 byte (`src/value_and_place.rs`):** cabang SIMD 16 byte yang sudah
+ada diperluas ke kelipatan 16 (<= 64 byte) sehingga salinan 32 byte jadi
+`2 x (load.i8x16 + store.i8x16)` alih-alih 4 load + 4 store `i64` lewat
+`emit_small_memory_copy`. Ini satu-satunya perubahan besar: kernel AVX2 murni
+9.394 -> **3.868 ms**.
+
+**Hasil terukur**
+- Kernel AVX2 murni (`_mm256_loadu/cmpeq/movemask`, 2 MB x 5): L 0.105 ms,
+  M 9.394 -> **3.868 ms** (jalur SSE2 M sendiri 2.78 ms).
+- `memchr::memchr` (2 MB x 5): L 0.199 ms, M 16.9 -> **5.087 ms**.
+- ripgrep 14.1.1 (clean build tiap rep, stdout hash `2297c3df` identik L/U/M):
+
+| backend | Cwall | Ccpu | Crss | size | Rwall | Rcpu | Rrss |
+|---|---|---|---|---|---|---|---|
+| L LLVM | 26030 ms | 82240 ms | 1018 MB | 30,490,856 | 400 ms | 270 ms | 9 MB |
+| U cg_clif | 9546 ms | 25930 ms | 890 MB | 35,356,496 | 4828 ms | 4720 ms | 17 MB |
+| M Rakit | 11350 ms | 32400 ms | 958 MB | 27,895,152 | **2145 ms** | 2030 ms | 13 MB |
+
+  M vs L: kompilasi 0.44x wall / 0.39x CPU, ukuran -8.5%, runtime **5.36x**
+  (sebelumnya 7.66x). M vs U: runtime **0.44x**.
+- Per-pencarian (median ms, L/M, M/L): literal `-F` 55.2/135.9 (2.46, dulu 6.01);
+  regex ber-capture 68.2/161.4 (2.37, dulu 6.04); `-i` alternation
+  176.5/1135.7 (6.43, dulu 8.06); multi-pattern 86.1/654.5 (7.60, dulu 10.99);
+  walk 5.1/9.8 (1.93). Total 391.1/2097.3 (**5.36x**, dulu 8.01x).
+- All-axes (CREPS=2 RREPS=7, semua baris `ok`): total M compile 1595 ms vs L
+  1877 (0.85x), run 417 vs 413 (1.01x), ukuran 61.49 MB vs 69.35 MB (-11.4%);
+  M/U run 0.16x. `p4_simd` 139 -> **85 ms** (M/L 1.52x) dan `p2_mem` 50 ms
+  (M/L 2.94x) ikut membaik dari perluasan salinan 16 byte.
+
+**Gate:** `./y.sh test --sysroot rakit` -> **65 suites / 25,368 passed / 0
+failed**; `bench/regressions.sh` -> `all fixtures passed` (satu-satunya
+penyesuaian: `vol256_discard` boleh memuat `movdqu` karena salinan nilai
+setelah baca volatile kini memakai move 16 byte — 4 load `i64` volatile dan
+`mfence` tetap diverifikasi); allaxes semua baris `ok`.
+
+**Sisa gap & langkah berikutnya:** M masih 5.4x di ripgrep. Penyebabnya bukan
+lagi penskalaran, melainkan **round-trip memori antar op**: setiap nilai 32 byte
+masih MIR temporary di stack, jadi tiap op = 2 load + 2 store. Untuk menutupnya
+perlu representasi **pasangan register** (dua `i8x16`) untuk nilai SIMD 32 byte
+— `CValue::by_val_pair`/`CPlaceInner::VarPair` sudah ada (dipakai u64/u128),
+jadi pekerjaannya adalah memperluas `analyze.rs::is_ssa` + semua arm
+`CPlaceInner` ke layout SIMD 32 byte. Alternatifnya lowering AVX2 native di
+`rakit-codegen` (di luar sesi ini). multi-pattern masih 7.6x karena
+aho-corasick memakai `_mm256_alignr_epi8`, `_mm256_permute2x128_si256`,
+`_mm256_extract_epi8` yang belum diturunkan (jatuh ke per-lane).
+
 ## Session (2026-11-24, branch `rakit-exp8`) — post-`addr_base`-fix all-axes scoreboard (L/U/M); remaining gap is all large
 
 Canonical matrix on the merged build: `cd bench && CREPS=2 RREPS=7 ./allaxes.sh`

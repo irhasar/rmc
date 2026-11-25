@@ -196,20 +196,6 @@ pub(crate) fn compile_fn(
     // top-tested shape; it then turns the remaining call-bound loops into
     // bottom-tested ones (one branch per iteration instead of a test plus a
     // back-jump).
-    let mut pipeline = rakit_opt::PassManager::new();
-    pipeline
-        .push(Box::new(rakit_opt::RecLoopPass))
-        .push(Box::new(rakit_opt::StoreForwardPass))
-        .push(Box::new(rakit_opt::DivTestPass))
-        .push(Box::new(rakit_opt::IfConvertPass))
-        .push(Box::new(rakit_opt::UnrollPass))
-        .push(Box::new(rakit_opt::RotatePass))
-        .push(Box::new(rakit_opt::SincosPass));
-    let mut analyses = rakit_opt::Analyses::new();
-    let mut pctx =
-        rakit_opt::PassCtx { ctx: &mut *context, module: &mut *module, analyses: &mut analyses };
-    pipeline.run(&mut pctx);
-
     #[cfg(false)]
     let _rakit_guard = {
         let isa = module.isa();
@@ -229,6 +215,20 @@ pub(crate) fn compile_fn(
             rakit
         })
     };
+
+    let mut pipeline = rakit_opt::PassManager::new();
+    pipeline
+        .push(Box::new(rakit_opt::RecLoopPass))
+        .push(Box::new(rakit_opt::StoreForwardPass))
+        .push(Box::new(rakit_opt::DivTestPass))
+        .push(Box::new(rakit_opt::IfConvertPass))
+        .push(Box::new(rakit_opt::UnrollPass))
+        .push(Box::new(rakit_opt::RotatePass))
+        .push(Box::new(rakit_opt::SincosPass));
+    let mut analyses = rakit_opt::Analyses::new();
+    let mut pctx =
+        rakit_opt::PassCtx { ctx: &mut *context, module: &mut *module, analyses: &mut analyses };
+    pipeline.run(&mut pctx);
 
     // Define function
     prof.generic_activity("define function").run(|| {
