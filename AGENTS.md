@@ -1,3 +1,770 @@
+## Session (2026-11-24, branch `rakit-exp12`) — store-forward address memoisation; write-once rule rejected
+## Session (2026-11-25, branch `rakit-exp12`) — review round 11: assert the diagnostic
+
+- **Bug:** every negative self-test only asked for a nonzero exit, so a checker
+  that cannot parse a minus sign at all "passed" them: `v2-8` becomes
+  "unparsable store address" and `stack_addr ss1-8` becomes "names no stack
+  slot" — both nonzero, neither the bug the dump encodes.
+- **Fix:** `vol_reject <dump> <fragment>` requires the rejection to *say* the
+  expected thing (`8-byte store at -8 leaves the 40-byte slot`,
+  `16-byte store at 32 leaves the 40-byte slot`,
+  `no fully written 40-byte object`) and reports "rejected ... for the wrong
+  reason" otherwise; `vol_accept` does the same for dumps that must pass. The
+  fragment carries the offset, so the assertion cannot be satisfied by a
+  parse failure.
+- **Verified both ways:** with `OFFSET` reduced to `(?:\+(\d+))?` the harness
+  now fails on both negative dumps with "for the wrong reason: unparsable store
+  address 'v2-8'" and "names no stack slot" (`fail=1`); with the real checker it
+  passes (`fail=0`). Harness-only change: no compiler or std rebuild.
+
+## Session (2026-11-25, branch `rakit-exp12`) — review round 10: negative offsets
+
+- **Bug:** the address regexes only knew `+`. A store to `v2-8` failed to match
+  and was dropped with `continue`, and `v2 = stack_addr.i64 ss1-8` was read as
+  `ss1+0` because `ADDR.match` is a prefix match. Either way a write *before*
+  the object vanished from the analysis, so a region whose remaining stores
+  covered the object passed.
+- **Fix:** one `OFFSET` fragment (`(?:([+-])\s*(\d+))?`) shared by both regexes,
+  decoded by `byte_offset`, with `ADDR` anchored so it cannot silently ignore a
+  tail. A store the checker cannot place (unparsable address, or a base that is
+  not a `stack_addr`) is now a hard error instead of being skipped: it refuses to
+  certify coverage it cannot see.
+- **Bounds are checked against the slot**, not the object, for every store in
+  every region — so an out-of-range store is caught even on a slot whose size
+  never enters the object comparison. Coverage is still measured against the
+  object size, which is now sound because no range can leave the slot.
+- **Pinned by two more self-tests:** `vol_neg` (five 8-byte stores covering the
+  40-byte object plus one at `v2-8`) and `vol_negaddr` (`stack_addr ss1-8`).
+  Both are accepted by the previous checker and rejected now
+  ("8-byte store at -8 leaves the 40-byte slot ss1"); dropping the `off < 0`
+  bound makes the harness print "accepts a store before the object" (`fail=1`).
+- The real `t_volatile_dead` dump still passes. Harness-only change: no compiler
+  or std rebuild.
+
+## Session (2026-11-25, branch `rakit-exp12`) — review round 9: a store that leaves the object
+
+- **Bug:** `covered()` only asked whether the union of stores *reaches* the
+  object size (`end >= size`), so a 16-byte store at offset 32 of a 40-byte slot
+  covered the tail while writing 8 bytes past it, and the regression passed.
+  Coverage is now bounded: any store with `off < 0` or `off + w > size` is
+  rejected outright ("16-byte store at 32 overruns the 40-byte object") instead
+  of being allowed to cover what it overruns.
+- **Pinned by a third self-test** (`vol_over`): four 8-byte stores plus one
+  16-byte store at 32. The pre-fix checker accepts it, the fixed one rejects it,
+  and the harness reports "volatile checker accepts a write past the object" if
+  the guard is removed — verified by sourcing the block with the guard deleted
+  (`fail=1`) and with it (`fail=0`).
+- The real `t_volatile_dead` dump still passes, so the stricter bound raises no
+  false positive. Harness-only change: no compiler or std rebuild.
+
+## Session (2026-11-25, branch `rakit-exp12`) — review round 8: the checks the harness silently lost
+
+- **Round 7 deleted the volatile IR check.** Rewriting the deep-cast block by
+  slicing from `check t_deep_cast_chain` to the AVX comment also removed the
+  whole volatile section that sat between them, so only `check t_volatile_dead
+  'written'` survived — and that output cannot see a missing store. Both blocks
+  are back and now live in one place, after the fixture list.
+- **`--emit=llvm-ir` cannot be used for dumps**: rakit never writes the `.ll`
+  rustc then copies, so that emit type always exits 1. New `RAKIT_DUMP=1`
+  produces the same `.unopt`/`.opt`/`.vcode` dumps from an ordinary compile that
+  exits 0 (`pretty_rakit::dump_ir_enabled`, also consulted by the AOT `codegen`
+  for the post-pass dump). Verified codegen-neutral: `.text`, `.rodata`,
+  `.data.rel.ro`, `.eh_frame`, `.symtab`, `.strtab` are byte-identical with and
+  without it; only `.note.gnu.build-id` differs.
+- **Neither IR check depends on `objdump` any more** (they only read compiler
+  output), and both now fail on a nonzero compile status instead of passing
+  silently. Proved by sourcing the two blocks with a `PATH` that has no
+  `objdump` (both pass) and with a fixture that does not compile (`fail=1`,
+  "compile failed" printed).
+- **`t_ptr_store_alias` is registered** (`check t_ptr_store_alias '7 0'`); it
+  was written but never run.
+- **Gate:** std rebuilt from scratch; 65 suites / 25,368 passed / 0 failed;
+  regressions pass; `allaxes` 45/45 `ok`, full matrix below (`L/U/M` per cell).
+
+| prog | Cwall | Ccpu | Crss | size | Rwall | Rcpu | Rrss |
+|---|---|---|---|---|---|---|---|
+| h_arith | 123ms/87ms/99ms | 148ms/116ms/127ms | 116.3M/118.0M/119.1M | 4,617,128/5,839,120/4,091,440 | 2ms/2ms/2ms | 2ms/2ms/2ms | 10.8M/11.1M/11.0M |
+| h_branch | 116ms/87ms/96ms | 143ms/116ms/124ms | 116.7M/117.9M/119.2M | 4,616,832/5,837,264/4,089,760 | 2ms/2ms/2ms | 2ms/2ms/2ms | 11.0M/10.8M/11.0M |
+| h_calls | 115ms/89ms/96ms | 139ms/115ms/126ms | 116.9M/118.4M/119.7M | 4,616,872/5,837,792/4,090,136 | 2ms/2ms/2ms | 2ms/2ms/2ms | 11.0M/10.9M/11.0M |
+| h_float | 125ms/88ms/97ms | 150ms/115ms/126ms | 115.6M/117.2M/118.7M | 4,637,984/5,861,024/4,130,328 | 2ms/3ms/2ms | 2ms/2ms/2ms | 11.0M/11.0M/11.1M |
+| h_mem | 264ms/133ms/165ms | 430ms/186ms/234ms | 135.9M/133.5M/135.6M | 4,646,856/5,959,856/4,179,440 | 3ms/10ms/4ms | 3ms/10ms/4ms | 10.7M/11.1M/11.0M |
+| h_simd | 142ms/96ms/109ms | 166ms/123ms/141ms | 122.4M/123.5M/124.5M | 4,617,704/5,843,736/4,093,864 | 2ms/4ms/2ms | 2ms/3ms/2ms | 10.7M/10.8M/11.1M |
+| p1_arith | 83ms/79ms/81ms | 102ms/101ms/104ms | 104.5M/106.9M/108.0M | 4,635,232/5,877,944/4,159,072 | 81ms/109ms/101ms | 81ms/108ms/100ms | 11.0M/10.9M/11.0M |
+| p2_mem | 244ms/126ms/155ms | 377ms/170ms/216ms | 132.0M/129.9M/131.8M | 4,639,896/5,936,144/4,156,944 | 16ms/154ms/42ms | 16ms/154ms/42ms | 11.1M/10.8M/11.0M |
+| p3_calls | 96ms/84ms/90ms | 119ms/114ms/118ms | 114.2M/115.4M/116.9M | 4,612,368/5,820,136/4,079,800 | 37ms/116ms/55ms | 36ms/117ms/55ms | 11.0M/11.0M/11.0M |
+| p4_simd | 106ms/92ms/101ms | 126ms/120ms/125ms | 114.9M/115.8M/117.6M | 4,636,096/5,892,376/4,165,696 | 55ms/155ms/83ms | 56ms/155ms/83ms | 48.2M/49.5M/48.8M |
+| p5_inline | 82ms/75ms/78ms | 102ms/98ms/102ms | 103.6M/105.5M/106.8M | 4,609,368/5,813,704/4,072,712 | 58ms/892ms/6ms | 58ms/892ms/6ms | 11.0M/10.8M/10.8M |
+| p6_scalar | 83ms/76ms/79ms | 99ms/97ms/100ms | 99.8M/101.9M/103.0M | 4,609,368/5,813,688/4,072,712 | 58ms/900ms/7ms | 57ms/898ms/6ms | 11.1M/11.0M/10.8M |
+| p7_branchy | 83ms/78ms/81ms | 102ms/100ms/102ms | 103.8M/105.6M/106.8M | 4,609,520/5,813,800/4,072,888 | 43ms/101ms/36ms | 43ms/101ms/35ms | 10.8M/11.1M/11.1M |
+| p8_minmax | 83ms/76ms/82ms | 102ms/99ms/105ms | 103.9M/105.5M/106.6M | 4,609,544/5,813,752/4,072,872 | 18ms/38ms/20ms | 17ms/38ms/20ms | 11.0M/10.8M/11.0M |
+| p9_u64f32 | 92ms/87ms/92ms | 110ms/108ms/116ms | 109.5M/111.6M/113.1M | 4,635,448/5,886,872/4,162,704 | 31ms/76ms/34ms | 31ms/76ms/34ms | 17.8M/18.8M/18.2M |
+
+## Session (2026-11-25, branch `rakit-exp12`) — review round 7: checker self-test, observable walk abandonment
+
+- **The volatile checker is now pinned from both sides.** Its two failure modes
+  are written into `bench/regressions.sh` as synthetic RAKIT dumps run through
+  the same checker: `vol_gap` (three 8-byte stores at 0/16/32 of a 40-byte slot,
+  which leave 16 bytes unwritten) must be rejected, and `vol_wide` (one 16-byte
+  store covering the 16-byte object) must be accepted. A width-blind checker
+  passes the first and fails the second, so the self-test catches both.
+- **Walk abandonment is now observable.** The output of `shared_paths` cannot
+  detect a truncated provenance walk — the pass leaves the function alone, which
+  is slower but still correct. Rebuilding the pass with `PROV_MAX_NODES = 4`
+  confirms it: the fixture still prints `127 127` while every walk bails. So the
+  pass reports it: `RAKIT_SF_DEBUG=1` now prints the per-function summary (the
+  same line `RAKIT_SF_TIME` produced) and `[sf] <func> provenance walk truncated`
+  when `analyze` gives up. The regression requires reports and no truncation for
+  `t_deep_cast_chain`; with the cap at 4 it fails on
+  `[sf] u0:4 provenance walk truncated`.
+- **Gate:** std rebuilt from scratch; `./y.sh test --sysroot rakit` → 65 suites /
+  25,368 passed / 0 failed; regressions pass (4 fixtures + the two self-tests);
+  `allaxes` 45/45 `ok`, full matrix below (`L/U/M` per cell).
+
+| prog | Cwall | Ccpu | Crss | size | Rwall | Rcpu | Rrss |
+|---|---|---|---|---|---|---|---|
+| h_arith | 121ms/93ms/101ms | 145ms/118ms/128ms | 116.5M/117.4M/119.4M | 4,617,128/5,839,120/4,091,440 | 2ms/2ms/2ms | 2ms/2ms/2ms | 11.1M/10.8M/11.0M |
+| h_branch | 120ms/91ms/98ms | 146ms/120ms/127ms | 117.0M/117.5M/119.3M | 4,616,832/5,837,264/4,089,760 | 2ms/2ms/2ms | 2ms/2ms/2ms | 10.8M/11.0M/10.9M |
+| h_calls | 119ms/92ms/103ms | 147ms/123ms/132ms | 117.0M/118.0M/119.7M | 4,616,872/5,837,792/4,090,136 | 2ms/3ms/2ms | 2ms/2ms/2ms | 11.0M/10.8M/10.8M |
+| h_float | 129ms/91ms/100ms | 159ms/120ms/129ms | 115.8M/116.9M/118.8M | 4,637,984/5,861,024/4,130,328 | 2ms/3ms/3ms | 2ms/2ms/2ms | 11.1M/11.0M/11.0M |
+| h_mem | 272ms/137ms/173ms | 443ms/188ms/244ms | 136.6M/133.4M/136.1M | 4,646,856/5,959,856/4,179,440 | 3ms/10ms/5ms | 3ms/10ms/4ms | 11.1M/11.1M/11.0M |
+| h_simd | 149ms/100ms/112ms | 173ms/130ms/144ms | 122.5M/123.5M/124.9M | 4,617,704/5,843,736/4,093,864 | 2ms/4ms/3ms | 2ms/3ms/2ms | 11.0M/11.0M/11.0M |
+| p1_arith | 87ms/84ms/84ms | 105ms/108ms/111ms | 104.6M/106.8M/108.4M | 4,635,232/5,877,944/4,159,072 | 82ms/109ms/101ms | 81ms/108ms/101ms | 11.0M/10.8M/10.7M |
+| p2_mem | 252ms/136ms/162ms | 388ms/182ms/225ms | 131.7M/129.7M/132.5M | 4,639,896/5,936,144/4,156,944 | 18ms/159ms/43ms | 17ms/159ms/44ms | 11.0M/10.8M/11.0M |
+| p3_calls | 101ms/87ms/94ms | 123ms/114ms/123ms | 114.3M/115.6M/116.9M | 4,612,368/5,820,136/4,079,800 | 37ms/118ms/56ms | 37ms/117ms/56ms | 11.0M/10.8M/10.8M |
+| p4_simd | 114ms/107ms/106ms | 141ms/136ms/131ms | 115.1M/115.9M/117.8M | 4,636,096/5,892,376/4,165,696 | 56ms/157ms/84ms | 55ms/156ms/84ms | 48.2M/49.5M/48.8M |
+| p5_inline | 83ms/78ms/80ms | 104ms/101ms/106ms | 103.6M/105.5M/107.1M | 4,609,368/5,813,704/4,072,712 | 59ms/895ms/7ms | 58ms/894ms/6ms | 10.8M/11.0M/11.0M |
+| p6_scalar | 84ms/79ms/82ms | 103ms/101ms/105ms | 100.0M/102.0M/103.1M | 4,609,368/5,813,688/4,072,712 | 58ms/901ms/7ms | 58ms/900ms/7ms | 11.0M/10.8M/11.0M |
+| p7_branchy | 87ms/79ms/82ms | 107ms/103ms/105ms | 103.8M/105.5M/106.9M | 4,609,520/5,813,800/4,072,888 | 44ms/101ms/36ms | 44ms/100ms/36ms | 11.0M/10.8M/11.0M |
+| p8_minmax | 88ms/82ms/82ms | 108ms/105ms/105ms | 104.0M/105.4M/107.1M | 4,609,544/5,813,752/4,072,872 | 18ms/39ms/21ms | 18ms/39ms/20ms | 11.0M/11.1M/11.0M |
+| p9_u64f32 | 99ms/94ms/97ms | 120ms/115ms/120ms | 109.6M/111.6M/113.2M | 4,635,448/5,886,872/4,162,704 | 31ms/77ms/34ms | 30ms/76ms/33ms | 17.8M/18.8M/18.2M |
+
+## Session (2026-11-25, branch `rakit-exp12`) — review round 6: width-aware volatile check, shared-path fixture
+
+- **The volatile check was width-blind.** It accepted stores at offsets 0, 16 and
+  32 of a 40-byte slot whatever their width — three 8-byte stores there leave 16
+  bytes unwritten — and rejected a single 16-byte store that covers the 16-byte
+  slot. It now derives each store's width from the stored value's type
+  (`load.i8x16` → 16, `load.i64` → 8, propagated through same-typed ops) and
+  requires the resulting ranges to tile `[0, size)` with no gap. Verified on
+  synthetic dumps: 8-byte stores at 0/16/32 of a 40-byte slot fail, one 16-byte
+  store for the 16-byte slot passes, and the real dump still passes.
+- **The shared-path fixture did not share anything.** The two `read_through` calls
+  each started their own chain, and the visited set is per query, so no walk met
+  `mid` twice. `t_deep_cast_chain` now has two functions: `deep_chain` (a slot
+  reachable only through a ten-step chain — the case that was miscompiled) and
+  `shared_paths` (one argument reaching `mid` both at the end of the long chain
+  and directly). Rebuilt the round-4 pass to confirm the split still reproduces
+  the bug: `deep_chain` printed `397020275139115` while `shared_paths` printed
+  `127`; LLVM and the current pass print `127 127`.
+- **Gate:** regressions pass (4 store-forward fixtures); `./y.sh test --sysroot
+  rakit` → 65 suites / 25,368 passed / 0 failed; `allaxes` 45/45 `ok`, full
+  matrix below (`L/U/M` per cell).
+
+| prog | Cwall | Ccpu | Crss | size | Rwall | Rcpu | Rrss |
+|---|---|---|---|---|---|---|---|
+| h_arith | 118ms/90ms/101ms | 143ms/117ms/129ms | 116.7M/118.1M/119.5M | 4,617,128/5,839,120/4,091,440 | 2ms/2ms/2ms | 2ms/2ms/2ms | 11.1M/11.1M/11.0M |
+| h_branch | 114ms/90ms/100ms | 139ms/120ms/130ms | 117.1M/118.2M/119.4M | 4,616,832/5,837,264/4,089,760 | 2ms/2ms/2ms | 2ms/2ms/2ms | 10.9M/11.1M/11.0M |
+| h_calls | 115ms/88ms/100ms | 140ms/118ms/128ms | 117.3M/118.5M/119.8M | 4,616,872/5,837,792/4,090,136 | 2ms/2ms/2ms | 2ms/2ms/2ms | 11.0M/11.0M/11.1M |
+| h_float | 124ms/89ms/102ms | 148ms/117ms/128ms | 116.2M/117.7M/119.1M | 4,637,984/5,861,024/4,130,328 | 2ms/3ms/2ms | 2ms/2ms/2ms | 10.8M/11.0M/11.0M |
+| h_mem | 270ms/135ms/167ms | 430ms/192ms/239ms | 136.1M/133.6M/136.3M | 4,646,856/5,959,856/4,179,440 | 3ms/9ms/4ms | 3ms/9ms/4ms | 11.1M/10.8M/11.1M |
+| h_simd | 140ms/97ms/110ms | 162ms/130ms/138ms | 122.6M/123.7M/125.1M | 4,617,704/5,843,736/4,093,864 | 2ms/4ms/2ms | 2ms/3ms/2ms | 11.0M/11.1M/10.8M |
+| p1_arith | 83ms/80ms/85ms | 101ms/100ms/108ms | 104.9M/107.1M/108.4M | 4,635,232/5,877,944/4,159,072 | 82ms/108ms/101ms | 82ms/108ms/100ms | 11.0M/11.0M/11.0M |
+| p2_mem | 251ms/136ms/171ms | 377ms/182ms/220ms | 132.5M/130.3M/132.4M | 4,639,896/5,936,144/4,156,944 | 16ms/158ms/42ms | 16ms/157ms/41ms | 10.9M/11.0M/11.0M |
+| p3_calls | 98ms/85ms/93ms | 121ms/111ms/120ms | 114.7M/115.6M/117.2M | 4,612,368/5,820,136/4,079,800 | 37ms/116ms/55ms | 36ms/116ms/55ms | 10.9M/11.0M/11.1M |
+| p4_simd | 106ms/94ms/104ms | 125ms/119ms/130ms | 115.2M/116.0M/117.6M | 4,636,096/5,892,376/4,165,696 | 55ms/157ms/85ms | 55ms/157ms/88ms | 48.2M/49.5M/48.8M |
+| p5_inline | 80ms/77ms/82ms | 100ms/100ms/105ms | 103.9M/105.7M/107.1M | 4,609,368/5,813,704/4,072,712 | 58ms/894ms/6ms | 57ms/893ms/6ms | 10.9M/10.9M/10.9M |
+| p6_scalar | 80ms/75ms/82ms | 98ms/97ms/103ms | 99.9M/102.0M/103.2M | 4,609,368/5,813,688/4,072,712 | 58ms/901ms/6ms | 57ms/901ms/6ms | 11.0M/11.0M/11.0M |
+| p7_branchy | 83ms/79ms/84ms | 102ms/101ms/110ms | 104.1M/105.8M/107.2M | 4,609,520/5,813,800/4,072,888 | 43ms/100ms/35ms | 43ms/100ms/35ms | 11.1M/10.9M/11.1M |
+| p8_minmax | 83ms/77ms/84ms | 101ms/99ms/106ms | 104.2M/105.5M/107.0M | 4,609,544/5,813,752/4,072,872 | 18ms/39ms/21ms | 17ms/38ms/21ms | 11.0M/11.0M/11.0M |
+| p9_u64f32 | 93ms/86ms/95ms | 112ms/109ms/119ms | 109.9M/111.6M/113.4M | 4,635,448/5,886,872/4,162,704 | 30ms/76ms/33ms | 30ms/75ms/33ms | 17.8M/18.9M/18.2M |
+
+## Session (2026-11-25, branch `rakit-exp12`) — review round 5: complete provenance walk, IR-based volatile check
+
+- **The provenance walk had a depth budget of eight nodes.** `collect_slots`
+  counted the `stack_addr` itself against the budget, so eight arithmetic
+  operations exhausted it before the slot was reached: the slot looked private
+  and `drop_dead_stores` deleted its initialization. `t_deep_cast_chain` (two
+  ten-step `^=`/`wrapping_add` chains over `&a as usize`, with a shared `mid`,
+  and `n` a runtime zero) printed `835192 835192` with the budgeted walk; LLVM
+  and the fixed pass print `127 127`. The walk is now an iterative worklist over
+  SSA definitions with a per-query `seen` set: no depth limit, each value visited
+  once, so a shared subexpression is recorded no matter which path reaches it
+  first.
+- **Truncation is now explicit.** `for_each_provenance_slot` returns `false`
+  when it exceeds `PROV_MAX_NODES` (4096, only reachable on pathological input).
+  `analyze` returns `None` then and `run_body` leaves the function untouched;
+  `drop_dead_stores` adds every private slot to `ptr_reads` for an incomplete
+  read walk. An incomplete set must never be read as "the unvisited slots are
+  absent".
+- **The volatile check no longer looks at machine code.** Counting stores in the
+  disassembly cannot distinguish the write from a register spill that lands at an
+  adjacent offset, so `runs` merged them and reported a missing write. The check
+  now reads the RAKIT dump: every store names its stack slot (the register
+  allocator runs later, so spills do not exist there) and `explicit_slot` gives
+  each object's size. Each fenced region must fully cover one object of the size
+  written there — starts at offset 0, reaches the last eight bytes, no gap wider
+  than a 16-byte store. Verified with one-write variants: only-40 fails
+  (`region 1: no fully written 16-byte object, stores per slot: {ss0(40B): [0, 16,
+  32]}`) and only-16 fails (`region 2: ... {}`).
+- **Gate:** std rebuilt from scratch (`rm -rf build/stdlib_target`); `./y.sh test
+  --sysroot rakit` → 65 suites / 25,368 passed / 0 failed; `bench/regressions.sh`
+  → all fixtures pass (4 store-forward fixtures now); `allaxes` 45/45 `ok`, full
+  matrix below (`L/U/M` per cell).
+
+| prog | Cwall | Ccpu | Crss | size | Rwall | Rcpu | Rrss |
+|---|---|---|---|---|---|---|---|
+| h_arith | 117ms/89ms/99ms | 141ms/117ms/130ms | 116.6M/118.2M/119.4M | 4,617,128/5,839,120/4,091,440 | 2ms/2ms/2ms | 2ms/2ms/2ms | 10.7M/11.0M/11.0M |
+| h_branch | 118ms/90ms/100ms | 141ms/118ms/128ms | 116.9M/118.9M/119.5M | 4,616,832/5,837,264/4,089,760 | 2ms/2ms/2ms | 2ms/2ms/2ms | 11.1M/11.1M/11.0M |
+| h_calls | 116ms/90ms/100ms | 141ms/118ms/128ms | 117.5M/118.5M/120.1M | 4,616,872/5,837,792/4,090,136 | 2ms/2ms/2ms | 2ms/2ms/2ms | 10.8M/10.8M/10.8M |
+| h_float | 126ms/94ms/102ms | 149ms/122ms/132ms | 116.0M/117.3M/119.0M | 4,637,984/5,861,024/4,130,328 | 2ms/3ms/2ms | 2ms/2ms/2ms | 10.8M/11.0M/11.1M |
+| h_mem | 270ms/134ms/170ms | 431ms/184ms/244ms | 136.5M/133.7M/136.3M | 4,646,856/5,959,856/4,179,440 | 3ms/10ms/4ms | 3ms/10ms/4ms | 10.9M/11.0M/11.0M |
+| h_simd | 141ms/97ms/111ms | 164ms/126ms/137ms | 122.5M/123.9M/125.3M | 4,617,704/5,843,736/4,093,864 | 2ms/4ms/2ms | 2ms/3ms/2ms | 11.0M/11.0M/11.0M |
+| p1_arith | 84ms/78ms/89ms | 103ms/100ms/108ms | 104.9M/107.1M/108.5M | 4,635,232/5,877,944/4,159,072 | 81ms/108ms/101ms | 81ms/108ms/100ms | 11.1M/11.0M/11.1M |
+| p2_mem | 240ms/130ms/158ms | 372ms/175ms/217ms | 132.4M/129.7M/132.3M | 4,639,896/5,936,144/4,156,944 | 17ms/158ms/42ms | 16ms/157ms/42ms | 11.1M/10.9M/11.0M |
+| p3_calls | 99ms/85ms/95ms | 121ms/111ms/124ms | 114.6M/115.6M/117.2M | 4,612,368/5,820,136/4,079,800 | 37ms/117ms/55ms | 37ms/116ms/55ms | 11.0M/10.8M/11.0M |
+| p4_simd | 107ms/93ms/105ms | 128ms/117ms/128ms | 115.3M/116.1M/117.9M | 4,636,096/5,892,376/4,165,696 | 56ms/157ms/84ms | 56ms/157ms/85ms | 48.2M/49.4M/48.8M |
+| p5_inline | 80ms/75ms/83ms | 100ms/101ms/108ms | 104.0M/105.7M/107.1M | 4,609,368/5,813,704/4,072,712 | 58ms/894ms/6ms | 57ms/893ms/6ms | 11.0M/11.0M/10.7M |
+| p6_scalar | 80ms/76ms/82ms | 98ms/98ms/104ms | 100.0M/102.0M/103.4M | 4,609,368/5,813,688/4,072,712 | 58ms/901ms/6ms | 58ms/900ms/6ms | 11.0M/11.0M/11.1M |
+| p7_branchy | 82ms/77ms/85ms | 100ms/98ms/108ms | 104.4M/105.7M/107.4M | 4,609,520/5,813,800/4,072,888 | 43ms/100ms/35ms | 42ms/100ms/35ms | 11.0M/11.1M/11.0M |
+| p8_minmax | 83ms/78ms/82ms | 101ms/99ms/105ms | 104.2M/105.7M/107.1M | 4,609,544/5,813,752/4,072,872 | 18ms/39ms/21ms | 17ms/38ms/21ms | 11.0M/11.1M/11.1M |
+| p9_u64f32 | 93ms/85ms/94ms | 113ms/107ms/117ms | 109.6M/111.7M/113.2M | 4,635,448/5,886,872/4,162,704 | 30ms/76ms/33ms | 30ms/76ms/34ms | 17.8M/18.8M/18.2M |
+
+## Session (2026-11-25, branch `rakit-exp12`) — review round 4: union provenance, destination-aware volatile check
+
+- **Provenance returned one slot, not all of them.** `provenance_rec` answered
+  with the *first* slot it found, so `low + addr(b)` — where `low` is a casted
+  offset computed from `a`'s address — was attributed to `a` alone. A call
+  receiving that sum can read either slot, but only `a` was marked escaping, so
+  `b` stayed private and its initialization was dropped. Fixture
+  `t_cast_offset` (`low = ((&a as usize as u8) & 7) as usize; p = (low +
+  &b as usize) as *const u64`) printed `1`, LLVM prints `127`; fixed prints
+  `127`. `for_each_provenance_slot` now walks the union over every operand of the
+  address arithmetic, and the escape analysis (argument uses, branch arguments,
+  untracked accesses) and `drop_dead_stores`'s `ptr_reads` consume the whole
+  set. The single-slot `provenance_slot` and its cache are gone; a per-query
+  `visited` set keeps the walk linear on diamond-shaped expression trees.
+  `prov`/`confined` stay single-slot because they are *proofs* (a missing entry
+  only makes invalidation more conservative).
+- **The volatile regression counted stores regardless of destination.** Any
+  store in a fenced region satisfied the byte sum, so a stray spill could cover
+  for a write that lost bytes. The check now builds `(region, base register)`
+  byte intervals from the disassembly, merges them into contiguous runs, and
+  requires a run of **exactly** 16 bytes in the first fenced region and one of
+  exactly 40 in the second. The fixture sources its values from `static`s in
+  `.rodata` so a region contains the write's copy rather than constant
+  materialization. Verified both ways: a fixture with only the 40-byte write
+  fails (`region 1: runs [40], want 16`) and one with only the 16-byte write
+  fails (`region 2: runs [], want 40`).
+- **Gate:** std rebuilt with the fixed pass; `./y.sh test --sysroot rakit` → 65
+  suites / 25,368 passed / 0 failed; `bench/regressions.sh` → all fixtures pass
+  (now 3 store-forward fixtures); `allaxes` 45/45 `ok` — full matrix below
+  (compile wall/CPU/RSS, artifact size, run wall/CPU/RSS; `L/U/M` per cell).
+
+| prog | Cwall | Ccpu | Crss | size | Rwall | Rcpu | Rrss |
+|---|---|---|---|---|---|---|---|
+| h_arith | 119ms/88ms/99ms | 142ms/116ms/126ms | 116.6M/118.3M/119.5M | 4,617,128/5,839,120/4,091,440 | 2ms/2ms/2ms | 2ms/2ms/2ms | 10.8M/10.8M/11.1M |
+| h_branch | 118ms/90ms/100ms | 141ms/122ms/130ms | 117.0M/118.3M/119.7M | 4,616,832/5,837,264/4,089,760 | 2ms/3ms/2ms | 2ms/2ms/2ms | 11.0M/11.0M/11.0M |
+| h_calls | 116ms/89ms/100ms | 142ms/120ms/129ms | 117.4M/118.6M/119.8M | 4,616,872/5,837,792/4,090,136 | 2ms/2ms/2ms | 2ms/2ms/2ms | 10.8M/11.1M/11.1M |
+| h_float | 126ms/92ms/102ms | 150ms/116ms/132ms | 115.8M/117.6M/118.9M | 4,637,984/5,861,024/4,130,328 | 2ms/3ms/2ms | 2ms/3ms/2ms | 11.0M/11.1M/11.1M |
+| h_mem | 268ms/133ms/173ms | 432ms/182ms/249ms | 136.3M/133.7M/136.2M | 4,646,856/5,959,856/4,179,440 | 3ms/10ms/4ms | 3ms/9ms/4ms | 11.0M/11.0M/11.0M |
+| h_simd | 143ms/97ms/110ms | 174ms/125ms/139ms | 122.7M/123.6M/125.1M | 4,617,704/5,843,736/4,093,864 | 2ms/4ms/2ms | 2ms/3ms/2ms | 11.0M/11.0M/11.0M |
+| p1_arith | 85ms/79ms/83ms | 103ms/103ms/106ms | 104.9M/107.1M/108.2M | 4,635,232/5,877,944/4,159,072 | 82ms/109ms/101ms | 81ms/108ms/101ms | 11.0M/10.6M/10.9M |
+| p2_mem | 248ms/133ms/159ms | 376ms/176ms/225ms | 132.5M/130.0M/132.4M | 4,639,896/5,936,144/4,156,944 | 17ms/158ms/43ms | 16ms/158ms/43ms | 11.1M/11.0M/10.8M |
+| p3_calls | 100ms/86ms/92ms | 119ms/114ms/120ms | 114.7M/115.6M/117.1M | 4,612,368/5,820,136/4,079,800 | 38ms/117ms/56ms | 37ms/116ms/55ms | 11.0M/10.8M/10.8M |
+| p4_simd | 108ms/94ms/102ms | 129ms/118ms/127ms | 115.2M/116.1M/117.8M | 4,636,096/5,892,376/4,165,696 | 56ms/157ms/84ms | 55ms/159ms/85ms | 48.1M/49.5M/48.8M |
+| p5_inline | 81ms/78ms/82ms | 101ms/100ms/108ms | 103.8M/105.6M/106.9M | 4,609,368/5,813,704/4,072,712 | 58ms/895ms/6ms | 57ms/895ms/6ms | 11.0M/11.0M/11.0M |
+| p6_scalar | 80ms/75ms/79ms | 100ms/97ms/100ms | 100.2M/102.0M/103.2M | 4,609,368/5,813,688/4,072,712 | 58ms/901ms/7ms | 57ms/900ms/6ms | 11.1M/11.0M/11.0M |
+| p7_branchy | 82ms/78ms/82ms | 100ms/101ms/106ms | 104.0M/105.8M/107.4M | 4,609,520/5,813,800/4,072,888 | 43ms/101ms/35ms | 43ms/101ms/35ms | 10.9M/11.0M/11.1M |
+| p8_minmax | 83ms/77ms/83ms | 101ms/101ms/105ms | 104.2M/105.7M/106.9M | 4,609,544/5,813,752/4,072,872 | 18ms/39ms/20ms | 18ms/38ms/20ms | 11.0M/10.7M/11.0M |
+| p9_u64f32 | 93ms/85ms/94ms | 113ms/108ms/118ms | 109.8M/111.7M/113.2M | 4,635,448/5,886,872/4,162,704 | 30ms/76ms/33ms | 30ms/77ms/33ms | 17.8M/18.9M/18.2M |
+
+## Session (2026-11-25, branch `rakit-exp12`) — review round 3: three store-forward miscompiles
+
+All three were reproduced with a fixture **before** the fix, using the
+previously built `dist/bin/rustc-rakit` (the `.so` is not part of cargo's
+fingerprint, so the old pass was still installed).
+
+- **Provenance stopped at `Binary`.** `provenance_rec` matched only
+  `InstructionData::Binary`, but `pure_address_arith` also accepts `uextend`,
+  `sextend`, `ireduce` and `bitcast`, which are *unary*. A cast of a
+  `stack_addr` therefore had no provenance, so handing it to a call did not mark
+  the slot as escaping (`!is_addr && !pure_address_arith(call)` was never
+  reached) and `drop_dead_stores` removed its initialization. Fixture
+  `t_cast_escape` smuggles the address as `f64` bits into a non-inlined reader:
+  pre-fix `1`, LLVM `127`, fixed `127`. The match now uses
+  `data.opcode()` + `arguments()`, i.e. every format the whitelist accepts.
+  This only ever *adds* escapes: `prov`/`confined` are unchanged, and
+  `drop_dead_stores` already treats an unknown base conservatively.
+- **Tracked-access test used the candidate pointer set.** `addr_only` was
+  filtered by `escaping_ptr` *after* the "is this access tracked?" loop, so a
+  pointer used both as a store address and as an operand of further address
+  arithmetic passed the test while `record_store` later classified the same
+  store as untracked — which keeps private-slot facts. A direct load after the
+  overwrite was forwarded the stale value. Fixture `t_ptr_store_alias`
+  (`*sa = 1; p = sa + off; *p = 7; q = p + 1; read *sa`): pre-fix `1 0`,
+  LLVM `7 0`, fixed `7 0`. The retain now happens before the loop.
+- **Fences were inconsistent between the two halves.** `forward_block` stops
+  recording stores after a `fence` (they may be volatile writes) but `transfer`
+  kept recording them, so a *successor* could forward a value the same block
+  refused to. `transfer` now seals as well.
+- **Harness**: `run_once` gained `err_path` so a caller comparing *results* can
+  keep stderr out of the capture (rgbench compares stdout, notes a stderr
+  difference); rgbench totals accumulate only for searches all three backends
+  completed and matched (they used to be summed inside the per-backend loop);
+  cratebench hashes a temp *file* rather than a shell variable, since
+  substitution strips trailing newlines and drops NUL bytes; the volatile-dead
+  regression now sums the bytes each fenced region stores (16 then 40) instead
+  of accepting "any store after a fence" — verified to fail on a fixture with
+  only the 16-byte write.
+
+**Gate:** std rebuilt with the fixed pass (`rm -rf build/stdlib_target` first —
+the .so is not in cargo's fingerprint); `./y.sh test --sysroot rakit` → 65
+suites / 25,368 passed / 0 failed; `bench/regressions.sh` → all fixtures pass;
+`allaxes` 45/45 `ok`, artifact sizes byte-identical, compile wall/CPU within
+noise, run wall within ±1 ms (p8 21→20, p2 42→41).
+
+## Session (2026-11-24, branch `rakit-exp12`) — review round 2: shared-temp trust, proof strength
+
+**Findings that were already fixed by the previous commit are marked ✓; the rest
+are this round's work.**
+
+- **CWE-377 in `bench/rgbench.sh`** (not fixed before, only partly). The default
+  `SRC=/tmp/rg/ripgrep-14.1.1` was a *predictable* path in a shared `/tmp`, and the
+  mode check passed for a tree another user owns but did not make world-writable.
+  The tree is **built**, so its build scripts run as the benchmark user. Now: no
+  `src-dir` argument ⇒ a fresh `mktemp -d` (0700) removed on exit; an explicit
+  `src-dir` is used only when `-O` (owned by us), not a symlink, and neither it
+  nor its parent is group/other writable. Download goes to a temp file before
+  unpacking (`curl -fsSL -o`) instead of `curl | tar`. Missing LLVM `rustc` is
+  reported instead of silently building nothing.
+- **✓ `RUSTC="rustc +toolchain"`**: already used `rustup which --toolchain`.
+- **✓ rgbench failed searches / predictable captures / missing CPU+RSS**: already
+  fixed (exit 0/1 accepted, `mkdtemp`, cpu/rss columns, nonzero exit on mismatch).
+- **✓ `extbench/cratebench.sh`** SRC validation, `mkdir -p "$OUTDIR"`, stale
+  captures, `OK[]` stage gate: already fixed. **New:** the untimed capture ran
+  inside a pipeline, so the status checked was `md5sum`'s — a failed workload
+  still produced a hash. Both capture paths keep the workload's own status, and a
+  compile-only run says "not compared" instead of `INCOMPLETE`.
+- **✓ `extbench/gen_corpus.sh`**: it probed `d0/f1.txt` for ownership, but `f1`
+  lands in `d1` (`d$((i % 20))`), so the marker never existed and regeneration
+  always refused. Now a `.gen_corpus` marker is written and checked.
+- **✓ `extbench/drivers/rg_work.sh`**: `set -euo pipefail` already propagates
+  `rg --files` failure through `wc`.
+- **✓ SIMD gating** (`simd_half_ty` size==32 + `simd_vectors_supported` + even
+  lane count + real 16-byte vector half; mask-shape match; wide copy limited to
+  `Arch::X86_64 | Arch::AArch64`). AArch64 keeps NEON baseline `I8X16`, so it is
+  safe there; riscv64/s390x fall back to the scalar paths.
+- **✓ RISC-V `-c`**: `has_zca`/`has_zcd` are plain bools (`has_c` is the preset),
+  so the explicit `set(..., "false")` does take effect.
+- **Regression proof strength** (`bench/regressions.sh`). `check_src_loads`
+  counted `mov[a-z]*` off the volatile source, so `movdqu (%rdi)` satisfied the
+  load count and the `vol256` case proved nothing: scalar mnemonics only, and any
+  SSE move of the source is now a failure. `vol_stack_discard` pooled five reads
+  with the copy tail (the tail reads the *staging* copy at `0x70(%rsp)`, not the
+  source slot), so an exact count could hide a missing read; it now requires five
+  **consecutive** 8-byte stack loads. New `t_isa_avx2` block: `+avx2` and `+fma`
+  must emit VEX (`vpxor`/`vmovdqu`/`vpad*`) while the baseline build must not —
+  the only way to observe that a flag reached the ISA builder. `t_volatile_dead`
+  also writes 40 bytes (16+16+8 stores after the fence), the shape
+  `memcpy_inline` creates, which is the finding that pass was suspected of.
+
+**Gate:** `bench/regressions.sh` → all fixtures pass (with the tightened counters
+and the new ISA block); no compiler source changed this round, so the previously
+recorded `./y.sh test` (65 suites / 25,368 / 0) and `allaxes` matrix still hold.
+
+## Session (2026-11-24, branch `rakit-exp12`) — three real miscompiles fixed, harness audit
+
+**Three confirmed miscompiles, each reproduced before the fix and pinned by a
+new fixture (`bench/tests/`, run by `bench/regressions.sh`).**
+
+1. **Overlapping `ptr::copy` (`src/common.rs`).** `emit_const_copy`'s vector-chunk
+   path stored each 16-byte chunk as soon as it loaded it, so `ptr::copy(buf,
+   buf+1, 32)` copied chunk 0 twice (`t_copy_overlap`, 32/48/64-byte sizes both
+   directions). The chunk path now requires `non_overlapping`; `ptr::copy` keeps
+   `emit_small_memory_copy`, which loads every chunk before storing any.
+2. **Volatile write elided (`rakit-opt/.../store_forward.rs`).** Rakit has no
+   volatile bit: `volatile_store` lowers to `fence` + ordinary stores, and a
+   16-byte write's `memcpy` is inlined into two vector stores. `drop_dead_stores`
+   kept a store only when some load read its bytes, so a volatile write into a
+   local array that nothing reads was **deleted** (IR: `fence` then nothing).
+   Stores after a fence in the same block are now kept and also never recorded
+   as forwardable facts (`sealed`), because forwarding the only reader would
+   delete the write just the same. `t_volatile_dead` asserts the fixture's IR
+   dump still has a store after the `fence`.
+3. **SIMD mask width (`src/intrinsics/simd.rs`).** The comparison fast paths
+   filled the mask with one vector compare of the *input* lanes, but Rust's
+   comparison intrinsics take the mask lane type separately:
+   `simd_eq::<i32, i8, 8>` wrote 32 bytes of lanes into an 8-byte result and
+   `simd_lt::<i32, i64, 8>` read 32 bytes out of a 64-byte one (`t_simd_mask`
+   printed garbage, then wild values). Both paths now require the result's lane
+   count and lane size to match the input. `simd_half_ty` also returned a
+   non-vector / 8-byte "half" for padded and `i128`-lane layouts, and the split
+   paths plus the wide vector copy emitted `I8X16` on targets whose backend
+   cannot lower it (riscv64/s390x); both are now gated on 128-bit vector support
+   (`Arch::X86_64 | Arch::AArch64`).
+
+**ISA feature mapping (`src/lib.rs`).** `-Ctarget-feature=+avx2` was applied
+without the implied `+avx`, and Cranelift gates every VEX/EVEX encoding on
+`has_avx`, so `+avx2` silently kept the SSE2 lowering. The AVX family now
+widens to `has_avx` (AVX-512 to `has_avx2` as well), `internal_target_features`
+is consulted too, the VNNI setting is spelled `has_avx_vnni`, and RISC-V `-c`
+clears `has_zca`/`has_zcd` instead of failing on the preset name. Verified:
+baseline binary 0 VEX ops, `+avx2` binary 9 (`vpxor`/`vmovdqu`).
+
+**Harness audit (`bench/rgbench.sh`, `extbench/*`).** rgbench counted a failed
+search as a valid one (three empty captures compare equal, so a missing corpus
+printed `ok` with garbage timings), wrote its captures to predictable `/tmp`
+names, reported no run CPU/RSS, and exited 0 on a mismatch; it now checks the
+exit status, uses a private `mktemp -d`, reports run CPU/RSS, exits nonzero on
+failure, and only trusts an existing checkout that is ripgrep 14.1.1 and not
+group/world writable. `cratebench.sh` now creates `OUTDIR`, drops stale
+captures, fails the capture itself, and requires all three backends to have
+built+run+captured before comparing. `gen_corpus.sh` refuses to `rm -rf` a
+directory it did not generate; `rg_work.sh` uses `pipefail`.
+
+**Gate:** `./y.sh test --sysroot rakit` → 65 suites / **25,368 passed / 0
+failed** (exit 0); `bench/regressions.sh` → all fixtures pass (3 new);
+`bench/allaxes.sh CREPS=3 RREPS=9` → 45/45 rows `ok`, byte-identical output.
+
+| prog | Cwall L/M | size L/M | Rwall L/M |
+|---|---|---|---|
+| p1_arith | 86/**86** | 4.64/**4.16** MB | 81/**101** |
+| p2_mem | 240/**168** | 4.64/**4.16** | 16/**42** |
+| p3_calls | 97/**92** | 4.61/**4.08** | 37/**56** |
+| p4_simd | 105/**100** | 4.64/**4.17** | 55/**84** |
+| p5_inline | 81/**78** | 4.61/**4.07** | 58/**6** |
+| p6_scalar | 81/**79** | 4.61/**4.07** | 58/**6** |
+| p7_branchy | 83/**80** | 4.61/**4.07** | 43/**35** |
+| p8_minmax | 82/**81** | 4.61/**4.07** | 18/**21** |
+| p9_u64f32 | 95/**93** | 4.64/**4.16** | 30/**34** |
+
+No row regressed against the previous session. Runtime parity is still open on
+p1/p2/p3/p4/p8/p9; the vectorizer lives in `vendor/rakit-codegen/src/vectorize.rs`
+(one canonical 4-lane `I32X4` map loop, lanes taken from the loads) and rejects
+p4's `c[i] = (a[i].to_bits() ^ b[i].to_bits()) * K` because the loads are `f32`
+and the store is `u32` — the cheapest remaining runtime lever, worth ~25% of
+p4, and still short of LLVM.
+
+
+**What landed.** `provenance_slot` and `const_upper_bound` are mutually
+recursive walks over the address graph, and `analyze`/`cross_block_entry`/
+`drop_dead_stores` re-ask the same questions for every operand of every
+load/store. Both are now memoised per function in a thread-local
+`AddrCache`, cleared at the top of `run_body` (the cache key is a `Value`, so
+it must not survive a function boundary). Reuse is sound at any depth: a cached
+`Some` is a proof that does not depend on the budget, and a cached `None` only
+makes the pass more conservative.
+
+**Measured: neutral.** `p2_mem` compile 157.9/154.1 ms before vs 156.1/156.0 ms
+after (`measure.py --reps 9`, two rounds each); store-forward's own
+`RAKIT_SF_TIME` totals stay ~30 ms of which `analyze` is ~7 ms. The pass is
+allocation-bound, not recursion-bound, so the memoisation removes work without
+moving wall time. Kept because it makes the walk linear instead of re-deriving
+subterms, and it costs nothing.
+
+**Rejected: a "slot stored exactly once" fact** (`Bases::single`, a store
+counted per key, then per slot, used as a fact for any load the store block
+dominates — the case the must-analysis cannot reach across a loop back edge).
+It kept the AVX2 needle broadcast in a register (visible in the disassembly)
+but was **runtime-neutral on all 15 all-axes programs** (p1–p9 + h_*: every row
+within noise, e.g. p2 43/42 ms, p4 85/84 ms, p5 7/6 ms). It also caused two
+miscompiles before the soundness holes were closed, so it was removed rather
+than kept as a knob:
+
+1. Counting stores *per key* is wrong: a slot's bytes can be written through two
+   different keys (direct slot access vs derived pointer, or two types of the
+   same size). Fixed by counting per slot.
+2. Counting only stores with a resolvable (`prov`) base is wrong: a store at a
+   **dynamic** offset has no `prov` entry (the offset cannot be bounded) yet
+   still writes the slot. Repro `u16::extract_bits` (alloctests/coretests
+   `num::u16::test_extract_bits`): `prepare()` fills `[u16; 4]` through
+   `iadd(stack_addr, 2*stage)`, the array init is one static store, so the slot
+   looked write-once and a later `load.i64` of the whole array was replaced with
+   `iconst 0`. Fix: attribute such stores with `provenance_slot` (offset-blind).
+
+Repro programs kept in the notes: `[usize; N] -> VecDeque` (`deq.len()` read
+back as 0) and the `extract_bits` snippet; both must print the LLVM output.
+
+**Gate:** `./y.sh test --sysroot rakit` → 65 suites / 25,368 passed / 0 failed
+(run three times, twice with the rejected rule in place, once after removal).
+
+**All-axes, final tree** (`bench/allaxes.sh`, `CREPS=3 RREPS=9`; L/U/M,
+compile wall ms / artifact bytes / run wall ms, all stdout `ok`):
+
+| prog | Cwall L/U/M | size L/U/M | Rwall L/U/M |
+|---|---|---|---|
+| p1_arith | 83/76/**79** | 4.64/5.88/**4.16** MB | 81/108/**103** |
+| p2_mem | 242/126/**153** | 4.64/5.94/**4.16** | 17/154/**42** |
+| p3_calls | 98/84/**88** | 4.61/5.82/**4.08** | 37/116/**55** |
+| p4_simd | 106/92/**97** | 4.64/5.89/**4.16** | 55/157/**85** |
+| p5_inline | 79/74/**76** | 4.61/5.81/**4.07** | 58/894/**6** |
+| p6_scalar | 82/75/**77** | 4.61/5.81/**4.07** | 58/903/**6** |
+| p7_branchy | 85/77/**78** | 4.61/5.81/**4.07** | 43/100/**35** |
+| p8_minmax | 82/76/**78** | 4.61/5.81/**4.07** | 19/38/**20** |
+| p9_u64f32 | 92/85/**91** | 4.64/5.89/**4.16** | 30/76/**34** |
+| h_mem | 262/134/**164** | 4.65/5.96/**4.18** | 3/9/**4** |
+
+So M still wins compile wall vs **L** on all 15 programs and artifact size vs
+both, but loses compile wall to **U** everywhere (U has no rakit passes; ours
+cost ~25–30 ms of a ~155 ms p2_mem compile, store forwarding alone ~33 ms on its
+largest CGU). Runtime: M wins p5/p6 (~9.5x) and p7 (35 vs 43), ties p8 (20 vs
+19), loses p1/p2/p3/p4/p9.
+
+**Dead end confirmed (do not retry): the vendored vectorizer cannot fire on
+these loops.** `RAKIT_NO_VECTORIZE=1` produces a **byte-identical** binary for
+`p4_simd` (4,164,952 B both ways) and the same runtime (83.6 vs 82.8 ms), and it
+also does nothing for a pure `u32` elementwise loop over `Vec`s. `match_header`
+requires a straight-line body chain, so the bounds-check `brif` + cold panic
+block that every `a[i]` produces makes it bail. A real vectorization win needs
+bounds-check elimination first (the two length loads are not CSE'd — see the
+2026-11-22 note), not more matcher patterns.
+
+## Session (2026-11-24, branch `rakit-exp12`) — store forwarding through derived stack pointers (AVX2 −85%)
+
+**Root cause of the remaining 256-bit SIMD gap.** The two-half lowering makes
+every 32-byte `__m256i` a 64-byte stack slot, and rakit reaches its halves
+through an *over-aligned derived pointer*:
+
+    v76 = stack_addr ss8
+    v281 = isub(32, band(v76, 31))     ; "over-align to 32"
+    v81 = iadd(v76, v281)
+    store v82, v81 ; store v83, v81+16
+
+`store_forward::analyze` treated **any** non-address use of a stack address as
+an escape, and `band`/`isub`/`iadd` are non-address uses, so *every* 32-byte slot
+looked like it escaped. Nothing was private, nothing was forwarded, and each
+Teddy-style iteration kept ~28 slot round-trips (8 loads + 20 stores of 16 B).
+
+**Fixes (all in `rakit-opt/src/passes/store_forward.rs`):**
+- `pure_address_arith` + `provenance_slot`: integer arithmetic on an address
+  (`iadd`/`isub`/`imul`/`band`/`bor`/`bxor`/extends/reduce/`bitcast`) does not
+  leak it out of the function, so the slot stays private. A use in a call, a
+  store value, a `select` or a return still marks it as escaping.
+- Anything the pass cannot attribute to a slot (`provenance_slot` == None) but
+  that is derived from one — a phi, a `select`, an untracked load/store — makes
+  the slot non-private again. Without this, DSE deletes a store that a load
+  through a phi reads (this was a real miscompile: `regex-syntax`
+  `analysis_captures_len` failed 2 != 3).
+- `Confined` + `const_upper_bound`: two pointer bases provably inside
+  *different* stack slots cannot alias, so a store through one keeps the other's
+  facts. The displacement is bounded with `band(x, M) <= M`, which is what makes
+  `isub(32, band(sa, 31))` analysable. A fact is only trusted while
+  `bound + offset + size <= slot size`.
+- `prov: Base -> StackSlot`: bases of the *same* slot may alias (their offsets
+  are relative to different displacements), so a store through one kills the
+  other's facts.
+- `drop_dead_stores` now also removes stores through derived pointers (when the
+  slot has no reads at all) and counts derived-pointer loads as reading the whole
+  slot, because their offsets are not comparable with a direct slot offset.
+
+**Measured** (`/tmp/kern.rs`, AVX2 vs SSE2 byte count, 2 MB × 5):
+| build | avx2 | sse2 |
+|---|---|---|
+| LLVM | 0.13 ms | 1.09 ms |
+| Rakit, passes off | 6.5–7.6 ms | 5.4–8.7 ms |
+| Rakit, before this change | 2.3 ms | 1.24 ms |
+| Rakit, after | **0.78 ms** | **1.25 ms** |
+
+ripgrep 14.1.1 (`bench/rgbench.sh`): total run **2102 → 1726 ms** (M/L 5.39× →
+**4.47×**), all five search shapes byte-identical, compile 10030 ms / 28219408 B.
+
+**Gate:** `./y.sh test --sysroot rakit` → 65 suites / 25,368 passed / 0 failed;
+`bench/regressions.sh` clean; `bench/allaxes.sh` p1–p9 + h_* all `ok`.
+
+**Rejected:** a second (`LateStoreForwardPass`) run after the block-shape passes.
+It costs 2.5% compile (155.7 → 151.9 ms on `p2_mem`) and is neutral at runtime on
+p1–p9 and on the AVX2 kernel, so it was removed.
+
+**Gotcha:** `func.name.to_string()` is `u0:12`, not the mangled symbol, so
+`RAKIT_SF_SKIP=<mangled>` never matches.
+
+## Session (2026-11-24, branch `rakit-exp12`) — small constant copies: vector chunks, `size_of` fold, `memcpy` pass
+
+**Where the 256-bit SIMD gap actually lives.** After the M4.17 two-half
+lowering, the AVX2 byte-count kernel was still 3.9 ms vs LLVM 0.11 ms for the
+same 32 bytes/iteration. Dumping the IR (`--emit=llvm-ir` writes `<out>.rakit/`)
+showed three separate copies per `_mm256_loadu_si256`:
+
+1. `_mm256_loadu_si256` is `#[inline]`, so it is instantiated in the *user*
+   CGU and inlined, but its body is `mem::zeroed()` + `copy_nonoverlapping(src
+   as *const u8, dst as *mut u8, size_of::<__m256i>())`.
+2. `size_of::<__m256i>()` stayed a **call** (MIR keeps it for cross-crate
+   `#[inline]` bodies), so `const_of(count)` in the copy lowering returned
+   `None` and the copy became a `%Memcpy` **libcall**.
+3. `copy_nonoverlapping` had **no arm at all** in `codegen_regular_intrinsic_call`
+   (only `sym::copy` did), so even a constant count fell through to a libcall.
+
+**Fixes (commit `89c6302`):**
+- `common::emit_const_copy` — constant-size copy in 16-byte `I8X16` chunks (up
+  to 64 B) instead of `i64` pairs; used by the `CopyNonOverlapping` statement
+  and by `sym::copy | sym::copy_nonoverlapping` (the latter now also uses
+  `call_memcpy`, not `call_memmove`).
+- `base::const_mem_fn_value` — folds a call to `core::mem::size_of`/`align_of`
+  into an `iconst`. **Gotchas:** guard with `DefKind::Fn` (closures have no
+  `item_name` and `item_name` panics), and do **not** use `def_path_str` in a
+  pass — it trips `trimmed_def_paths`/`must_produce_diag` and ICEs. Check
+  `crate_name == core` + parent module name instead.
+- New `rakit-opt` pass `memcpy_inline` (first in the pipeline, before
+  `store_forward`): rewrites `%Memcpy(dst, src, k)` with `k % 16 == 0 && k <= 64`
+  into load/store pairs. Needed because the inliner copies
+  `copy_nonoverlapping`'s body into the caller with a constant count but the
+  libcall inside that body is already emitted.
+
+**Measured:** AVX2 kernel 3.87 → 3.11 ms, SSE2 3.36 → 1.59 ms (LLVM 0.11 /
+1.22). `p4_simd` M 83 ms (L 55, U 157). Full suite 65 suites / 25,368 passed /
+0 failed; all-axes 15 programs × 3 backends all `ok`, stdout identical to LLVM.
+
+**Still open on the AVX2 kernel (3.11 vs 0.11 ms):** every `__m256i` value
+round-trips a 32-byte stack slot with the over-alignment trick
+(`stack_addr; band 31; isub; iadd`), because Cranelift has no 256-bit type and
+`CPlace` must be `ByRef`. The address arithmetic is hoisted to the preheader,
+but each op still does 2 loads + 2 stores. Closing it needs 32-byte SIMD locals
+kept in two `I8X16` variables — a `CPlace`/`analyze` change, not a lowering one.
+Note this is *not* where ripgrep's remaining gap is (memchr is ~5 ms of a
+~2.1 s run).
+
+**Negative result — do not retry naively: forwarding the over-aligned slots.**
+Taught `store_forward` an `AlignedSlot(slot, shift)` base so a store through
+`iadd(stack_addr(s), shift)` forwards to a load through the *same* derived
+pointer, plus `analyze`/DSE conservatism for the unknown shift. Result: the
+AVX2 kernel got **worse** (3.11 → 4.7 ms) and the function gained loads
+(16 → 25). Making the slot private pulls it into the pass's fact machinery,
+where the new "same slot, unknown shift ⇒ always invalidate" rule destroys
+plain-slot facts that used to survive, while the aligned store/load pairs
+mostly *don't* match (rakit recomputes the idiom per access, so the `shift`
+values differ). Reverted. If retried, first canonicalise the idiom so every
+access to a slot shares one derived pointer value.
+
+**ripgrep re-measured after the copy work** (`bench/rgbench.sh`, 41 deps):
+compile M 9805 ms wall / 32.4 s cpu / 390 MB RSS / 28.2 MB binary vs L 23110 /
+83.5 s / 409 MB / 30.5 MB and U 8529 / 26.6 s / 378 MB / 35.4 MB. Runtime total
+M 2102 ms vs L 390 (**5.39x**, unchanged from 5.35x — the copy fix targets
+`p2_mem`-shaped code, not Teddy). All five search shapes byte-identical.
+`rgbench.sh` had to stop passing `RUSTC="rustc +toolchain"`: cargo wants a bare
+executable, so the LLVM column now uses `rustup which --toolchain ... rustc`.
+
+**Generalised the copy inlining (LANDED):** `%Memcpy` was only inlined for
+sizes that are a multiple of 16, so 40/56/72-byte aggregate copies — which is
+what `Option<Vec>` and `RawTableInner` bookkeeping actually copy — stayed
+libcalls. `chunk_plan` now splits any constant size ≤128 into 16-byte chunks plus
+an 8/4/2/1 tail. p2_mem 46.8 → **41.2 ms (−12%)**, 23 of 35 memcpy call sites
+gone, `p3_calls` neutral. The `t_volatile` regression checks had to be made
+precise: they counted *all* stack loads and banned `movdqu` outright, so a
+vectorised **plain** copy (which their own comment allows) tripped them; they now
+count only 64-bit moves and reject a wide load from the volatile source itself.
+
+**Two more attempts at the same slot, both neutral or worse (measured):**
+
+1. *Restricted* `AlignedSlot`: only slots with **no** direct `stack_addr` access
+   may use the derived-pointer key space (so no plain fact can be shadowed).
+   Still **worse**: kernel 3.1 → 5.0 ms and the pass stopped forwarding
+   altogether (`load` 16 → 25, equal to `RAKIT_NO_STORE_FWD=1`). Reason found
+   afterwards: the over-align idiom is `iadd(sa, isub(K, band(sa, K-1)))`, so
+   `sa`'s *first* use is `band`, which marks the slot escaping before the `iadd`
+   rule ever applies — the slot never becomes private, and re-keying its
+   accesses away from `Ptr` destroyed the forwarding that already worked.
+2. *`may_alias` relaxation*: keep `Ptr` keys (which is what already forwards
+   these accesses) and only stop invalidating when two pointer bases are derived
+   from **different** slots. Sound, but the IR is byte-identical to the
+   baseline (`load` 16, `store` 24) and the kernel time is unchanged — i.e. the
+   pass was already extracting everything available here.
+
+Conclusion: 32-byte SIMD code is at the limit of what a store/load pass can do;
+the remaining ~12 vector memory ops per operation need 32-byte locals kept in
+two `I8X16` variables (`CPlace`/`analyze`), which is the real next project.
+
+**Harness:** `bench/rgbench.sh [src-dir] [corpus-dir]` rebuilds the matrix
+(downloads ripgrep 14.1.1 if absent, three `CARGO_TARGET_DIR`s, compile axes via
+`measure.py`, five search shapes with stdout equality).
+
+**ripgrep matrix reproduced this session** (`ripgrep 14.1.1`, 2000-file / 40 MB
+corpus, M/L): literal 2.42×, captures 2.28×, `-i` alternation **6.51×**,
+multi-pattern `-F x4` **7.44×**, `--files` 1.75×, total **5.35×** (M 2076 ms,
+L 388 ms, U 4695 ms). The two worst are regex-automata's Teddy prefilter, which
+is the AVX2 path above — so closing the 32-byte SIMD slot round-trip is what
+moves ripgrep, not the byte-copy lowering.
+
+**Push status:** `GITHUB_TOKEN` and `OH_GIT_CREDENTIAL_ACCESS_TOKEN_GITHUB` are
+both rejected for `irhasar/rmc` (403 / invalid token). Commit `89c6302` is local
+only; push with a user-supplied `repo`-scoped PAT.
+
+## Session (2026-11-24, branch `rakit-exp12`) — lowering SIMD 256-bit (dua half 128-bit): ripgrep 7.7x -> 5.4x
+
+**Akar masalah (dari sesi sebelumnya):** rakit hanya menurunkan vektor 128-bit
+(`I8X16/I16X8/I32X4/I64X2`); `Type::by` tidak bisa membangun tipe 32 byte.
+Akibatnya `_mm256_*` di memchr/aho-corasick/regex diskalarisasi jadi salinan
+`i64` per 8 byte, sehingga kernel AVX2 jalan skalar.
+
+**Bug yang menghabiskan satu putaran:** `codegen_simd_intrinsic_call` meng-emit
+`jump` ke blok target **di akhir fungsi**. Arm baru saya melakukan `return`
+lebih awal, jadi blok IR kehilangan terminator dan Cranelift panik di
+`machinst/blockorder.rs:271` (`opcode.is_terminator`). Cara menemukannya yang
+cepat: jalankan dengan `RAKIT_ENABLE_VERIFIER=1` — verifier langsung menunjuk
+`block1: block does not end in a terminator instruction` beserta IR-nya, jauh
+lebih cepat daripada menebak lewat dump. Perbaikan: jangan pernah `return` dari
+dalam arm; pakai rantai `if/else if/else` supaya alur jatuh ke `jump` bersama.
+
+**Desain lowering (`src/intrinsics/simd.rs`):** nilai SIMD 32 byte diproses
+sebagai **dua half 16 byte** yang memakai ulang lowering 128-bit yang sudah ada
+(`simd_half_ty`, `simd_load_halves`, `simd_write_halves`). Cakupan: `simd_splat`,
+perbandingan integer (`simd_eq/ne/lt/le/gt/ge`), `simd_and/or/xor/add/sub`, dan
+`simd_bitmask`. Hasil ditulis langsung ke `ret` (bukan lewat
+`CValue::by_ref` + `write_cvalue`) agar tidak ada slot 32 byte tambahan per op.
+
+**Dua bug semantik yang tertangkap differential test (`/tmp/p_all256.rs`,
+i8x32/i16x16/i32x8/i64x4 vs LLVM):**
+1. `vhigh_bits` menghasilkan satu bit per lane, jadi tipe hasil per half harus
+   `ceil((lane_count/2)/8)` byte — bukan `lane_count/16` (yang jadi 0 byte untuk
+   i32x8/i64x4 dan `unwrap()` panik).
+2. `uextend` hanya boleh dikerjakan bila tipe half lebih sempit dari tipe hasil;
+   untuk i32x8/i64x4 keduanya `i8` dan `uextend.i8 i8` melanggar verifier.
+
+**Salinan 32 byte (`src/value_and_place.rs`):** cabang SIMD 16 byte yang sudah
+ada diperluas ke kelipatan 16 (<= 64 byte) sehingga salinan 32 byte jadi
+`2 x (load.i8x16 + store.i8x16)` alih-alih 4 load + 4 store `i64` lewat
+`emit_small_memory_copy`. Ini satu-satunya perubahan besar: kernel AVX2 murni
+9.394 -> **3.868 ms**.
+
+**Hasil terukur**
+- Kernel AVX2 murni (`_mm256_loadu/cmpeq/movemask`, 2 MB x 5): L 0.105 ms,
+  M 9.394 -> **3.868 ms** (jalur SSE2 M sendiri 2.78 ms).
+- `memchr::memchr` (2 MB x 5): L 0.199 ms, M 16.9 -> **5.087 ms**.
+- ripgrep 14.1.1 (clean build tiap rep, stdout hash `2297c3df` identik L/U/M):
+
+| backend | Cwall | Ccpu | Crss | size | Rwall | Rcpu | Rrss |
+|---|---|---|---|---|---|---|---|
+| L LLVM | 26030 ms | 82240 ms | 1018 MB | 30,490,856 | 400 ms | 270 ms | 9 MB |
+| U cg_clif | 9546 ms | 25930 ms | 890 MB | 35,356,496 | 4828 ms | 4720 ms | 17 MB |
+| M Rakit | 11350 ms | 32400 ms | 958 MB | 27,895,152 | **2145 ms** | 2030 ms | 13 MB |
+
+  M vs L: kompilasi 0.44x wall / 0.39x CPU, ukuran -8.5%, runtime **5.36x**
+  (sebelumnya 7.66x). M vs U: runtime **0.44x**.
+- Per-pencarian (median ms, L/M, M/L): literal `-F` 55.2/135.9 (2.46, dulu 6.01);
+  regex ber-capture 68.2/161.4 (2.37, dulu 6.04); `-i` alternation
+  176.5/1135.7 (6.43, dulu 8.06); multi-pattern 86.1/654.5 (7.60, dulu 10.99);
+  walk 5.1/9.8 (1.93). Total 391.1/2097.3 (**5.36x**, dulu 8.01x).
+- All-axes (CREPS=2 RREPS=7, semua baris `ok`): total M compile 1595 ms vs L
+  1877 (0.85x), run 417 vs 413 (1.01x), ukuran 61.49 MB vs 69.35 MB (-11.4%);
+  M/U run 0.16x. `p4_simd` 139 -> **85 ms** (M/L 1.52x) dan `p2_mem` 50 ms
+  (M/L 2.94x) ikut membaik dari perluasan salinan 16 byte.
+
+**Gate:** `./y.sh test --sysroot rakit` -> **65 suites / 25,368 passed / 0
+failed**; `bench/regressions.sh` -> `all fixtures passed` (satu-satunya
+penyesuaian: `vol256_discard` boleh memuat `movdqu` karena salinan nilai
+setelah baca volatile kini memakai move 16 byte — 4 load `i64` volatile dan
+`mfence` tetap diverifikasi); allaxes semua baris `ok`.
+
+**Sisa gap & langkah berikutnya:** M masih 5.4x di ripgrep. Penyebabnya bukan
+lagi penskalaran, melainkan **round-trip memori antar op**: setiap nilai 32 byte
+masih MIR temporary di stack, jadi tiap op = 2 load + 2 store. Untuk menutupnya
+perlu representasi **pasangan register** (dua `i8x16`) untuk nilai SIMD 32 byte
+— `CValue::by_val_pair`/`CPlaceInner::VarPair` sudah ada (dipakai u64/u128),
+jadi pekerjaannya adalah memperluas `analyze.rs::is_ssa` + semua arm
+`CPlaceInner` ke layout SIMD 32 byte. Alternatifnya lowering AVX2 native di
+`rakit-codegen` (di luar sesi ini). multi-pattern masih 7.6x karena
+aho-corasick memakai `_mm256_alignr_epi8`, `_mm256_permute2x128_si256`,
+`_mm256_extract_epi8` yang belum diturunkan (jatuh ke per-lane).
+
 ## Session (2026-11-24, branch `rakit-exp8`) — post-`addr_base`-fix all-axes scoreboard (L/U/M); remaining gap is all large
 
 Canonical matrix on the merged build: `cd bench && CREPS=2 RREPS=7 ./allaxes.sh`
@@ -241,6 +1008,436 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
     runtime coverage is not skipped when no disassembler is present. Known miss (correct, scalar): a bound that the
     egraph rematerializes into the header (e.g. `n & mask`) is not hoisted, so
     that loop is not vectorized.
+  - **M3.3 LANDED: combine ops xor/add/sub (optional `* K`).** The matcher now
+    accepts `c[i] = (a[i] {^,+,-} b[i]) [* K]`, not just `xor * K`; operand order
+    is preserved for `sub`. Lowers to `pxor`/`paddd`/`psubd` (+ optional
+    `pmuludq`). `l3_bw` (`wrapping_add`) **143.7 → 89.8 ms** (LLVM 57.3; was
+    2.5×, now 1.57×). New `t_vectorize_ops` (add+sub in one address-taken
+    `fn ops2`) asserts `paddd` and `psubd` **inside `ops2`**; wired into
+    `regressions.sh` (and kept out of the `pmuludq`-presence loop, which only
+    applies to multiply shapes). Gate: suite **65 / 25,368 / 0**; allaxes ok.
+  - **M3.4 LANDED: f32 and i64 lanes.** The matcher is generic over element type
+    via `enum Lanes { U32, I64, F32 }` (`vec()`/`shift()`/`size()`/`per_vec()`):
+    u32 xor/add/sub [*K] → `I32X4`; i64 xor/add/sub → `I64X2`; f32
+    add/sub/mul/div → `F32X4`. `per_vec` is 4 for 32-bit lanes and **2 for i64**,
+    so the step and the `i + per_vec <= n` gate adapt; the overflow guard uses
+    `n < u64::MAX/size`. `* K` stays u32-only (only `pmuludq` exists). New
+    `t_vectorize_f32` (add+mul; n=1000/999/5/2/0) and `t_vectorize_i64` (add;
+    n=1000/999/3/1/0) in address-taken fns; `regressions.sh` asserts
+    `addps`/`mulps` in `f32ops` and `paddq` in `i64ops`. Probes: f32 add/mul and
+    i64 add all match LLVM; `l3_*` checksums unchanged; ktime ~25.5 ms.
+  - **M3.5 LANDED: f64 lanes + single-source constant patterns.** A `Rhs` enum
+    (`Mem` / `IntConst` / `FConst`) lets the store value be
+    `combine(loadA, const)` as well as two-source. f64 lanes (`F64X2`, per_vec 2,
+    add/sub/mul/div). Integer single-source: u32 `a*K` (`pmuludq`), and
+    u32/i64 add/sub/xor with K; float single-source: f32/f64 `*K`, `+K`, `-K`,
+    `/K` (const on the right; commutative ops accept either side). Float
+    constants are read via `InstructionData::UnaryIeee32/64` bits
+    (`fconst_bits`). The disjointness guard now checks C against **every** `Mem`
+    source. New `t_vectorize_f64` (add+mul; n=1000/999/5/1/0) and
+    `t_vectorize_const` (u32*K, i64+K, f32*K, f32-K in one address-taken fn);
+    `regressions.sh` asserts `addpd`/`mulpd` in `f64ops` and
+    `pmuludq`/`paddq`/`mulps`/`subps` in `constops`. Probes: f64 add, u32*K,
+    f32*K, f32-K, i64+K all L==M; `l3_*` unchanged; ktime ~25 ms.
+  - **M3.6 LANDED: integer sum reductions.** New `match_reduction` /
+    `apply_reduction` in `vectorize.rs` handle `acc = init; for i in 0..n
+    { acc += a[i] }` for **u32/i64** (float sums excluded — vector order would
+    change rounding and break bit-exactness). The vector accumulator starts at
+    identity 0 (`splat(0)`); a `RED` block horizontally sums it via a 16-byte
+    stack slot and adds `init` **once**, so `n < per_vec` yields exactly `init`,
+    then jumps the original header `H(i, acc)`, which runs the scalar tail and
+    exit unchanged. Strict shape: 2 header params, 1 load, 0 stores, no
+    calls/traps, and `acc`/load each used exactly once by `acc2` with `acc2` only
+    as the back-edge arg. `bwsum` (4M×20 u32): **98.4 → 44.0 ms** (LLVM 12.9;
+    7.6× → 3.4×). New `t_vectorize_sum` (u32 `paddd` / u64 `paddq`,
+    n=1000/999/5/3/1/0); `regressions.sh` asserts both.
+  - **M3.7 LANDED: bitwise and/or + non-zero loop start.** Map ops extended with
+    `band`/`bor` (u32/i64, two-source and const) → `pand`/`por`. Both the map and
+    the reduction path now accept **any** loop start (not just 0): the guard /
+    vector entry passes the real `init`, so `for i in s..n` vectorizes from `s`
+    and the scalar tail covers `[s + k*per_vec, n)`; `s == n` is empty. New
+    `t_vectorize_bitops` (and/or, n=1000/999/5/2/0) and `t_vectorize_start`
+    (map + sum, s=0/1/3/5/1000); `regressions.sh` asserts `pand`/`por` in
+    `bandfn`/`borfn` and `pmuludq`/`paddd` in `startmul`/`startsum`.
+  - **M3.8 LANDED: loop-invariant scalar broadcast.** `Rhs::Scalar(Value)` lets
+    `c[i] = a[i] OP s` vectorize when `s` is a loop-invariant scalar (defined
+    outside the loop, same type as the element) for every existing lane/op
+    (`pmuludq`/`paddd`/`mulps`/…). The disjointness guard ignores scalars (only
+    memory sources count). New `t_vectorize_scalar` (u32 `*k`, u32 `+k`, f32
+    `*k`; n=1000/999/5/2/0); `regressions.sh` asserts `pmuludq`/`paddd`/`mulps`.
+  - **u8/u16 lanes: deferred in M3.8, then LANDED in M4.0 (below).** Plain `a[i]` on `&[u8]`/`&[u16]`
+    lowers to **narrow** `uload8`/`sload16` loads and `istore8`/`istore16`
+    stores, which the matcher rejects (it requires exact `Load`/`Store`).
+    Supporting them needs widening/narrow load-store handling. The
+    `Lanes::U8/U16` experiment did not fire and was reverted (no effect).
+  - **M3.9 LANDED: two-source u32 multiply.** `c[i] = a[i] * b[i]` (and
+    `(a[i]*b[i])*K`) now vectorize: when `imul`'s operands are both loads the
+    matcher takes the two-source path with `op = Imul` → `pmuludq` (one
+    `imul.i32x4` lowers to 2 `pmuludq`). New `t_vectorize_mul2` (`mul2`,
+    `mul2k`; n=1000/999/5/2/0); `regressions.sh` asserts `pmuludq` in both.
+  - **M4.0 LANDED: u8/u16 lanes.** `Lanes::U8`/`U16` (`I8X16`/`I16X8`, shift
+    0/1, size 1/2, per_vec 16/8) for exact ops {add, sub, xor, and, or} →
+    `paddb`/`psubb`/`pxor`/`pand`/`por`/`paddw`/`psubw`. Two extra addressing
+    forms were required and added to `scaled_of`: `base + i` with **no** `ishl`
+    (byte, shift 0) and `base + (i + i)` == `i*2` (word). Constant and min/max
+    for u8/u16 stay out (no `iconst.i8` path / SSE4.1 needed). New
+    `t_vectorize_u8u16` (10 fns, n=1000/999/17/15/1/0); `regressions.sh`
+    asserts the seven SSE2 ops.
+  - **Environment (important):** the sandbox repeatedly wiped `$HOME` and
+    `/tmp` (toolchain + probes vanished mid-run). The toolchain now lives in
+    `/workspace/.rustup` + `/workspace/.cargo` (survives resets; export
+    `RUSTUP_HOME`/`CARGO_HOME`/`PATH` accordingly) and throwaway probes live in
+    `bench/out/probe` (inside the repo, not `/tmp`).
+  - **M4.1 LANDED: multi-block body matcher + u8/i16 min/max.** `match_header`
+    now follows a straight-line body chain `b → b2 → … → h` (`body_chain`): each
+    block has one predecessor (the previous chain block, or `h`), no block
+    params, and ends in an argument-less `jump`; loads/stores are gathered across
+    the chain and `defined_outside_chain` treats every chain block as inside. The
+    false edge must not also return to `h`. This unlocks `std` min/max, whose body
+    is split (loads in block1, op+store in block2). u8 unsigned min/max →
+    `pminub`/`pmaxub`, i16 signed min/max → `pminsw`/`pmaxsw` (SSE2-safe; signed
+    byte and unsigned word min/max need SSE4.1 and stay out). New
+    `t_vectorize_minmax` (n=1000/999/17/15/1/0); `regressions.sh` asserts the four
+    ops.
+  - **M4.2 LANDED: u8/u16 constant operands.** `(Rhs::IntConst, U8|U16)` is now
+    allowed, so `c[i] = a[i] OP K` for `+ ^ & |` becomes `paddb`/`pxor`/`pand`/
+    `por`/`paddw` (splat of `iconst.i8`/`i16` lowers fine; no multiply/min/max).
+    New `t_vectorize_narrow_const` (8 fns, n=1000/999/17/15/1/0); regressions
+    asserts `paddb`/`pxor`/`pand`/`por`/`paddw`.
+  - **M4.3 LANDED: vector shifts (ICE fixed in vendored Cranelift).** The x64
+    lowering's `mask_xmm_shift` fallback calls `lo_gpr`, which panics on a vector
+    (XMM/Float-class) amount. Added an ISLE rule in `isa/x64/lower.isle`
+    (`(rule 2 (mask_xmm_shift ty (splat _ (iconst _ n))) (RegMemImm.Imm
+    (shift_amount_masked ty n)))`) so a splat-constant amount takes the immediate
+    path. The vectorizer now allows constant shifts (amount < lane width): u32
+    `Ishl`/`Ushr`/`Sshr` and i64 `Ishl`/`Ushr` → `pslld`/`psrld`/`psrad`/
+    `psllq`/`psrlq`. New `t_vectorize_shift` (n=1000/999/17/15/1/0); regressions
+    asserts the five ops.
+  - **M4.4 LANDED: uniform (runtime) shift amounts.** Added a second ISLE rule
+    (`(rule 1 (mask_xmm_shift ty (splat _ x)) (gpr_to_reg (x64_and $I64 (lo_gpr x)
+    (RegMemImm.Imm (shift_mask ty)))))`) so a splat of a *value* uses the scalar
+    lane as the masked count; the more specific splat-`iconst` rule keeps priority
+    2 (a general rule at higher priority is rejected by ISLE). The vectorizer now
+    accepts `Rhs::Scalar` for shifts, so `c[i] = a[i] << s` with loop-invariant
+    `s` vectorizes: u32 → `pslld`/`psrld`/`psrad`, u64 → `psllq`. New
+    `t_vectorize_shift_var` (s = 0/3/31/7/5/2, incl. width-1 masking);
+    regressions asserts the four ops.
+  - **M4.5 LANDED: in-place map vectorization.** When the destination base equals
+    every source base (same index expression, already required by the matcher),
+    the overlap guard is skipped: `srcs.is_empty()` jumps straight to the vector
+    header. Unlocks `a[i] = a[i] OP ...`: u32 add -> `paddd`, xor -> `pxor`,
+    two-source `a[i] += b[i]` -> `paddd` (guard still emitted for `b`), f32
+    `a[i] *= 2.0` -> `mulps`. New `t_vectorize_inplace`
+    (n=1000/999/17/15/1/0); regressions asserts the four ops.
+  - **M4.16 LANDED: partial IR dumps are attributable and rejected.**
+    `write_ir_file` logged `error writing ir file: <err>` with no file name, so
+    a partial write left a non-empty, truncated dump that satisfied `-s` and a
+    warning the scoped grep could not attribute. The warning now names the file
+    (`error writing ir file <path>: <err>`), and the gate adds a completeness
+    check: a complete dump ends with the function's closing brace, so
+    `tail -1 "$dump" != "}"` fails. Checked: positive passes; truncating a dump
+    with no log line fails; a named write error fails.
+    **Full all-axes matrix** (CREPS=2 RREPS=7; compile = wall ms / cpu ms /
+    peak RSS MB / bytes, run = wall ms / cpu ms / peak RSS MB):
+
+    | prog | C L | C U | C M | R L | R U | R M | ΔR M |
+    |---|---|---|---|---|---|---|---|
+    | h_arith | 122/147/118.2/4617128 | 95/122/119.6/5839120 | 110/139/120.7/4079048 | 2/2/11.0 | 2/2/11.1 | 2/2/11.0 | +0.0% |
+    | h_branch | 125/150/118.7/4616832 | 97/128/119.5/5837264 | 109/138/120.5/4077368 | 2/2/10.8 | 2/2/11.1 | 2/2/11.1 | +0.0% |
+    | h_calls | 131/157/119.2/4616872 | 95/126/119.8/5837792 | 110/141/120.6/4077744 | 2/2/11.0 | 3/2/11.0 | 3/2/11.1 | +50.0% |
+    | h_float | 138/162/117.2/4637984 | 101/128/118.8/5861024 | 118/144/119.8/4118544 | 2/2/11.1 | 3/2/11.0 | 3/2/11.1 | +0.0% |
+    | h_mem | 275/446/138.3/4646856 | 141/194/134.8/5959856 | 180/251/137.1/4166664 | 3/3/10.8 | 10/10/11.0 | 5/5/10.7 | +0.0% |
+    | h_simd | 154/179/124.2/4617704 | 101/130/124.7/5843736 | 122/153/125.8/4081456 | 2/2/11.0 | 4/4/10.8 | 3/2/11.0 | +50.0% |
+    | p1_arith | 87/107/106.2/4635232 | 85/108/108.1/5877944 | 94/118/109.0/4146472 | 82/81/11.1 | 109/108/10.8 | 103/103/11.0 | +0.0% |
+    | p2_mem | 267/412/134.4/4639896 | 137/185/131.1/5936144 | 170/228/133.2/4143848 | 18/17/11.1 | 158/156/11.1 | 51/51/11.1 | +2.0% |
+    | p3_calls | 102/125/116.1/4612368 | 90/118/116.8/5820136 | 103/131/117.7/4067424 | 37/37/10.8 | 117/116/11.0 | 57/57/11.1 | +0.0% |
+    | p4_simd | 111/132/116.8/4636096 | 96/121/117.2/5892376 | 120/143/118.6/4153096 | 57/56/48.2 | 161/161/49.4 | 87/86/48.8 | +1.2% |
+    | p5_inline | 86/106/105.3/4609368 | 80/104/106.9/5813704 | 92/118/107.8/4060320 | 58/57/11.1 | 895/895/11.0 | 7/6/11.0 | +0.0% |
+    | p6_scalar | 85/103/101.6/4609368 | 80/103/103.1/5813688 | 93/116/104.2/4060320 | 58/57/11.0 | 905/905/11.0 | 7/6/11.1 | +0.0% |
+    | p7_branchy | 93/109/105.8/4609520 | 81/104/106.9/5813800 | 91/115/107.9/4060496 | 43/43/11.1 | 101/100/11.1 | 35/35/11.1 | -2.8% |
+    | p8_minmax | 87/107/105.4/4609544 | 80/102/106.6/5813752 | 91/115/107.7/4060464 | 18/18/11.1 | 39/39/11.0 | 21/20/11.1 | +0.0% |
+    | p9_u64f32 | 98/118/111.2/4635448 | 89/112/112.9/5886872 | 102/126/114.2/4150120 | 31/32/17.8 | 77/77/18.8 | 34/35/18.2 | -2.9% |
+    | **TOTAL** | 1961/2560/1738.6/69350216 | 1448/1885/1746.8/87847208 | 1705/2176/1764.8/61503384 | 415/411/209.0 | 2586/2579/211.2 | 420/414/210.5 | |
+
+    M vs L: compile **0.87x**, size **-11.3%**, run **1.01x**; M vs U: compile
+    1.18x, size -30.0%, run **0.16x**. Suite 65/25368/0; regressions green;
+    allaxes 15/15 ok, no INVALID.
+  - **M4.15 LANDED: the IR-dump gate rejects empty dumps.**
+    `-f` accepted a zero-byte file, and `write_ir_file` only *warns* when a
+    write fails, so a failed dump could still satisfy the gate. It now requires
+    `-s` (non-empty) for `vol512_discard.opt.rakit` and
+    `vol_stack_discard.opt.rakit`, and fails on any `error writing ir file`
+    line that names one of them (other functions legitimately hit
+    `File name too long`, so the match is scoped to the fixture names).
+    Checked: positive passes; truncating a dump or appending a scoped write
+    error both fail the gate. Test-only change.
+  - **M4.14 LANDED: the IR-dump gate really checks the dumps.**
+    The previous edit left only the `panicked` grep: the per-function check was
+    dropped, so a run that exited without a panic but wrote no IR still passed.
+    `regressions.sh` now requires `vol_ir.rakit/vol512_discard.opt.rakit` and
+    `vol_ir.rakit/vol_stack_discard.opt.rakit` at top level (lines 287-309, i.e.
+    before the `objdump` guard at 314, since the gate disassembles nothing).
+    Negative check: deleting one dump makes the gate report
+    `--emit=llvm-ir produced no dump for vol512_discard` and fail; with both
+    present it passes. Test-only change, no compiler code touched (suite and
+    allaxes results from M4.13 still stand).
+  - **M4.13 LANDED: IR-dump gate + fence consistency in store_forward.**
+    (a) The `--emit=llvm-ir` gate sat inside the `objdump` guard even though it
+    disassembles nothing, and it only checked that `<out>.rakit/` existed — a
+    directory `write_ir_file` creates before writing any function. It now runs
+    outside the guard and requires `vol512_discard.opt.rakit` and
+    `vol_stack_discard.opt.rakit` specifically.
+    (b) `store_forward`'s cross-block dataflow decoded a fence as a plain
+    `Clobber` (which keeps stack facts) while `forward_block` cleared them, so
+    the two paths disagreed. New `SfEvent::Fence` clears the map in `transfer`
+    as well; the trapping-load guard was already protecting volatile reads.
+    Gate: suite 65/25368/0; regressions green; allaxes 15/15 ok.
+    **Full all-axes matrix** (CREPS=2 RREPS=7; compile = wall ms / cpu ms /
+    peak RSS MB / bytes, run = wall ms / cpu ms / peak RSS MB):
+
+    | prog | C L | C U | C M | R L | R U | R M | ΔR M |
+    |---|---|---|---|---|---|---|---|
+    | h_arith | 122/147/118.2/4617128 | 94/122/119.3/5839120 | 108/138/120.4/4079048 | 2/2/11.1 | 2/2/11.0 | 2/2/11.0 | +0.0% |
+    | h_branch | 123/149/118.7/4616832 | 94/124/119.6/5837264 | 110/140/120.4/4077368 | 2/2/11.1 | 3/3/11.0 | 2/2/11.1 | +0.0% |
+    | h_calls | 125/151/119.0/4616872 | 95/126/119.8/5837792 | 108/138/120.7/4077744 | 2/2/11.1 | 3/2/11.0 | 2/2/10.8 | +0.0% |
+    | h_float | 141/166/117.5/4637984 | 97/125/118.7/5861024 | 111/140/119.7/4118544 | 2/2/11.0 | 3/3/11.0 | 3/2/11.1 | +50.0% |
+    | h_mem | 278/449/137.8/4646856 | 143/196/134.9/5959856 | 181/251/137.1/4166664 | 3/3/11.1 | 10/10/11.0 | 5/4/11.0 | +0.0% |
+    | h_simd | 146/171/124.3/4617704 | 102/132/125.0/5843736 | 115/144/125.8/4081456 | 2/2/11.1 | 4/3/10.8 | 2/2/11.1 | -33.3% |
+    | p1_arith | 88/108/106.2/4635232 | 81/103/108.0/5877944 | 91/115/108.9/4146472 | 82/81/11.0 | 109/108/11.0 | 103/103/11.1 | +0.0% |
+    | p2_mem | 262/397/133.2/4639896 | 131/175/130.9/5936144 | 165/223/132.6/4143848 | 17/16/11.1 | 158/158/11.0 | 50/51/10.8 | +2.0% |
+    | p3_calls | 102/124/116.1/4612368 | 91/118/116.6/5820136 | 102/128/117.8/4067424 | 38/37/11.0 | 117/117/11.1 | 57/57/11.0 | -1.7% |
+    | p4_simd | 112/133/116.8/4636096 | 101/125/117.1/5892376 | 111/136/118.5/4153096 | 57/57/48.2 | 165/164/49.5 | 86/85/48.8 | +1.2% |
+    | p5_inline | 83/103/105.2/4609368 | 79/104/106.9/5813704 | 90/115/107.8/4060320 | 58/58/11.0 | 897/896/10.9 | 7/6/11.0 | +0.0% |
+    | p6_scalar | 82/101/101.7/4609368 | 79/100/103.0/5813688 | 89/112/103.9/4060320 | 58/57/11.0 | 906/905/10.8 | 7/6/11.1 | +0.0% |
+    | p7_branchy | 83/102/105.7/4609520 | 79/102/106.9/5813800 | 91/114/108.0/4060496 | 43/43/11.0 | 101/100/11.0 | 36/36/11.1 | +0.0% |
+    | p8_minmax | 84/103/105.5/4609544 | 80/102/106.7/5813752 | 89/112/107.9/4060464 | 18/18/11.1 | 41/41/11.0 | 21/21/11.0 | +0.0% |
+    | p9_u64f32 | 95/113/111.1/4635448 | 87/111/112.8/5886872 | 101/126/113.9/4150120 | 30/30/17.6 | 77/77/18.9 | 35/36/18.2 | +0.0% |
+    | **TOTAL** | 1926/2517/1737.0/69350216 | 1433/1865/1746.2/87847208 | 1662/2132/1763.4/61503384 | 414/410/209.5 | 2596/2589/211.0 | 418/415/210.2 | |
+
+    M vs L: compile **0.86x**, size **-11.3%**, run **1.01x**; M vs U: compile
+    1.16x, size -30.0%, run **0.16x**.
+  - **M4.12 LANDED: IR-comment panic, store forwarding of volatile reads.**
+    (a) `--emit=llvm-ir` panicked: the counted volatile loop left an empty exit
+    block and `write_cvalue_maybe_transmute` unwraps the block's last
+    instruction to attach its comment. Emit a `nop` in the exit block. A/B
+    checked: removing it panics at `value_and_place.rs:549`.
+    (b) `store_forward` deleted volatile reads of a **stack** value: private
+    slot facts survived a `fence` and a trapping load was forwarded like any
+    other. Now a `Fence` clears the fact map and loads without `notrap` are
+    never forwarded (`func.dfg.mem_flags[flags].notrap()`). A/B checked: without
+    the guard `vol_stack_discard` issues **0** loads instead of 5.
+    (c) `vol512_use` now folds a checksum over all 64 words, so a skipped
+    interior word changes the result; new `vol_stack_discard`/`vol_stack_use`
+    (local `Five` tuple struct + `read_volatile(&raw const local)`) cover the
+    forwarding case, and `regressions.sh` gates on `--emit=llvm-ir` not
+    panicking and on 5 stack source loads.
+    **Full all-axes matrix** (CREPS=2 RREPS=7; compile = wall ms / cpu ms /
+    peak RSS MB / bytes, run = wall ms / cpu ms / peak RSS MB):
+
+    | prog | C L | C U | C M | R L | R U | R M |
+    |---|---|---|---|---|---|---|
+    | h_arith | 118/143/118.2/4617128 | 95/122/119.2/5839120 | 106/134/120.3/4079232 | 2/2/11.0 | 2/2/11.1 | 2/2/11.0 |
+    | h_branch | 118/144/118.3/4616832 | 95/124/119.5/5837264 | 107/136/120.5/4077568 | 2/2/11.1 | 2/2/11.0 | 2/2/10.9 |
+    | h_calls | 118/144/118.9/4616872 | 92/120/119.6/5837792 | 105/135/120.7/4077928 | 2/2/11.0 | 2/2/11.0 | 2/2/11.0 |
+    | h_float | 134/156/119.0/4637984 | 91/119/118.7/5861024 | 112/138/119.4/4118728 | 2/2/11.1 | 3/2/10.7 | 2/2/11.0 |
+    | h_mem | 269/435/138.4/4646856 | 137/189/134.8/5959856 | 176/246/137.0/4166856 | 3/3/11.0 | 10/9/11.0 | 5/4/10.8 |
+    | h_simd | 145/171/124.2/4617704 | 108/133/124.7/5843736 | 117/146/125.9/4081656 | 2/2/11.0 | 4/4/11.1 | 3/2/11.0 |
+    | p1_arith | 87/106/106.0/4635232 | 82/106/108.0/5877944 | 91/115/109.4/4146656 | 82/82/11.1 | 109/108/10.8 | 103/103/11.1 |
+    | p2_mem | 257/390/134.0/4639896 | 130/175/130.8/5936144 | 164/223/132.7/4144024 | 17/16/11.1 | 160/159/11.1 | 49/49/10.8 |
+    | p3_calls | 101/124/116.1/4612368 | 88/116/116.5/5820136 | 100/128/118.0/4067592 | 37/37/10.8 | 117/117/11.0 | 58/58/11.1 |
+    | p4_simd | 108/129/116.7/4636096 | 98/122/117.0/5892376 | 111/137/118.5/4153280 | 56/56/48.2 | 157/157/49.4 | 85/85/48.8 |
+    | p5_inline | 84/106/105.0/4609368 | 77/101/106.9/5813704 | 88/113/107.7/4060504 | 58/57/11.0 | 895/895/11.1 | 7/6/10.8 |
+    | p6_scalar | 83/101/101.4/4609368 | 79/101/103.1/5813688 | 93/113/104.2/4060504 | 58/58/11.1 | 904/903/10.8 | 7/6/10.9 |
+    | p7_branchy | 86/104/105.4/4609520 | 80/102/106.7/5813800 | 90/113/107.7/4060664 | 43/43/11.1 | 101/100/11.1 | 36/35/10.8 |
+    | p8_minmax | 85/105/105.5/4609544 | 83/106/106.8/5813752 | 92/116/107.7/4060648 | 18/18/11.0 | 39/39/10.8 | 21/20/10.8 |
+    | p9_u64f32 | 96/117/111.3/4635448 | 89/112/112.8/5886872 | 103/128/114.0/4150304 | 31/31/17.8 | 77/76/18.8 | 35/34/18.2 |
+    | **TOTAL** | 1889/2475/1738.4/69350216 | 1424/1848/1745.1/87847208 | 1655/2121/1763.7/61506144 | 413/411/209.4 | 2582/2575/210.8 | 417/410/209.0 |
+
+    M vs L: compile **0.88x**, size **-11.3%**, run **1.01x**; M vs U: compile
+    1.16x, size -30.0%, run **0.16x**. Suite 65/25368/0; regressions green;
+    allaxes 15/15 ok, no INVALID.
+  - **M4.11 LANDED: no library copy reads a volatile source.**
+    (a) `emit_small_memory_copy` falls back to `memcpy` above four chunks, and
+    `memcpy` may use overlapping loads — a 40-byte volatile read of five
+    read-to-clear registers was read twice at offsets 8..24. The wide path now
+    emits its own loads: unrolled explicit trapping loads when there are <= 32
+    chunks, otherwise a counted loop of the same (one trapping load + one store
+    per iteration, sealed blocks). Ordinary copies may still move the finished
+    temporary. Verified: `vol40_discard` issues exactly **5** 8-byte loads (was
+    a `memcpy`), `vol512_discard` one load in a 64-iteration loop, `vol12` three
+    4-byte loads, `vol256` four 8-byte loads, `vol_discard_u8` one.
+    (b) Chunk size is `min(8, source ABI alignment)` (`1` for
+    `unaligned_volatile_load`), so a 4-byte-aligned aggregate never gets an
+    `i64` load; `t_volatile` covers a `Blob12` at offset 4 inside a `repr(C)`
+    wrapper.
+    (c) `regressions.sh` counts source loads from the first argument register
+    only (`mov…(%rdi…),`, so `%rip`/GOT and stack traffic are excluded) and
+    requires the exact count, plus `mfence` and no SIMD in each case.
+
+    **Full all-axes matrix** (CREPS=2 RREPS=7; compile = wall ms / cpu ms /
+    peak RSS MB / bytes, run = wall ms / cpu ms / peak RSS MB):
+
+    | prog | C L | C U | C M | R L | R U | R M |
+    |---|---|---|---|---|---|---|
+    | h_arith | 122/148/118.3/4617128 | 95/125/119.5/5839120 | 108/138/120.1/4078224 | 2/2/11.0 | 2/2/11.0 | 2/2/11.0 |
+    | h_branch | 122/148/118.5/4616832 | 96/127/119.5/5837264 | 108/138/120.4/4076568 | 2/2/11.0 | 2/2/11.1 | 2/2/11.1 |
+    | h_calls | 129/152/119.0/4616872 | 97/128/119.7/5837792 | 110/140/120.5/4076928 | 2/2/10.8 | 3/2/10.8 | 3/2/11.0 |
+    | h_float | 136/161/117.4/4637984 | 97/126/118.7/5861024 | 112/141/119.8/4117728 | 2/2/10.8 | 3/3/11.0 | 3/2/11.1 |
+    | h_mem | 286/463/138.4/4646856 | 146/200/134.8/5959856 | 189/264/136.9/4165648 | 4/3/11.1 | 10/10/11.1 | 5/4/11.1 |
+    | h_simd | 147/174/124.4/4617704 | 102/132/124.7/5843736 | 122/152/126.0/4080656 | 2/2/10.8 | 4/4/11.0 | 3/2/11.0 |
+    | p1_arith | 90/110/106.1/4635232 | 84/107/108.0/5877944 | 94/118/109.2/4145648 | 82/82/10.8 | 109/108/11.0 | 102/101/11.0 |
+    | p2_mem | 256/392/134.3/4639896 | 140/187/131.4/5936144 | 169/228/133.3/4142864 | 18/17/10.8 | 161/159/11.0 | 50/51/11.0 |
+    | p3_calls | 108/131/116.1/4612368 | 90/118/116.8/5820136 | 107/135/118.2/4066592 | 38/38/10.8 | 117/116/10.7 | 58/58/10.8 |
+    | p4_simd | 113/134/117.0/4636096 | 97/123/117.1/5892376 | 119/144/118.7/4152280 | 57/56/48.2 | 158/157/49.5 | 84/83/48.8 |
+    | p5_inline | 84/105/105.5/4609368 | 81/106/106.9/5813704 | 90/115/107.7/4059504 | 58/57/10.8 | 896/895/11.0 | 7/7/11.0 |
+    | p6_scalar | 91/109/101.7/4609368 | 83/106/103.0/5813688 | 92/114/104.2/4059504 | 58/57/11.0 | 904/904/10.8 | 7/6/11.1 |
+    | p7_branchy | 86/105/105.5/4609520 | 82/105/106.8/5813800 | 90/113/108.0/4059664 | 43/43/11.0 | 104/103/11.1 | 36/35/11.0 |
+    | p8_minmax | 86/106/105.5/4609544 | 86/108/106.8/5813752 | 94/117/108.0/4059648 | 18/18/11.1 | 40/40/11.1 | 21/20/11.0 |
+    | p9_u64f32 | 98/118/111.1/4635448 | 94/119/112.9/5886872 | 104/128/114.2/4149304 | 31/30/17.8 | 77/76/18.8 | 35/34/18.2 |
+    | **TOTAL** | 1954/2556/1738.8/69350216 | 1470/1917/1746.6/87847208 | 1708/2185/1765.2/61490760 | 417/411/207.8 | 2590/2581/211.0 | 418/409/210.2 |
+
+    M vs L: compile **0.87x**, size **-11.3%**, run **1.00x**; M vs U: compile
+    1.16x, size -30.0%, run **0.16x**. Suite 65/25368/0; regressions green;
+    allaxes 15/15 ok, no INVALID.
+  - **M4.10 LANDED: volatile chunk alignment + per-program matrix.**
+    (a) Chunking a wide volatile read by 8 bytes issued a misaligned `i64` load
+    for a 4-byte-aligned aggregate (faults where misaligned loads are not
+    supported). The chunked path is now a single `emit_small_memory_copy` with
+    the source's guaranteed ABI alignment (`1` for `unaligned_volatile_load`)
+    and trapping flags, so chunk sizes stay within that alignment and large
+    values use a library call instead of unbounded expansion. Verified:
+    `vol12_discard` (field at offset 4 inside a `repr(C)` wrapper) issues
+    exactly three 4-byte loads, `vol256_discard` four 8-byte loads,
+    `vol_discard_u8` one, `vol512_discard` zero inline loads plus a `memcpy`
+    call; every case keeps `mfence`.
+    (b) `t_volatile` cast an 8-byte-aligned array to `*const __m256i`
+    (undefined alignment); it now uses a `#[repr(C, align(32))]` wrapper, and a
+    `Big512([u64; 64])` case covers the library-call path.
+    (c) `regressions.sh` counts *source load instructions* (`mov…(%rdi),`) per
+    function and requires the exact number, so a partially dropped read fails
+    and stores/address arithmetic no longer satisfy the check.
+
+    **Full all-axes matrix** (CREPS=2 RREPS=7, `bench/allaxes.sh`; compile =
+    wall ms / cpu ms / peak RSS MB / bytes, run = wall ms / cpu ms / peak RSS MB):
+
+    | prog | C L | C U | C M | R L | R U | R M |
+    |---|---|---|---|---|---|---|
+    | h_arith | 126/151/118.0/4617128 | 96/125/119.3/5839120 | 104/133/120.5/4078224 | 2/2/11.0 | 2/2/11.0 | 2/2/11.1 |
+    | h_branch | 117/142/118.5/4616832 | 90/119/119.3/5837264 | 105/135/121.1/4076568 | 2/2/11.1 | 2/2/10.7 | 2/2/11.1 |
+    | h_calls | 118/144/118.7/4616872 | 92/121/119.6/5837792 | 104/133/120.7/4076928 | 2/2/11.0 | 3/3/11.1 | 2/2/10.8 |
+    | h_float | 126/151/117.6/4637984 | 92/118/118.5/5861024 | 107/134/119.8/4117728 | 2/2/11.1 | 3/2/11.0 | 2/2/11.1 |
+    | h_mem | 279/452/138.2/4646856 | 136/186/134.7/5959856 | 175/246/136.6/4165648 | 3/3/11.0 | 10/9/11.0 | 4/4/10.8 |
+    | h_simd | 141/165/124.3/4617704 | 96/125/124.7/5843736 | 114/143/125.8/4080656 | 2/2/11.0 | 4/3/11.0 | 2/2/11.0 |
+    | p1_arith | 85/103/106.3/4635232 | 86/107/108.1/5877944 | 92/116/109.1/4145648 | 82/81/10.8 | 108/108/11.0 | 102/101/11.0 |
+    | p2_mem | 251/384/134.4/4639896 | 134/179/131.0/5936144 | 166/224/133.0/4142864 | 17/16/10.8 | 159/161/11.0 | 49/49/11.0 |
+    | p3_calls | 101/124/116.1/4612368 | 89/115/116.6/5820136 | 102/130/118.1/4066592 | 37/37/11.1 | 118/118/11.0 | 58/58/11.0 |
+    | p4_simd | 108/128/116.8/4636096 | 95/120/117.2/5892376 | 110/135/118.6/4152280 | 57/57/48.2 | 160/157/49.4 | 84/83/48.8 |
+    | p5_inline | 83/103/105.2/4609368 | 80/104/106.9/5813704 | 92/118/108.0/4059504 | 58/58/11.1 | 895/893/11.0 | 7/6/11.1 |
+    | p6_scalar | 89/108/101.8/4609368 | 80/103/102.9/5813688 | 87/109/104.2/4059504 | 58/57/11.0 | 907/907/11.1 | 7/6/10.9 |
+    | p7_branchy | 91/109/105.6/4609520 | 82/106/106.8/5813800 | 90/114/107.9/4059664 | 43/43/11.1 | 101/101/11.0 | 36/35/11.0 |
+    | p8_minmax | 86/103/105.4/4609544 | 81/103/106.9/5813752 | 89/111/107.9/4059648 | 18/17/11.0 | 39/38/11.1 | 21/20/10.8 |
+    | p9_u64f32 | 98/118/111.3/4635448 | 91/115/112.8/5886872 | 101/126/114.5/4149304 | 31/30/17.8 | 78/78/18.8 | 35/34/18.2 |
+    | **TOTAL** | 1899/2485/1738.2/69350216 | 1420/1846/1745.3/87847208 | 1638/2107/1765.8/61490760 | 414/409/209.1 | 2589/2582/211.2 | 413/406/209.7 |
+
+    M vs L: compile **0.86x**, size **-11.3%**, run **1.00x**; M vs U: compile
+    1.16x, size -30.0%, run **0.16x**. Suite 65/25368/0; regressions green;
+    allaxes 15/15 ok, no INVALID.
+  - **M4.9 LANDED: wide volatile reads + real overlap fixtures.**
+    (a) `read_volatile::<__m256i>` aborted codegen: the direct trapping load used
+    a 256-bit vector type that the x64 backend cannot lower. Only layouts up to
+    128 bits take the single direct load now; wider ones are read in
+    supported-size chunks (i64→i32→i16→i8) with **trapping** loads into a fresh
+    stack slot, so an unused result still performs the read and no wide load is
+    emitted (`vol256_discard`/`vol256_use`/`vol12_*` verified L==M).
+    (b) The `constmul1`/`scalemul` overlap fixtures used **two** allocations, so
+    they never overlapped; both now alias one buffer with the destination one
+    element ahead, which genuinely exercises the scalar fallback (checksums
+    recomputed from LLVM).
+    New `bench/tests/t_volatile.rs` (volatile byte loop, discarded byte read,
+    12-byte struct, `__m256i`); `regressions.sh` asserts the loop is never
+    widened and that each discard case keeps `mfence` plus a real read.
+    Gate: suite 65/25368/0; regressions green; allaxes 15/15 ok, run total
+    413 ms vs L 412 (1.00x), compile 1626 vs 1899 ms (0.86x), size 61.5 vs
+    69.35 MB (-11.3%); vs upstream run 0.16x.
+  - **M4.8 LANDED: second review round.**
+    (a) A discarded volatile read was still dropped: `load_scalar` emits a
+    `notrap` load and `must_lower_even_if_unused` skips it, leaving only the
+    fence. `volatile_load` now emits a **trapping** load for scalar/vector
+    layouts (`fx.bcx.ins().load(ty, MemFlagsData::new(), …)` +
+    `CValue::by_val`); verified `mfence` + `movzbq` in `vol_discard`.
+    (b) The old `sum_ctr` fixture passed for the wrong reason — three header
+    params are rejected *before* the purity check. New `sum_ctr2` keeps two
+    header params and stores the counter, so it exercises `header_is_pure`
+    (asserted: no `paddd`/`movdqu`, counter matches LLVM).
+    (c) `RAKIT_VEC_VERIFY` is cached in a `OnceLock` (`vectorize::verify_enabled`)
+    per the tunables rule, and both the constant and runtime shift fixtures are
+    compiled with it.
+    (d) `body_chain`/`body_chain_checked` check the terminator shape before
+    scanning predecessors (a `return`/`brif` no longer pays for the scan).
+    (e) Constant/scalar operands are broadcast **once** in the guard block
+    (`vother`) instead of once per chunk; (f) the map overlap guard spans
+    `bound - start`, so only the touched range is compared (an untouched prefix
+    that happens to overlap no longer blocks vectorization).
+    Fixtures: `mul2` inputs now wrap; `ops2r` pins the reversed load order
+    (asserted `psubd`); `constmul1`/`scalemul` overlap (dest one ahead of src)
+    and `inplace_add2` with `pb = pa - 1` exercise the scalar fallback.
+    Gate: suite 65/25368/0; regressions green; allaxes 15/15 ok, run total
+    416 ms vs L 412 (1.01x), compile 1625 vs 1906 ms (0.85x), size 61.5 vs
+    69.4 MB (-11.3%). Focused 15-rep medians: p2_mem 48.3 ms (L 15.5),
+    p8_minmax 19.2 ms (L 16.7) — the allaxes +4/5% deltas were noise.
+  - **M4.7 LANDED: correctness hardening (code-review findings).**
+    (a) Vector headers (map and reduction) now require `nxt > i` *and*
+    `nxt <= bound`, so a start near `u64::MAX` (`usize::MAX` with `n = 3`) can no
+    longer wrap into a "fits" test and touch memory the scalar loop never reads.
+    (b) `header_is_pure` is shared by both matchers: a reduction whose header
+    stores/loads/calls keeps its side effects (previously skipped for the whole
+    vector prefix).
+    (c) Shift counts are scalar (`y` is the scalar-only `iB` operand): `apply`
+    passes `iconst(lane)`/the scalar value instead of a splat, the two
+    `splat`-shaped `mask_xmm_shift` ISLE rules are deleted, and
+    `RAKIT_VEC_VERIFY=1` runs the Cranelift verifier after vectorizing (the old
+    IR was rejected by the verifier even though x64 lowered it).
+    (d) Volatile: rakit's IR has no volatile bit, so `volatile_load`/`_store`
+    now emit `fence` (mfence) — ordering for volatile, and the vectorizer
+    rejects the block, so byte/word volatile loops are never widened.
+    (e) Power-of-two multipliers: `x*8` already lowers to `ishl` (vectorized);
+    `x*2` becomes `x + x`, now recognized as `Rhs::Double` (`paddd`).
+    Tests: new `t_vectorize_guards` (sum_ctr, vol_loop, mul2, mul8),
+    `t_vectorize_start` gained the `usize::MAX`/`n=3` wrap case, the shift
+    fixtures use non-zero inputs (so a skipped store at `n=1` shows) and
+    runtime counts 32/33/63/100. `regressions.sh` adds u16 bitwise opcode
+    asserts, moves the panic-message check outside the `objdump` guard, asserts
+    guards stay scalar and pow2 maps use `paddd`/`pslld`, and compiles the shift
+    fixture with `RAKIT_VEC_VERIFY=1`.
+    Gate: suite 65/25368/0; allaxes 15/15 ok, no invalid. Full matrix
+    (CREPS=2 RREPS=7): run total **410 ms vs LLVM 414 (0.99x)**, compile
+    **1589 vs 1847 ms (0.86x)**, size **61.5 vs 69.4 MB (-11.3%)**; p2_mem
+    50->48 ms, p8 21->20 ms, p7 36->35 ms.
+    Still open (perf/test gaps, no correctness impact): overlap coverage for
+    `constops`/`scalemul`/`inplace_add2`, non-zero-start overlap span uses
+    `[0,n)`, scalar broadcast re-splatted per chunk, `body_chain` scans preds
+    before checking the terminator, and mixed-width shift counts.
+  - **M4.6 LANDED: bounds-checked slice loops.** `body_chain_checked` follows the
+    `brif (icmp i, len)` checks rustc emits for indexing (the other edge must be
+    a trapping block) and records each length; `apply` builds
+    `min(n, len...)` (an `umin` chain) in the guard block and uses it as the
+    vector bound, so the vector body needs no checks while the original checked
+    scalar loop still runs the tail. A short destination therefore still panics
+    at the exact index (verified: same message/location as LLVM). New
+    `t_vectorize_slice` (`slice_map1`, `slice_map2`, `slice_param`;
+    n=1000/999/17/15/1/0), L==M; regressions asserts `paddd` and compares the
+    panic message. Panic exit codes differ (LLVM 101 unwind vs Rakit 134 abort)
+    — pre-existing, also for a plain out-of-bounds index. **Measured** (1M u32,
+    20x slice_map2 + 20x slice_map1, min of 5): M 46 ms vs
+    `RAKIT_NO_VECTORIZE=1` 82 ms (**-44%, 1.78x**); LLVM 18 ms (2.6x, was 4.6x).
+    Full all-axes suite (CREPS=2 RREPS=7) unchanged within noise: run total
+    416 ms vs LLVM 413 ms (1.01x), compile 1615 ms vs 1900 ms (0.85x), size
+    61.5 MB vs 69.4 MB (-11.3%); vs upstream 2589 ms run / 87.8 MB.
+  - **Slice loops (bounds checks): not vectorized.** `for i in 0..n { c[i]=a[i]+b[i] }`
+    lowers every access with a bounds `icmp`+`brif` to a cold `call panic; trap`
+    block, i.e. a multi-block body *with internal control flow*. Vectorizing it
+    needs bounds-check elimination / range analysis (prove `i < len` from the
+    loop guard), not just the chain matcher.
 
 ## Session (2026-11-24, branch `rakit-exp7`) — p9 reloads are real, but NOT soundly hoistable with the existing flags (alias tags don't move loads)
 
@@ -1073,6 +2270,67 @@ cpu ms / peak RSS MB. All stdout matched LLVM.
   regressions pass; heldout outputs match LLVM; allaxes p3 93.8 → 59 ms.
 
 # AGENTS.md
+
+## Session (2026-11-24) — ripgrep 14.1.1: compile/size win, runtime 7.7x, root cause 256-bit SIMD
+
+**Target:** proyek nyata besar — **ripgrep 14.1.1**, 41 dependensi transitif
+(regex, memchr, aho-corasick, ignore, globset, serde, clap). Harness
+`extbench/cratebench.sh` mengukur seluruh pohon cargo (wall/CPU/peak-RSS),
+ukuran biner, dan runtime (wall/CPU/RSS) dengan validasi stdout byte-per-byte.
+Korpus deterministik `extbench/gen_corpus.sh` (2000 file x 400 baris, 40 MB);
+beban kerja `extbench/drivers/rg_work.sh` = lima pencarian (`--sort path`).
+
+**Full matrix** (CREPS=2, RREPS=5; kompilasi wall/cpu/peak-RSS/byte; runtime wall/cpu/peak-RSS):
+
+| backend | Cwall | Ccpu | Crss | size | Rwall | Rcpu | Rrss |
+|---|---|---|---|---|---|---|---|
+| L LLVM | 27065 ms | 85910 ms | 1102 MB | 30,490,856 | 411 ms | 280 ms | 9 MB |
+| U cg_clif | 9924 ms | 26930 ms | 904 MB | 35,356,496 | 4869 ms | 4720 ms | 16 MB |
+| M Rakit | 11451 ms | 32220 ms | 929 MB | 27,906,952 | 3164 ms | 3040 ms | 13 MB |
+
+M vs L: kompilasi **0.42x wall, 0.37x CPU**, RSS 0.84x, ukuran **-8.5%**,
+runtime **7.66x**. M vs U: kompilasi 1.15x, ukuran **-21%**, runtime **0.65x**.
+stdout ketiga backend identik (3,457,671 byte).
+
+**Per-pencarian** (median ms, korpus 40 MB): literal `-F` 55.0/389.2/330.4
+(L/U/M, M/L 6.01); regex ber-capture 63.3/468.2/382.9 (6.04); `-i` alternation
+173.7/2350.3/1399.3 (8.06); multi-pattern 86.1/1485.8/946.8 (10.99); walk
+4.9/14.8/9.1 (1.84). Total 383.1/4708.4/3068.5 (M/L 8.01, M/U 0.65).
+
+**Akar gap = penskalaran intrinsik 256-bit, bukan pass.** Terisolasi `memchr`
+(2 MB x 5): L 0.2 ms, U 21.1 ms, M 16.9 ms. Disasm: L 104 `%ymm` / 68
+`pcmpeqb`; U 0 / 0; M 0 `%ymm` / 19 `pcmpeqb`. Probe `_mm256_add_epi8`: L 12
+`%ymm` + 4 `vpaddb`; M 0 (badan kernel: 940 `mov`, 103 `sub` — skalar per
+byte). `is_x86_feature_detected!` (sse2/sse4.1/avx/avx2/bmi2/popcnt) **identik
+true** di ketiganya, jadi bukan deteksi CPU. Cranelift x64 tidak punya lowering
+256-bit; rakit menskalarisasi `_mm256_*` sebelum sampai ke backend.
+
+**Fix landed (`rakit/src/lib.rs`): propagasi `-Ctarget-feature`.** Sebelumnya
+flag diabaikan total: builder hanya menerima nama CPU, dan `enable("avx2")`
+malah `Err(BadName)` karena setting Cranelift bernama `has_avx2`. Sekarang
+`sess.target.features` + `sess.opts.cg.target_feature` diterapkan dengan
+pemetaan `+feat` -> `feat` atau `has_<feat tanpa titik>` (dan `-feat` ->
+`set("has_...", "false")`). `RAKIT_ISA_DEBUG=1` mencetak hasil per fitur.
+Efek: ripgrep M 3083 -> 3036 ms (**-1.5%**), output tetap identik; tanpa flag
+codegen **tidak berubah** (ukuran biner allaxes identik 61,503,384 byte).
+Gate: suite **65 suites / 25,368 passed / 0 failed**; regresi hijau; allaxes
+M/L run **1.00x**, compile 0.81x, ukuran -11.3%.
+
+**Harness fixes (dipakai ulang):** `SRC` dinormalisasi ke path absolut (dulu
+`cd $SRC` + `CARGO_TARGET_DIR` relatif membuat target bersarang); subcommand
+per backend (`build` untuk L/U, `rakit build` hanya untuk M — sebelumnya U
+gagal `exit=101`); `RUNCMD` untuk beban kerja multi-argumen; `OUTDIR`
+menyimpan stdout tiap backend dan `cmp` byte-per-byte di akhir (mismatch ->
+exit 1); baris runtime dicetak di luar cabang; `RUN_FAIL` eksplisit;
+`CARGO` env untuk biner L.
+
+**Kesimpulan untuk tujuan "unggul di semua":** pada proyek nyata M sudah
+menang kompilasi (2.4x lebih cepat, 16% RSS lebih kecil) dan ukuran (8.5%
+lebih kecil, 21% lebih kecil dari U), tetapi runtime masih 7.7x. Penutupnya
+bukan pass baru, melainkan **lowering vektor 256-bit di rakit-codegen**
+(`_mm256_*` -> 2x 128-bit atau AVX2 native); itu prasyarat agar memchr,
+aho-corasick, dan regex-automata memakai jalur cepatnya. `+target-feature`
+saja tidak cukup.
 
 ## Session (2026-11-24) — all-axes output validation, strict held-out args
 - **Bug fixed:** `allaxes.sh` timed discovered held-out programs without

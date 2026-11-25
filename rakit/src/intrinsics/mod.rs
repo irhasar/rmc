@@ -17,6 +17,7 @@ mod llvm_aarch64;
 mod llvm_x86;
 mod simd;
 
+use rakit_codegen::ir::immediates::Offset32;
 use rakit_codegen::ir::{
     AtomicRmwOp, BlockArg, ExceptionTableData, ExceptionTableItem, ExceptionTag,
 };
@@ -408,7 +409,7 @@ fn codegen_regular_intrinsic_call<'tcx>(
 
             fx.bcx.ins().debugtrap();
         }
-        sym::copy => {
+        sym::copy | sym::copy_nonoverlapping => {
             intrinsic_args!(fx, args => (src, dst, count); intrinsic);
             let src = src.load_scalar(fx);
             let dst = dst.load_scalar(fx);
@@ -430,22 +431,17 @@ fn codegen_regular_intrinsic_call<'tcx>(
             // 8 bytes instead costs a full call + return per element and shows
             // up as a ~10x slowdown in sort-heavy code. When the byte count is a
             // small compile-time constant, inline it as load/store pairs.
+            let non_overlapping = intrinsic == sym::copy_nonoverlapping;
             match crate::unroll::const_of(&fx.bcx.func, count)
                 .and_then(|c| c.checked_mul(elem_size))
             {
                 Some(bytes) if bytes != 0 && bytes <= 8 * 8 => {
-                    fx.bcx.emit_small_memory_copy(
-                        fx.target_config,
-                        dst,
-                        src,
-                        bytes,
-                        1,
-                        1,
-                        false,
-                        MemFlagsData::new(),
-                    );
+                    crate::common::emit_const_copy(fx, dst, src, bytes, non_overlapping);
                 }
                 // FIXME emit_small_memmove
+                _ if non_overlapping => {
+                    fx.bcx.call_memcpy(fx.target_config, dst, src, byte_amount)
+                }
                 _ => fx.bcx.call_memmove(fx.target_config, dst, src, byte_amount),
             }
         }
@@ -713,20 +709,124 @@ fn codegen_regular_intrinsic_call<'tcx>(
         sym::volatile_load | sym::unaligned_volatile_load => {
             intrinsic_args!(fx, args => (ptr); intrinsic);
 
-            // Rakit treats loads as volatile by default
-            // FIXME correctly handle unaligned_volatile_load
+            // Rakit has no volatile bit in its IR: the fence provides the
+            // ordering volatile requires and keeps the vectorizer from widening
+            // these accesses (it rejects blocks with side effects). A `notrap`
+            // load is dropped when its result is unused, which would discard the
+            // read entirely, so emit a trapping load instead.
+            let _ = fx.bcx.ins().fence();
             let inner_layout = fx.layout_of(ptr.layout().ty.builtin_deref(true).unwrap());
-            let val = CValue::by_ref(Pointer::new(ptr.load_scalar(fx)), inner_layout);
+            let ptr_val = ptr.load_scalar(fx);
+            let rakit_ty = match inner_layout.layout.backend_repr {
+                BackendRepr::Scalar(scalar) => {
+                    Some(crate::common::scalar_to_rakit_type(fx.tcx, scalar))
+                }
+                BackendRepr::SimdVector { element, count } => Some(
+                    crate::common::scalar_to_rakit_type(fx.tcx, element)
+                        .by(count.as_u32())
+                        .unwrap(),
+                ),
+                _ => None,
+            };
+            let size = inner_layout.size.bytes() as i64;
+            let val = match rakit_ty {
+                // The x64 backend only lowers vector loads up to 128 bits.
+                Some(ty) if size <= 16 => {
+                    let v = fx
+                        .bcx
+                        .ins()
+                        .load(ty, MemFlagsData::new(), ptr_val, Offset32::new(0));
+                    CValue::by_val(v, inner_layout)
+                }
+                // Wider values (e.g. `__m256i`) have no single load: read them
+                // into a local slot in chunks the target can lower. The loads
+                // stay trapping, so an unused result still performs the read.
+                _ => {
+                    // No single load above 128 bits, and the source must never be
+                    // read by an ordinary copy: `memcpy` may use overlapping
+                    // loads, which reads a read-to-clear source twice. Emit
+                    // explicit non-overlapping trapping loads, sized to the
+                    // source's guaranteed alignment (an i64 load would be
+                    // misaligned for a 4-byte-aligned aggregate).
+                    let align = if matches!(intrinsic, sym::unaligned_volatile_load) {
+                        1
+                    } else {
+                        inner_layout.align.bytes().try_into().unwrap_or(1)
+                    };
+                    if size == 0 {
+                        CValue::by_ref(Pointer::new(ptr_val), inner_layout)
+                    } else {
+                        let align = align.min(size as u32);
+                        let (ty, chunk) = match align.min(8) {
+                            8 => (types::I64, 8i64),
+                            4 => (types::I32, 4i64),
+                            2 => (types::I16, 2i64),
+                            _ => (types::I8, 1i64),
+                        };
+                        let slot = fx.create_stack_slot(size as u32, align);
+                        let chunks = size / chunk;
+                        // A counted loop keeps a large read from expanding
+                        // without bound while still issuing every load.
+                        const UNROLLED_MAX: i64 = 32;
+                        if chunks <= UNROLLED_MAX {
+                            for k in 0..chunks {
+                                let off = (k * chunk) as i32;
+                                let v = Pointer::new(ptr_val)
+                                    .offset(fx, Offset32::new(off))
+                                    .load(fx, ty, MemFlagsData::new());
+                                slot.offset_i64(fx, k * chunk).store(
+                                    fx,
+                                    v,
+                                    MemFlagsData::new().with_notrap(),
+                                );
+                            }
+                        } else {
+                            let dst_base = slot.get_addr(fx);
+                            let body = fx.bcx.create_block();
+                            let exit = fx.bcx.create_block();
+                            let zero = fx.bcx.ins().iconst(types::I64, 0);
+                            fx.bcx.ins().jump(body, &[zero.into()]);
+                            fx.bcx.switch_to_block(body);
+                            let i = fx.bcx.append_block_param(body, types::I64);
+                            let off = fx.bcx.ins().imul_imm(i, chunk);
+                            let src = fx.bcx.ins().iadd(ptr_val, off);
+                            let v =
+                                fx.bcx
+                                    .ins()
+                                    .load(ty, MemFlagsData::new(), src, Offset32::new(0));
+                            let dst = fx.bcx.ins().iadd(dst_base, off);
+                            fx.bcx.ins().store(
+                                MemFlagsData::new().with_notrap(),
+                                v,
+                                dst,
+                                Offset32::new(0),
+                            );
+                            let next = fx.bcx.ins().iadd_imm(i, 1);
+                            let more =
+                                fx.bcx.ins().icmp_imm_s(IntCC::UnsignedLessThan, next, chunks);
+                            fx.bcx.ins().brif(more, body, &[next.into()], exit, &[]);
+                            fx.bcx.switch_to_block(exit);
+                            fx.bcx.seal_block(body);
+                            fx.bcx.seal_block(exit);
+                            // `write_cvalue` attaches its assignment comment to the
+                            // block's last instruction; an empty exit block panics
+                            // when IR comments are on (`--emit=llvm-ir`).
+                            fx.bcx.ins().nop();
+                        }
+                        CValue::by_ref(slot, inner_layout)
+                    }
+                }
+            };
             ret.write_cvalue(fx, val);
         }
         sym::volatile_store | sym::unaligned_volatile_store | sym::nontemporal_store => {
             intrinsic_args!(fx, args => (ptr, val); intrinsic);
             let ptr = ptr.load_scalar(fx);
 
-            // Rakit treats stores as volatile by default
-            // FIXME correctly handle unaligned_volatile_store
-            // FIXME actually do nontemporal stores if requested (but do not just emit MOVNT on x86;
-            // see the LLVM backend for details)
+            // See `volatile_load`: a fence blocks reordering and vectorization.
+            if matches!(intrinsic, sym::volatile_store | sym::unaligned_volatile_store) {
+                let _ = fx.bcx.ins().fence();
+            }
             let dest = CPlace::for_ptr(Pointer::new(ptr), val.layout());
             dest.write_cvalue(fx, val);
         }

@@ -3,7 +3,7 @@
 Uses os.wait4 for exact child rusage (ru_maxrss = peak RSS in KB on Linux)."""
 import os, sys, time, json, resource, statistics, tempfile
 
-def run_once(cmd, env=None, stdin_devnull=True, cwd=None, out_path=None):
+def run_once(cmd, env=None, stdin_devnull=True, cwd=None, out_path=None, err_path=None):
     t0 = time.perf_counter()
     pid = os.fork()
     if pid == 0:
@@ -14,7 +14,13 @@ def run_once(cmd, env=None, stdin_devnull=True, cwd=None, out_path=None):
                 out = os.open(os.devnull, os.O_WRONLY)
             else:
                 out = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            os.dup2(out, 1); os.dup2(out, 2)
+            # A caller comparing *results* needs stderr kept apart: merged, a
+            # backend's diagnostics would read as a result mismatch.
+            if err_path is None:
+                err = out
+            else:
+                err = os.open(err_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            os.dup2(out, 1); os.dup2(err, 2)
             if cwd: os.chdir(cwd)
             os.execvpe(cmd[0], cmd, env if env is not None else os.environ)
         except Exception as e:

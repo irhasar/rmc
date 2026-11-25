@@ -196,20 +196,6 @@ pub(crate) fn compile_fn(
     // top-tested shape; it then turns the remaining call-bound loops into
     // bottom-tested ones (one branch per iteration instead of a test plus a
     // back-jump).
-    let mut pipeline = rakit_opt::PassManager::new();
-    pipeline
-        .push(Box::new(rakit_opt::RecLoopPass))
-        .push(Box::new(rakit_opt::StoreForwardPass))
-        .push(Box::new(rakit_opt::DivTestPass))
-        .push(Box::new(rakit_opt::IfConvertPass))
-        .push(Box::new(rakit_opt::UnrollPass))
-        .push(Box::new(rakit_opt::RotatePass))
-        .push(Box::new(rakit_opt::SincosPass));
-    let mut analyses = rakit_opt::Analyses::new();
-    let mut pctx =
-        rakit_opt::PassCtx { ctx: &mut *context, module: &mut *module, analyses: &mut analyses };
-    pipeline.run(&mut pctx);
-
     #[cfg(false)]
     let _rakit_guard = {
         let isa = module.isa();
@@ -229,6 +215,21 @@ pub(crate) fn compile_fn(
             rakit
         })
     };
+
+    let mut pipeline = rakit_opt::PassManager::new();
+    pipeline
+        .push(Box::new(rakit_opt::MemcpyInlinePass))
+        .push(Box::new(rakit_opt::RecLoopPass))
+        .push(Box::new(rakit_opt::StoreForwardPass))
+        .push(Box::new(rakit_opt::DivTestPass))
+        .push(Box::new(rakit_opt::IfConvertPass))
+        .push(Box::new(rakit_opt::UnrollPass))
+        .push(Box::new(rakit_opt::RotatePass))
+        .push(Box::new(rakit_opt::SincosPass));
+    let mut analyses = rakit_opt::Analyses::new();
+    let mut pctx =
+        rakit_opt::PassCtx { ctx: &mut *context, module: &mut *module, analyses: &mut analyses };
+    pipeline.run(&mut pctx);
 
     // Define function
     prof.generic_activity("define function").run(|| {
@@ -1090,22 +1091,52 @@ fn codegen_stmt<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, cur_block: Block, stmt:
                     .and_then(|c| c.checked_mul(elem_size));
                 match const_bytes {
                     Some(bytes) if bytes != 0 && bytes <= 8 * 8 => {
-                        fx.bcx.emit_small_memory_copy(
-                            fx.target_config,
-                            dst,
-                            src,
-                            bytes,
-                            1,
-                            1,
-                            true,
-                            MemFlagsData::new(),
-                        );
+                        crate::common::emit_const_copy(fx, dst, src, bytes, true);
                     }
                     _ => fx.bcx.call_memcpy(fx.target_config, dst, src, bytes),
                 }
             }
         },
     }
+}
+
+/// Constant value of a call to `core::mem::size_of`/`align_of`, if `instance`
+/// is one.
+///
+/// Both are const fns, so MIR normally folds them into a `NullOp` constant. A
+/// cross-crate `#[inline]` body keeps the call instead, and the call is not
+/// free: `_mm256_loadu_si256` sizes its `copy_nonoverlapping` with
+/// `size_of::<__m256i>()`, and a non-constant size there forces a `memcpy`
+/// libcall per use instead of an inlined copy.
+pub(crate) fn const_mem_fn_value<'tcx>(
+    fx: &mut FunctionCx<'_, '_, 'tcx>,
+    instance: ty::Instance<'tcx>,
+) -> Option<CValue<'tcx>> {
+    let def_id = instance.def_id();
+    if !matches!(instance.def, ty::InstanceKind::Item(_))
+        || fx.tcx.crate_name(def_id.krate) != rustc_span::sym::core
+    {
+        return None;
+    }
+    if fx.tcx.def_kind(def_id) != rustc_hir::def::DefKind::Fn {
+        return None;
+    }
+    let want_size = match fx.tcx.item_name(def_id).as_str() {
+        "size_of" => true,
+        "align_of" => false,
+        _ => return None,
+    };
+    let parent = fx.tcx.parent(def_id);
+    if fx.tcx.def_kind(parent) != rustc_hir::def::DefKind::Mod
+        || fx.tcx.item_name(parent).as_str() != "mem"
+    {
+        return None;
+    }
+    let layout = fx.layout_of(instance.args.type_at(0));
+    let value = if want_size { layout.size.bytes() } else { layout.align.bytes() } as i64;
+    let usize_layout = fx.layout_of(fx.tcx.types.usize);
+    let val = fx.bcx.ins().iconst(crate::common::pointer_ty(fx.tcx), value);
+    Some(CValue::by_val(val, usize_layout))
 }
 
 fn codegen_array_len<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, place: CPlace<'tcx>) -> Value {

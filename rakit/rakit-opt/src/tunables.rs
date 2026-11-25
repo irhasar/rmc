@@ -39,6 +39,13 @@ pub fn store_forward_time() -> bool {
     *V.get_or_init(|| flag("RAKIT_SF_TIME"))
 }
 
+/// Whether store forwarding reports what it did per function (`RAKIT_SF_DEBUG`),
+/// including a provenance walk that was truncated.
+pub fn store_forward_debug() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| flag("RAKIT_SF_DEBUG"))
+}
+
 /// Substring of function names the store-forwarding pass skips (`RAKIT_SF_SKIP`).
 pub fn store_forward_skip() -> Option<&'static str> {
     static V: OnceLock<Option<String>> = OnceLock::new();

@@ -260,7 +260,16 @@ pub(crate) fn format_rakit_ir_header(isa: &dyn TargetIsa, symbol_name: &str) -> 
 }
 
 pub(crate) fn should_write_ir(sess: &Session) -> bool {
-    sess.opts.output_types.contains_key(&OutputType::LlvmAssembly)
+    // `--emit=llvm-ir` is the historical trigger, but rakit never writes the
+    // `.ll` file rustc then copies, so that emit type fails the build.
+    // `RAKIT_DUMP=1` produces the same dumps from an ordinary compile.
+    sess.opts.output_types.contains_key(&OutputType::LlvmAssembly) || dump_ir_enabled()
+}
+
+/// Whether `RAKIT_DUMP` asks for the per-function RAKIT dumps.
+pub(crate) fn dump_ir_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("RAKIT_DUMP").is_some())
 }
 
 pub(crate) fn write_ir_file(
@@ -278,12 +287,18 @@ pub(crate) fn write_ir_file(
 
     let rakit_file_name = rakit_output_dir.join(name);
 
-    let res = std::fs::File::create(rakit_file_name).and_then(|mut file| write(&mut file));
+    let res = std::fs::File::create(&rakit_file_name).and_then(|mut file| write(&mut file));
     if let Err(err) = res {
-        // Using early_warn as no Session is available here
+        // Using early_warn as no Session is available here. Name the file: a
+        // failed write leaves a partial dump behind, and tests need to know
+        // which function's dump is incomplete.
         let handler =
             rustc_session::EarlyDiagCtxt::new(rustc_session::config::ErrorOutputType::default());
-        handler.early_warn(format!("error writing ir file: {}", err));
+        handler.early_warn(format!(
+            "error writing ir file {}: {}",
+            rakit_file_name.display(),
+            err
+        ));
     }
 }
 

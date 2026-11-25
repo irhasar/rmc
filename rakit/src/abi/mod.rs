@@ -462,6 +462,17 @@ pub(crate) fn codegen_terminator_call<'tcx>(
             }
         }
 
+        // `core::mem::size_of`/`align_of` are const fns; MIR normally folds
+        // them, but a cross-crate `#[inline]` body keeps the call and a real
+        // call per use costs a `memcpy` libcall in std's SIMD kernels.
+        if let Some(value) = crate::base::const_mem_fn_value(fx, instance) {
+            ret_place.write_cvalue(fx, value);
+            let dest = target.expect("size_of/align_of always return");
+            let ret_block = fx.get_block(dest);
+            fx.bcx.ins().jump(ret_block, &[]);
+            return;
+        }
+
         match instance.def {
             InstanceKind::Intrinsic(_) => {
                 match crate::intrinsics::codegen_intrinsic_call(
