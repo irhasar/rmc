@@ -303,8 +303,16 @@ fi
 # `write_ir_file` only warns when a write fails, so require a *non-empty* dump
 # of each function that used to panic, and no write error naming them.
 for fn in vol512_discard vol_stack_discard; do
-    if [ ! -s "$TMP/vol_ir.rakit/$fn.opt.rakit" ]; then
+    dump="$TMP/vol_ir.rakit/$fn.opt.rakit"
+    if [ ! -s "$dump" ]; then
         echo "[regression] t_volatile: --emit=llvm-ir produced no/empty dump for $fn" >&2
+        fail=1
+        continue
+    fi
+    # A partial write leaves a non-empty but truncated file; a complete dump
+    # ends with the closing brace of the function.
+    if [ "$(tail -1 "$dump")" != "}" ]; then
+        echo "[regression] t_volatile: --emit=llvm-ir left a truncated dump for $fn" >&2
         fail=1
     fi
 done

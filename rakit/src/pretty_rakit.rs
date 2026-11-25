@@ -278,12 +278,18 @@ pub(crate) fn write_ir_file(
 
     let rakit_file_name = rakit_output_dir.join(name);
 
-    let res = std::fs::File::create(rakit_file_name).and_then(|mut file| write(&mut file));
+    let res = std::fs::File::create(&rakit_file_name).and_then(|mut file| write(&mut file));
     if let Err(err) = res {
-        // Using early_warn as no Session is available here
+        // Using early_warn as no Session is available here. Name the file: a
+        // failed write leaves a partial dump behind, and tests need to know
+        // which function's dump is incomplete.
         let handler =
             rustc_session::EarlyDiagCtxt::new(rustc_session::config::ErrorOutputType::default());
-        handler.early_warn(format!("error writing ir file: {}", err));
+        handler.early_warn(format!(
+            "error writing ir file {}: {}",
+            rakit_file_name.display(),
+            err
+        ));
     }
 }
 

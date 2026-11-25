@@ -362,6 +362,39 @@ bytes, then run **wall/cpu** ms, run peak-RSS MB.
     two-source `a[i] += b[i]` -> `paddd` (guard still emitted for `b`), f32
     `a[i] *= 2.0` -> `mulps`. New `t_vectorize_inplace`
     (n=1000/999/17/15/1/0); regressions asserts the four ops.
+  - **M4.16 LANDED: partial IR dumps are attributable and rejected.**
+    `write_ir_file` logged `error writing ir file: <err>` with no file name, so
+    a partial write left a non-empty, truncated dump that satisfied `-s` and a
+    warning the scoped grep could not attribute. The warning now names the file
+    (`error writing ir file <path>: <err>`), and the gate adds a completeness
+    check: a complete dump ends with the function's closing brace, so
+    `tail -1 "$dump" != "}"` fails. Checked: positive passes; truncating a dump
+    with no log line fails; a named write error fails.
+    **Full all-axes matrix** (CREPS=2 RREPS=7; compile = wall ms / cpu ms /
+    peak RSS MB / bytes, run = wall ms / cpu ms / peak RSS MB):
+
+    | prog | C L | C U | C M | R L | R U | R M | ΔR M |
+    |---|---|---|---|---|---|---|---|
+    | h_arith | 122/147/118.2/4617128 | 95/122/119.6/5839120 | 110/139/120.7/4079048 | 2/2/11.0 | 2/2/11.1 | 2/2/11.0 | +0.0% |
+    | h_branch | 125/150/118.7/4616832 | 97/128/119.5/5837264 | 109/138/120.5/4077368 | 2/2/10.8 | 2/2/11.1 | 2/2/11.1 | +0.0% |
+    | h_calls | 131/157/119.2/4616872 | 95/126/119.8/5837792 | 110/141/120.6/4077744 | 2/2/11.0 | 3/2/11.0 | 3/2/11.1 | +50.0% |
+    | h_float | 138/162/117.2/4637984 | 101/128/118.8/5861024 | 118/144/119.8/4118544 | 2/2/11.1 | 3/2/11.0 | 3/2/11.1 | +0.0% |
+    | h_mem | 275/446/138.3/4646856 | 141/194/134.8/5959856 | 180/251/137.1/4166664 | 3/3/10.8 | 10/10/11.0 | 5/5/10.7 | +0.0% |
+    | h_simd | 154/179/124.2/4617704 | 101/130/124.7/5843736 | 122/153/125.8/4081456 | 2/2/11.0 | 4/4/10.8 | 3/2/11.0 | +50.0% |
+    | p1_arith | 87/107/106.2/4635232 | 85/108/108.1/5877944 | 94/118/109.0/4146472 | 82/81/11.1 | 109/108/10.8 | 103/103/11.0 | +0.0% |
+    | p2_mem | 267/412/134.4/4639896 | 137/185/131.1/5936144 | 170/228/133.2/4143848 | 18/17/11.1 | 158/156/11.1 | 51/51/11.1 | +2.0% |
+    | p3_calls | 102/125/116.1/4612368 | 90/118/116.8/5820136 | 103/131/117.7/4067424 | 37/37/10.8 | 117/116/11.0 | 57/57/11.1 | +0.0% |
+    | p4_simd | 111/132/116.8/4636096 | 96/121/117.2/5892376 | 120/143/118.6/4153096 | 57/56/48.2 | 161/161/49.4 | 87/86/48.8 | +1.2% |
+    | p5_inline | 86/106/105.3/4609368 | 80/104/106.9/5813704 | 92/118/107.8/4060320 | 58/57/11.1 | 895/895/11.0 | 7/6/11.0 | +0.0% |
+    | p6_scalar | 85/103/101.6/4609368 | 80/103/103.1/5813688 | 93/116/104.2/4060320 | 58/57/11.0 | 905/905/11.0 | 7/6/11.1 | +0.0% |
+    | p7_branchy | 93/109/105.8/4609520 | 81/104/106.9/5813800 | 91/115/107.9/4060496 | 43/43/11.1 | 101/100/11.1 | 35/35/11.1 | -2.8% |
+    | p8_minmax | 87/107/105.4/4609544 | 80/102/106.6/5813752 | 91/115/107.7/4060464 | 18/18/11.1 | 39/39/11.0 | 21/20/11.1 | +0.0% |
+    | p9_u64f32 | 98/118/111.2/4635448 | 89/112/112.9/5886872 | 102/126/114.2/4150120 | 31/32/17.8 | 77/77/18.8 | 34/35/18.2 | -2.9% |
+    | **TOTAL** | 1961/2560/1738.6/69350216 | 1448/1885/1746.8/87847208 | 1705/2176/1764.8/61503384 | 415/411/209.0 | 2586/2579/211.2 | 420/414/210.5 | |
+
+    M vs L: compile **0.87x**, size **-11.3%**, run **1.01x**; M vs U: compile
+    1.18x, size -30.0%, run **0.16x**. Suite 65/25368/0; regressions green;
+    allaxes 15/15 ok, no INVALID.
   - **M4.15 LANDED: the IR-dump gate rejects empty dumps.**
     `-f` accepted a zero-byte file, and `write_ir_file` only *warns* when a
     write fails, so a failed dump could still satisfy the gate. It now requires
