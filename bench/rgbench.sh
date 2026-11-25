@@ -3,10 +3,15 @@
 #
 #   ./rgbench.sh [src-dir] [corpus-dir]
 #
-# Builds ripgrep 14.1.1 from `src-dir` (downloaded there on first run) once per
-# backend, then times five search shapes over `corpus-dir`. Reports compile
-# wall/cpu/peak-RSS and artifact size per backend, run wall per search, and
-# requires the three backends to produce byte-identical stdout.
+# Builds ripgrep 14.1.1 once per backend, then times five search shapes over
+# `corpus-dir`. Reports compile wall/cpu/peak-RSS and artifact size per backend,
+# run wall/cpu/peak-RSS per search, and requires the three backends to produce
+# byte-identical stdout.
+#
+# Without `src-dir` the crate is unpacked into a fresh private (0700) directory
+# and removed on exit. A `src-dir` you pass yourself is only used when this user
+# owns it and neither it nor its parent is group/other writable, because the
+# build runs the checkout's own build scripts.
 #
 # corpus: 2000 files, ~40 MB, with the shapes below embedded:
 #   find d0..d99 -name '*.txt' | xargs -I{} sh -c \
@@ -14,7 +19,6 @@
 set -u
 BENCH=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(dirname "$BENCH")
-SRC=${1:-/tmp/rg/ripgrep-14.1.1}
 CORPUS=${2:-/tmp/rgcorpus}
 N=nightly-2026-11-17
 export RUSTUP_HOME=${RUSTUP_HOME:-/workspace/.rustup}
@@ -23,20 +27,42 @@ export PATH="$CARGO_HOME/bin:$PATH"
 
 die() { echo "rgbench: $*" >&2; exit 1; }
 
-# A checkout is built by running its build scripts, so an existing one is only
-# trusted when it is the expected crate and no other user can have modified it.
+# A checkout is *built*, so its build scripts run as this user: an existing tree
+# is only trusted when it is the expected crate, owned by this user, and neither
+# it nor its parent is writable by anyone else. Without a SRC argument the tree
+# is unpacked into a private (0700) temporary directory instead of a predictable
+# path under a shared /tmp, where another user could plant a checkout first.
+private_work() {
+  [ -z "${SRC:-}" ] || return 0
+  work=$(mktemp -d "${TMPDIR:-/tmp}/rgbench-src.XXXXXX") || die "cannot create a private work dir"
+  trap 'rm -rf "$work"' EXIT
+  SRC=$work/ripgrep-14.1.1
+}
+SRC=${1:-}
+private_work
+
 if [ -d "$SRC" ]; then
+  [ ! -L "$SRC" ] || die "$SRC is a symlink; pass a real directory"
+  [ -O "$SRC" ] || die "$SRC is not owned by $(id -un); pass a private SRC or remove it"
   perm=$(stat -c '%A' "$SRC")
   case "${perm:5:1}${perm:8:1}" in
     *w*) die "$SRC is writable by group/other; pass a private SRC or remove it" ;;
+  esac
+  parent=$(dirname "$SRC")
+  pparent=$(stat -c '%A' "$parent" 2>/dev/null) || die "$parent does not exist"
+  case "${pparent:5:1}${pparent:8:1}" in
+    *w*) die "$parent is writable by group/other; put SRC under a private directory" ;;
   esac
   [ -f "$SRC/Cargo.toml" ] || die "$SRC has no Cargo.toml; pass a clean SRC"
   grep -qx 'name = "ripgrep"' "$SRC/Cargo.toml" || die "$SRC is not ripgrep"
   grep -qx 'version = "14.1.1"' "$SRC/Cargo.toml" || die "$SRC is not ripgrep 14.1.1"
 else
   mkdir -p "$(dirname "$SRC")" || exit 1
-  curl -sL https://static.crates.io/crates/ripgrep/ripgrep-14.1.1.crate |
-    tar xz -C "$(dirname "$SRC")" || exit 1
+  crate=$(mktemp "${TMPDIR:-/tmp}/ripgrep-14.1.1.XXXXXX") || die "cannot create a temp file"
+  curl -fsSL https://static.crates.io/crates/ripgrep/ripgrep-14.1.1.crate -o "$crate" ||
+    { rm -f "$crate"; die "download failed"; }
+  tar xzf "$crate" -C "$(dirname "$SRC")" || { rm -f "$crate"; die "unpack failed"; }
+  rm -f "$crate"
 fi
 
 [ -d "$CORPUS" ] || die "corpus $CORPUS is missing (see the header for how to build it)"
@@ -45,7 +71,9 @@ find "$CORPUS" -name '*.txt' -print -quit | grep -q . ||
 
 # `cargo` takes RUSTC as a bare executable, so the LLVM column needs the
 # toolchain's own `rustc` path rather than a `rustc +toolchain` command line.
-RUSTC_LLVM=$(RUSTUP_HOME="$RUSTUP_HOME" "$CARGO_HOME/bin/rustup" which --toolchain "$N" rustc)
+RUSTC_LLVM=$(RUSTUP_HOME="$RUSTUP_HOME" "$CARGO_HOME/bin/rustup" which --toolchain "$N" rustc) ||
+  die "cannot resolve rustc for $N"
+[ -x "$RUSTC_LLVM" ] || die "rustc for $N is missing ($RUSTC_LLVM)"
 declare -A RC=(
   [L]="$RUSTC_LLVM"
   [U]="$ROOT/cg_clif_upstream/dist/bin/rustc-clif"

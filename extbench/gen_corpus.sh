@@ -6,9 +6,11 @@ set -eu
 out=${1:?usage: gen_corpus.sh <outdir> [files] [lines]}
 files=${2:-800}
 lines=${3:-300}
-# Never delete a directory this script did not generate.
+# Never delete a directory this script did not generate: only a tree carrying
+# the marker written below is ours to replace.
+marker=$out/.gen_corpus
 if [ -e "$out" ]; then
-  if [ -f "$out/d0/f1.txt" ]; then
+  if [ -f "$marker" ] && [ "$(cat "$marker")" = gen_corpus ]; then
     rm -rf -- "$out"
   else
     echo "gen_corpus: $out exists and is not a generated corpus; refusing to delete it" >&2
@@ -16,6 +18,7 @@ if [ -e "$out" ]; then
   fi
 fi
 mkdir -p "$out"
+echo gen_corpus > "$marker"
 for i in $(seq 1 "$files"); do
   d="$out/d$((i % 20))"
   mkdir -p "$d"

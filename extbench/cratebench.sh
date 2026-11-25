@@ -84,12 +84,16 @@ for bk in L U M; do
       fi
       out=$(md5sum <"$OUTDIR/out_$bk.txt" | cut -c1-8)
     else
-      out=$(BIN="$bin" bash -c "$RUNCMD" 2>/dev/null | md5sum | cut -c1-8)
+      # `$?` after a pipeline is md5sum's, so the workload's own status has to be
+      # kept explicitly: a failed run must not contribute a hash.
+      cap=$(BIN="$bin" bash -c "$RUNCMD" 2>/dev/null) || { echo "$bk CAPTURE_FAIL"; continue; }
+      out=$(printf '%s' "$cap" | md5sum | cut -c1-8)
     fi
   elif [ -n "$WORK" ]; then
     rres=$(python3 "$TM" --reps "$RREPS" --warmup 1 --json -- "$bin" "$WORK" | jf)
     read -r rw rc rr re <<<"$rres"
-    out=$("$bin" "$WORK" 2>/dev/null | md5sum | cut -c1-8)
+    cap=$("$bin" "$WORK" 2>/dev/null) || { echo "$bk CAPTURE_FAIL"; continue; }
+    out=$(printf '%s' "$cap" | md5sum | cut -c1-8)
   else
     printf '%-2s | %8sms %8sms %7sM | %10s | -\n' "$bk" "$cw" "$cc" "$((cr/1024))" "$sz"
     continue
@@ -104,6 +108,10 @@ for bk in L U M; do
   OK[$bk]=1
 done
 
+if [ -n "${OUTDIR:-}" ] && [ -z "$WORK" ] && [ -z "${RUNCMD:-}" ]; then
+  echo "outputs: not compared (compile-only run: no workload)"
+  exit 0
+fi
 if [ -n "${OUTDIR:-}" ]; then
   bad=0
   for bk in L U M; do
