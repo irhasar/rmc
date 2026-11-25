@@ -1,4 +1,20 @@
 ## Session (2026-11-24, branch `rakit-exp12`) — store-forward address memoisation; write-once rule rejected
+## Session (2026-11-25, branch `rakit-exp12`) — review round 9: a store that leaves the object
+
+- **Bug:** `covered()` only asked whether the union of stores *reaches* the
+  object size (`end >= size`), so a 16-byte store at offset 32 of a 40-byte slot
+  covered the tail while writing 8 bytes past it, and the regression passed.
+  Coverage is now bounded: any store with `off < 0` or `off + w > size` is
+  rejected outright ("16-byte store at 32 overruns the 40-byte object") instead
+  of being allowed to cover what it overruns.
+- **Pinned by a third self-test** (`vol_over`): four 8-byte stores plus one
+  16-byte store at 32. The pre-fix checker accepts it, the fixed one rejects it,
+  and the harness reports "volatile checker accepts a write past the object" if
+  the guard is removed — verified by sourcing the block with the guard deleted
+  (`fail=1`) and with it (`fail=0`).
+- The real `t_volatile_dead` dump still passes, so the stricter bound raises no
+  false positive. Harness-only change: no compiler or std rebuild.
+
 ## Session (2026-11-25, branch `rakit-exp12`) — review round 8: the checks the harness silently lost
 
 - **Round 7 deleted the volatile IR check.** Rewriting the deep-cast block by

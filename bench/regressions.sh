@@ -216,6 +216,12 @@ for reg, size in want.items():
             if w is None:
                 print(f"region {reg}: unknown width for stored {value} in {slot}", file=sys.stderr)
                 sys.exit(1)
+            if off < 0 or off + w > size:
+                # A store that leaves the object is a bug of its own; it must not
+                # be allowed to "cover" the tail it overruns.
+                print(f"region {reg}: {w}-byte store at {off} overruns the {size}-byte object in {slot}",
+                      file=sys.stderr)
+                sys.exit(1)
             ranges.append((off, off + w))
         if covered(ranges, size):
             ok = True
@@ -244,8 +250,9 @@ else
     fi
     # Self-test. A width-blind checker accepts the first dump (three 8-byte
     # stores at 0/16/32 leave 16 of 40 bytes unwritten) and rejects the second
-    # (one 16-byte store covers the whole 16-byte object), so both directions
-    # are pinned here instead of relying on what the backend happens to emit.
+    # (one 16-byte store covers the whole 16-byte object). The third covers the
+    # 40-byte object only by writing 8 bytes past its end, which a checker that
+    # only asks "does the union reach the size" accepts.
     cat > "$TMP/vol_gap.rakit" <<'RAKITEOF'
     ss0 = explicit_slot 16, align = 8
     ss1 = explicit_slot 40, align = 8
@@ -276,12 +283,33 @@ block0:
     store notrap v4, v2+16
     store notrap v3, v2+32
 RAKITEOF
+    cat > "$TMP/vol_over.rakit" <<'RAKITEOF'
+    ss0 = explicit_slot 16, align = 8
+    ss1 = explicit_slot 40, align = 8
+block0:
+    v1 = stack_addr.i64 ss0
+    v2 = stack_addr.i64 ss1
+    v3 = load.i64 v9
+    v4 = load.i8x16 v9
+    fence
+    store notrap v4, v1
+    fence
+    store notrap v3, v2
+    store notrap v3, v2+8
+    store notrap v3, v2+16
+    store notrap v3, v2+24
+    store notrap v4, v2+32
+RAKITEOF
     if python3 "$TMP/volcheck.py" "$TMP/vol_gap.rakit" >/dev/null 2>&1; then
         echo "[regression] volatile checker accepts a gapped 40-byte write" >&2
         fail=1
     fi
     if ! python3 "$TMP/volcheck.py" "$TMP/vol_wide.rakit" >/dev/null 2>&1; then
         echo "[regression] volatile checker rejects a single 16-byte write" >&2
+        fail=1
+    fi
+    if python3 "$TMP/volcheck.py" "$TMP/vol_over.rakit" >/dev/null 2>&1; then
+        echo "[regression] volatile checker accepts a write past the object" >&2
         fail=1
     fi
 fi
