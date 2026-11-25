@@ -383,30 +383,82 @@ fn build_isa(sess: &Session, jit: bool) -> Arc<dyn TargetIsa + 'static> {
         }
     };
 
-    // Apply `-Ctarget-feature=+feat`. Without this the builder only sees the
-    // CPU name, so `+avx2`/`+bmi2`/`+fma` are silently dropped and code that
-    // relies on them (`memchr`, `aho-corasick`, `regex`) stays on the SSE2 or
-    // scalar path. Unknown names (e.g. `crt-static`) are not ISA features.
+    // Apply the target's features to the ISA builder. Without this the builder
+    // only sees the CPU name, so `+avx2`/`+bmi2`/`+fma` are silently dropped and
+    // code that relies on them (`memchr`, `aho-corasick`, `regex`) stays on the
+    // SSE2 or scalar path. Unknown names (e.g. `crt-static`) are not ISA
+    // features, so a failed `enable` is ignored.
     let mut isa_builder = isa_builder;
     let cg_features = &sess.opts.cg.target_feature;
     let debug = std::env::var_os("RAKIT_ISA_DEBUG").is_some();
+
+    // rustc spells the x86 features `avx2` / `sse4.1`, Cranelift's settings are
+    // `has_avx2` / `has_sse41`, and one setting is spelled with an underscore.
+    fn clif_setting(name: &str) -> String {
+        match name {
+            "avxvnni" => "has_avx_vnni".to_string(),
+            other => format!("has_{}", other.replace('.', "")),
+        }
+    }
+
+    // `internal_target_features` adds the `-Ctarget-feature` flags to the
+    // target's own list; the raw strings are applied too so Cranelift-specific
+    // names still work.
+    let enabled: Vec<&str> = sess
+        .internal_target_features
+        .iter()
+        .map(|f| f.as_str())
+        .chain(
+            sess.target
+                .features
+                .split(',')
+                .chain(cg_features.split(','))
+                .filter_map(|f| f.strip_prefix('+')),
+        )
+        .collect();
+    for &name in &enabled {
+        let mut res = isa_builder.enable(name);
+        if res.is_err() {
+            res = isa_builder.enable(&clif_setting(name));
+        }
+        if debug {
+            eprintln!("rakit: target feature +{} -> {:?}", name, res);
+        }
+    }
+
+    // Cranelift gates every VEX/EVEX encoding on `has_avx`, while rustc applies
+    // `-Ctarget-feature` without resolving the implied features: `+avx2` alone
+    // leaves `has_avx` unset and the backend silently keeps the SSE2 lowering.
+    if matches!(target_tuple.architecture, target_lexicon::Architecture::X86_64) {
+        let wants_avx = enabled.iter().any(|f| *f == "fma" || f.starts_with("avx"));
+        let wants_avx2 = enabled.iter().any(|f| f.starts_with("avx512"));
+        if wants_avx2 {
+            let _ = isa_builder.set("has_avx2", "true");
+        }
+        if wants_avx || wants_avx2 {
+            let _ = isa_builder.set("has_avx", "true");
+        }
+        if debug {
+            eprintln!(
+                "rakit: avx widening -> avx={:?} avx2={:?}",
+                wants_avx || wants_avx2,
+                wants_avx2
+            );
+        }
+    }
+
     for feat in sess.target.features.split(',').chain(cg_features.split(',')) {
-        // rustc spells the x86 features `avx2` / `sse4.1`; Cranelift's settings
-        // are `has_avx2` / `has_sse41`, so try both spellings.
-        let clif_name = |name: &str| format!("has_{}", name.replace('.', ""));
-        if let Some(name) = feat.strip_prefix('+') {
-            let mut res = isa_builder.enable(name);
-            if res.is_err() {
-                res = isa_builder.enable(&clif_name(name));
-            }
-            if debug {
-                eprintln!("rakit: target feature +{} -> {:?}", name, res);
-            }
-        } else if let Some(name) = feat.strip_prefix('-') {
-            let res = isa_builder.set(&clif_name(name), "false");
-            if debug {
-                eprintln!("rakit: target feature -{} -> {:?}", name, res);
-            }
+        let Some(name) = feat.strip_prefix('-') else { continue };
+        let res = isa_builder.set(&clif_setting(name), "false");
+        if name == "c" {
+            // rustc's `-c` turns off both halves of the RISC-V compressed
+            // preset, which Cranelift exposes as two settings; `set` rejects the
+            // preset name itself, so neither would otherwise be cleared.
+            let _ = isa_builder.set("has_zca", "false");
+            let _ = isa_builder.set("has_zcd", "false");
+        }
+        if debug {
+            eprintln!("rakit: target feature -{} -> {:?}", name, res);
         }
     }
 
