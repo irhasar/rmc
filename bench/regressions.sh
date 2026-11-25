@@ -92,6 +92,26 @@ check t_vectorize_inplace $'n=1000 2067684494068040691 4955472742519183899 22573
 check t_vectorize_slice $'n=1000 2067684494068040691 2257382229062978179 2067684494068040691\nn=999 4938945738208900473 6360620038797656489 4938945738208900473\nn=17 3956057608133206998 14400859015502114329 3956057608133206998\nn=15 4854181577974998993 4245625956762491497 4854181577974998993\nn=1 4953162257141659110 4953163356653287321 4953162257141659110\nn=0 1469598103934665603 1469598103934665603 1469598103934665603'
 check t_vectorize_guards $'n=1000 sum=499500 ctr=1000 mul2=14734897173167142259 mul8=5635034875195320451 sum2=499500 ctr2=1000\nn=4 sum=6 ctr=4 mul2=4806693891325407483 mul8=17023279625793469443 sum2=6 ctr2=4\nn=3 sum=3 ctr=3 mul2=12198867445692768159 mul8=12189314888668763241 sum2=3 ctr2=3\nn=1 sum=0 ctr=1 mul2=4953163356653287321 mul8=4953163356653287321 sum2=0 ctr2=1\nn=0 sum=0 ctr=0 mul2=1469598103934665603 mul8=1469598103934665603 sum2=0 ctr2=0'
 check t_volatile $'n=1000 loop=17230722056597992339\nn=17 loop=18156365728903607819\nn=1 loop=4953257914653313467\nn=0 loop=1469598103934665603\nv256 18004264572236793056\nv12 3735928559 305419896 3405691582\nv40 16438386427504056938\nv512 74bf1cf9249bb103\nvstk 1230'
+check t_copy_overlap $'N=16 shift=1 11664426682378596937\nback N=16 shift=1 12713388859568982132\nN=32 shift=1 774115827419797049\nback N=32 shift=1 5146083939088780532\nN=32 shift=7 16864641215232849398\nback N=32 shift=7 6744451032907730017\nN=48 shift=3 11240810308952937694\nback N=48 shift=3 9582033626409429593\nN=64 shift=1 4928807640131852377\nback N=64 shift=1 13460265805155334836\nN=64 shift=16 3546406609664978499\nback N=64 shift=16 14022381290388415283\nnonoverlap 1882637779704813251'
+check t_simd_mask $'i8x8 eq [-1, 0, -1, 0, -1, 0, -1, 0]\ni64x8 lt [0, 0, 0, -1, 0, -1, 0, 0]\ni32x8 lt [0, 0, 0, -1, 0, -1, 0, 0]\nu8x2 eq [255, 0]'
+check t_volatile_dead 'written'
+
+# A volatile write must not be elided. `volatile_store` lowers to `fence` plus
+# ordinary stores (Rakit has no volatile bit), so a store has to survive after
+# the fence even when nothing reads the destination.
+if command -v objdump >/dev/null 2>&1; then
+    env -u RAKIT_HOST_LLVM "$ROOT/rakit/dist/bin/rustc-rakit" --target "$TARGET" \
+        -C opt-level=3 "$BENCH/tests/t_volatile_dead.rs" -o "$TMP/vdead" \
+        --edition 2021 --emit=llvm-ir >/dev/null 2>&1
+    vdump=$(ls "$TMP"/vdead.rakit/*4main.opt.rakit 2>/dev/null | head -1)
+    if [ -z "$vdump" ]; then
+        echo "[regression] t_volatile_dead: no IR dump" >&2
+        fail=1
+    elif ! awk '/fence/{f=1} f && /^[ \t]+store/{found=1} END{exit !found}' "$vdump"; then
+        echo "[regression] t_volatile_dead: volatile stores were elided" >&2
+        fail=1
+    fi
+fi
 
 # Output equality alone cannot prove the vectorizer ran. Each fixture below
 # contains exactly one xor+imul loop, so a packed multiply (SSE2 lowering of

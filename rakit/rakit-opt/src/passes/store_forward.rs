@@ -632,6 +632,9 @@ fn forward_block(
     prov: &FxHashMap<Base, StackSlot>,
 ) {
     let mut avail: Avail = entry.get(&block).cloned().unwrap_or_default();
+    // Set by a fence: the rest of the block may hold volatile accesses, which
+    // this pass must neither forward into nor make forwardable.
+    let mut sealed = false;
 
     for inst in func.layout.block_insts(block).collect::<Vec<_>>() {
         let opcode = func.dfg.insts[inst].opcode();
@@ -640,11 +643,17 @@ fn forward_block(
             if opcode == ir::Opcode::Fence {
                 // A fence orders the accesses around it, and `volatile_load`
                 // lowers to fence + trapping loads: a value stored before it
-                // must not be forwarded into a load after it.
+                // must not be forwarded into a load after it. Stores after it
+                // may be volatile writes, so they must not become facts either:
+                // forwarding their only reader would delete the write.
                 avail.clear();
+                sealed = true;
             } else {
                 avail.retain(|&(b, _), _| matches!(b, Base::Slot(_)));
             }
+            continue;
+        }
+        if sealed {
             continue;
         }
         if opcode.can_store() {
@@ -928,8 +937,17 @@ fn drop_dead_stores(
 
     let mut dead: Vec<Inst> = Vec::new();
     for block in func.layout.blocks() {
+        // Rakit has no volatile bit: `volatile_store` lowers to `fence` plus
+        // ordinary stores, so after a fence a store may be an observable write
+        // and must survive even with no reader.
+        let mut saw_fence = false;
         for inst in func.layout.block_insts(block) {
-            if !func.dfg.insts[inst].opcode().can_store() {
+            let opcode = func.dfg.insts[inst].opcode();
+            if opcode == ir::Opcode::Fence {
+                saw_fence = true;
+                continue;
+            }
+            if saw_fence || !opcode.can_store() {
                 continue;
             }
             let args = func.dfg.insts[inst].arguments(&func.dfg.value_lists);
