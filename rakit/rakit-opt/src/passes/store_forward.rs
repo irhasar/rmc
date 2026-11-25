@@ -262,6 +262,9 @@ fn run_body(
     // `analyze` skips a full instruction walk over every such function, which on
     // a large crate is most of them (8843 functions, ~45 us each).
     if func.sized_stack_slots.is_empty() && func.dynamic_stack_slots.is_empty() {
+        if crate::tunables::store_forward_debug() {
+            eprintln!("[sf] {} no stack slot", func.name);
+        }
         return;
     }
     let Some(Bases { private_slots: private, ptr_bases, loaded, confined, prov }) = analyze(func)
@@ -277,6 +280,9 @@ fn run_body(
     // Nothing the pass can track: no private slot and no non-escaping pointer
     // base means no store is forwardable and no dead store can be identified.
     if private.is_empty() && ptr_bases.is_empty() {
+        if crate::tunables::store_forward_debug() {
+            eprintln!("[sf] {} nothing trackable", func.name);
+        }
         return;
     }
     // Facts that hold on every path into a block. Seeding each block with these

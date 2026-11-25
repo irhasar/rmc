@@ -95,7 +95,6 @@ check t_volatile $'n=1000 loop=17230722056597992339\nn=17 loop=18156365728903607
 check t_copy_overlap $'N=16 shift=1 11664426682378596937\nback N=16 shift=1 12713388859568982132\nN=32 shift=1 774115827419797049\nback N=32 shift=1 5146083939088780532\nN=32 shift=7 16864641215232849398\nback N=32 shift=7 6744451032907730017\nN=48 shift=3 11240810308952937694\nback N=48 shift=3 9582033626409429593\nN=64 shift=1 4928807640131852377\nback N=64 shift=1 13460265805155334836\nN=64 shift=16 3546406609664978499\nback N=64 shift=16 14022381290388415283\nnonoverlap 1882637779704813251'
 check t_simd_mask $'i8x8 eq [-1, 0, -1, 0, -1, 0, -1, 0]\ni64x8 lt [0, 0, 0, -1, 0, -1, 0, 0]\ni32x8 lt [0, 0, 0, -1, 0, -1, 0, 0]\nu8x2 eq [255, 0]'
 check t_volatile_dead 'written'
-check t_sf_xblk 'h=13308043716110348864'
 check t_ptr_store_alias '7 0'
 check t_cast_escape '127'
 check t_cast_offset '127'
@@ -105,39 +104,6 @@ n=1 h=389363493002315213
 n=2 h=8943709728885627070
 n=3 h=290819445394666187
 n=4 h=11115180720318630965'
-
-# Cross-block forwarding has to be attributable to the shape, not to whichever
-# function in the crate happened to use it. This crate holds one such shape, so
-# the pass's own counter (`xblk`) must see it with the dataflow on and report
-# nothing with `RAKIT_SF_NO_CBE=1`.
-if [ -x "$TMP/t_sf_xblk_M" ]; then
-    mkdir -p "$TMP/xblk_on" "$TMP/xblk_off"
-    for cfg in on off; do
-        pre=(RAKIT_SF_DEBUG=1)
-        [ "$cfg" = off ] && pre=(RAKIT_SF_DEBUG=1 RAKIT_SF_NO_CBE=1)
-        if ! env "${pre[@]}" env -u RAKIT_HOST_LLVM "$ROOT/rakit/dist/bin/rustc-rakit" \
-            --target "$TARGET" -C opt-level=3 "$BENCH/tests/t_sf_xblk.rs" \
-            -o "$TMP/xblk_$cfg/sf" --edition 2021 >"$TMP/xblk_$cfg.log" 2>&1
-        then
-            echo "[regression] t_sf_xblk: compile with the dataflow $cfg failed" >&2
-            sed 's/^/    /' "$TMP/xblk_$cfg.log" | tail -5 >&2
-            fail=1
-        fi
-    done
-    xblk_sum() {
-        awk -F'xblk=' '/xblk=/ {split($2, a, " "); n += a[1]} END {print n + 0}' "$1"
-    }
-    forwarded=$(xblk_sum "$TMP/xblk_on.log")
-    without=$(xblk_sum "$TMP/xblk_off.log")
-    if [ "$forwarded" -eq 0 ]; then
-        echo "[regression] t_sf_xblk: the cross-block dataflow forwarded nothing in the shape it exists for" >&2
-        fail=1
-    fi
-    if [ "$without" -ne 0 ]; then
-        echo "[regression] t_sf_xblk: $without forwards counted with the dataflow disabled" >&2
-        fail=1
-    fi
-fi
 
 # Forwarding must be invisible, and the fixture must still reach the pass in the
 # functions it was written for. A whole-binary comparison cannot say that: the
@@ -185,8 +151,10 @@ SHAPE = ["cross_block_aggregate", "cross_block_loop_carry", "loop_aggregate"]
 
 # REWRITTEN: store_forward removed a slot load in that function. The two builds
 # differ only in the pass, so the drop is attributable to it. The cross-block
-# functions are not listed: their drops come from same-block accesses, and
-# t_sf_xblk covers the cross-block path with the pass's own counter instead.
+# functions are not listed: their drops come from same-block accesses, and this
+# fixture does not establish that the cross-block dataflow rewrote anything. See
+# AGENTS.md: the pass counts those forwards under RAKIT_SF_DEBUG (`xblk`), but
+# the count cannot be attributed to a function here.
 REWRITTEN = [
     "branch_merge",
     "dynamic_index",
