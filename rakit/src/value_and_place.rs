@@ -5,6 +5,7 @@ use rakit_codegen::ir::immediates::Offset32;
 use rakit_frontend::Variable;
 use rustc_middle::ty::FnSig;
 use rustc_middle::ty::layout::HasTypingEnv;
+use rustc_target::spec::Arch;
 
 use crate::prelude::*;
 
@@ -636,7 +637,11 @@ impl<'tcx> CPlace<'tcx> {
                             // AVX) have no single store, so they keep the memcpy.
                             BackendRepr::SimdVector { .. }
                                 if dst_layout.size.bytes().is_multiple_of(16)
-                                    && dst_layout.size.bytes() <= 64 =>
+                                    && dst_layout.size.bytes() <= 64
+                                    && matches!(
+                                        fx.tcx.sess.target.arch,
+                                        Arch::X86_64 | Arch::AArch64
+                                    ) =>
                             {
                                 // Copy 16 bytes per instruction. Wider vectors have no
                                 // single load/store on the x64 baseline, and

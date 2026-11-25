@@ -52,6 +52,14 @@ fn simd_bitmask_uses_vhigh_bits(arch: &Arch, lane_count: u64, lane_rakit_ty: Typ
         )
 }
 
+/// Whether the target lowers 128-bit vector types at all. Splitting a 32-byte
+/// value into `I8X16` halves is only valid where `I8X16` is a legal type: the
+/// riscv64 and s390x backends have no baseline vector support and fail in the
+/// backend on such a type, so those targets keep the scalar per-lane paths.
+fn simd_vectors_supported(fx: &FunctionCx<'_, '_, '_>) -> bool {
+    matches!(fx.tcx.sess.target.arch, Arch::X86_64 | Arch::AArch64)
+}
+
 /// A 32-byte SIMD value has no native RAKIT type: the x64 backend lowers only
 /// 128-bit vectors, and `Type::by` does not build wider ones. Such values are
 /// therefore processed as two 16-byte halves, each reusing the existing 128-bit
@@ -60,12 +68,39 @@ fn simd_half_ty<'tcx>(fx: &FunctionCx<'_, '_, 'tcx>, layout: TyAndLayout<'tcx>) 
     if layout.size.bytes() != 32 {
         return None;
     }
+    if !simd_vectors_supported(fx) {
+        return None;
+    }
     let (lane_count, lane_ty) = layout.ty.simd_size_and_type(fx.tcx);
     if matches!(lane_ty.kind(), ty::Float(FloatTy::F16) | ty::Float(FloatTy::F128)) {
         return None;
     }
+    // A 32-byte layout only splits into two 16-byte halves when the lanes divide
+    // evenly; padding (`[i32; 5]`) or a 16-byte scalar lane (`i128`) leaves a
+    // half that is not a legal 128-bit vector.
+    if !lane_count.is_multiple_of(2) {
+        return None;
+    }
     let half_lanes = u32::try_from(lane_count / 2).ok()?;
-    fx.rakit_type(lane_ty)?.by(half_lanes)
+    let half = fx.rakit_type(lane_ty)?.by(half_lanes)?;
+    (half.is_vector() && half.bytes() == 16).then_some(half)
+}
+
+/// Whether `ret` is a mask with the same lane count and lane size as the
+/// comparison input, so one vector compare can fill it directly. Rust's SIMD
+/// comparison intrinsics take the mask lane type as a separate parameter, so
+/// `i32x8` may be compared into an `i8x8` (8 bytes) or `i64x8` (64 bytes)
+/// result; a single compare of the input lanes cannot produce either.
+fn simd_mask_shape_matches<'tcx>(
+    fx: &FunctionCx<'_, '_, 'tcx>,
+    ret: TyAndLayout<'tcx>,
+    lane_ty: Ty<'tcx>,
+    lane_count: u64,
+) -> bool {
+    let (ret_lanes, ret_lane_ty) = ret.ty.simd_size_and_type(fx.tcx);
+    ret_lanes == lane_count
+        && ret_lane_ty.is_integral()
+        && fx.layout_of(ret_lane_ty).size == fx.layout_of(lane_ty).size
 }
 
 fn simd_load_halves<'tcx>(
@@ -144,6 +179,7 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
             let (lane_count, lane_ty) = x.layout().ty.simd_size_and_type(fx.tcx);
             if let Some(half_ty) = simd_half_ty(fx, x.layout())
                 && lane_ty.is_integral()
+                && simd_mask_shape_matches(fx, ret.layout(), lane_ty, lane_count)
                 && let Some(cc) = simd_int_cmp_cc(lane_ty, intrinsic)
                 && simd_cmp_lowers_to_vector_instr(&fx.tcx.sess.target.arch, half_ty)
             {
@@ -153,6 +189,7 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
                 let rhi = fx.bcx.ins().icmp(cc, xhi, yhi);
                 simd_write_halves(fx, ret, rlo, rhi);
             } else if lane_ty.is_integral()
+                && simd_mask_shape_matches(fx, ret.layout(), lane_ty, lane_count)
                 && simd_int_cmp_cc(lane_ty, intrinsic).is_some()
                 && let Some(lane_rakit_ty) = fx.rakit_type(lane_ty)
                 && let Some(vec_ty) = lane_rakit_ty.by(u32::try_from(lane_count).unwrap())
