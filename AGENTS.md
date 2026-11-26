@@ -45,9 +45,19 @@ through them was wrong.
   address ranges (the first version used IP windows and both windows matched
   every frame, because `caller` was inlined into `main`): the caller is "seen"
   only when a frame reports both of its values and none of `mid`'s, and the
-  clobber is "seen" when a frame reports two or more of `mid`'s values. With the
-  old RBP-relative CFA the test prints `false true false true`; the `true` in
-  position 2 is the non-vacuity check (mid really does clobber callee-saves).
+  clobber is "seen" when a frame reports two or more of `mid`'s values. The
+  caller's two values must sit in two *different* registers (`position`, not a
+  match count, which would also accept `[A, A]`). With the old RBP-relative CFA
+  the test prints `false true false true`; the `true` in position 2 is the
+  non-vacuity check (mid really does clobber callee-saves).
+  A swap of two registers' save slots is invisible to a value-by-value check, so
+  `vendor/rakit-codegen/src/isa/x64/inst/unwind/systemv.rs` also has
+  `test_frameless_save_reg_offsets`, which feeds `create_unwind_info_from_insts`
+  the instruction list of a real prologue (`sub $0x68`, clobber area 32,
+  rbx/r12/r13 at 0/8/16) and asserts the whole FDE:
+  `[(4, CfaOffset(112)), (8, Offset(Register(3), -40)), (12, Offset(Register(12),
+  -32)), (16, Offset(Register(13), -24))]`. Its mapper reports a frame register,
+  so it also fails if the CFA rule goes back to RBP-based.
   The CFI arithmetic was also cross-checked against real machine code: for a
   frameless function with a 64 B array and rbx/r12/r13 saved at
   `0x48/0x50/0x58(%rsp)` with `CFA = rsp+112`, the FDE says `c-40/c-32/c-24`,
@@ -72,16 +82,29 @@ through them was wrong.
     `write_profile_fd` checks `ferror` *and* `fclose`: a buffered write that
     fails mid-flush sets the stream error indicator, and a later `fclose` can
     still return 0 when nothing is left to flush, so checking the close alone
-    can let a truncated capture replace a good one. Verified with `ulimit -f 1`
-    plus an inherited `SIGXFSZ` ignore: the write fails, the destination keeps
-    its previous contents and no `.sampler.*` file is left behind. Honest
-    caveat: on this glibc `fclose` also reports the EFBIG, so the `ferror` check
-    could not be shown to be the deciding one; it is required by the C stream
-    rules, not by an observed failure here.
-  - The destructor also writes `MAP <start> <end> <path>` lines for the
-    executable mappings, and `sym.py` attributes samples that land in a shared
-    library to `[libc.so.6]`/`[libm.so.6]` instead of counting them as "outside
-    any symbol". First useful result: `p4_simd` is 18% libm, not executable code.
+    can let a truncated capture replace a good one. A failure is never silent:
+    overwrite mode reports that the previous capture was kept, the other two
+    modes report the path. Verified with `ulimit -f 1` plus an inherited
+    `SIGXFSZ` ignore: the write fails, the destination keeps its previous
+    contents, the diagnostic appears on stderr and no `.sampler.*` file is left
+    behind. Honest caveat: on this glibc `fclose` also reports the EFBIG, so the
+    `ferror` check could not be shown to be the deciding one; it is required by
+    the C stream rules, not by an observed failure here.
+  - The destructor also writes `MAP <start> <end> <exe|lib> <path>` lines for
+    the executable mappings, and `sym.py` attributes samples that land in a
+    shared library to `[libc.so.6]`/`[libm.so.6]` instead of counting them as
+    "outside any symbol". First useful result: `p4_simd` is 18% libm, not
+    executable code.
+  - **The tag is what survives archiving.** A capture names the path the binary
+    had when it ran, so symbolizing a saved profile against a *copy* of the
+    binary used to file every executable sample under `[prog]` (the path
+    comparison said "not the executable, must be a library"). `dump_maps` now
+    compares each mapping against `/proc/self/exe` and tags it, and `sym.py`
+    trusts the tag before any local path. Captures written before the tag exist,
+    so `sym.py` still accepts them and takes `--exe <captured path>` to say
+    which mapping was the executable. Verified end to end: capture from
+    `/tmp/fs_p4_simd`, symbolize against `/tmp/arch/prog_copy` → `main` and the
+    iterator `fold` are named, libm/libc bucketed.
   - `sym.py` also decides "is this mapping the executable" by comparing whole
     `realpath`s, not basenames (a binary named through a symlink was reported as
     a library, and a library that shares the executable's basename bypassed

@@ -17,12 +17,12 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SYM = os.path.join(HERE, "sym.py")
 
 
-def symbolize(lines, binary):
+def symbolize(lines, binary, extra=()):
     fd, path = tempfile.mkstemp(suffix=".samples")
     try:
         with os.fdopen(fd, "w") as f:
             f.write("\n".join(lines) + "\n")
-        out = subprocess.run([sys.executable, SYM, path, binary, "10"],
+        out = subprocess.run([sys.executable, SYM, path, binary, "10", *extra],
                              capture_output=True, text=True)
     finally:
         os.unlink(path)
@@ -89,8 +89,37 @@ def test_same_named_library_is_still_a_library():
     assert "1 samples, 0 outside any symbol" in out, out
 
 
+def test_tagged_executable_survives_relocation():
+    """An archived profile names the capture-time path; the tag still wins."""
+    with tempfile.TemporaryDirectory() as d:
+        exe = os.path.join(d, "prog")
+        open(exe, "w").close()
+        out = symbolize([
+            "BASE 0",
+            "MAP 1000 2000 exe /build/prog",
+            "1500",
+        ], exe)
+    assert "[prog]" not in out, out
+    assert "1 samples, 1 outside any symbol" in out, out
+
+
+def test_exe_override_for_untagged_capture():
+    with tempfile.TemporaryDirectory() as d:
+        exe = os.path.join(d, "prog")
+        open(exe, "w").close()
+        out = symbolize([
+            "BASE 0",
+            "MAP 1000 2000 /build/prog",
+            "1500",
+        ], exe, extra=["--exe", "/build/prog"])
+    assert "[prog]" not in out, out
+    assert "1 samples, 1 outside any symbol" in out, out
+
+
 if __name__ == "__main__":
     test_appended_captures_use_their_own_mappings()
     test_symlinked_binary_is_the_executable()
     test_same_named_library_is_still_a_library()
+    test_tagged_executable_survives_relocation()
+    test_exe_override_for_untagged_capture()
     print("ok")

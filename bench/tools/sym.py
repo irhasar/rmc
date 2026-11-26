@@ -5,7 +5,15 @@
     one instruction pointer per sample. This maps each pointer to the nearest
     preceding symbol from `nm -S --defined-only` and prints the top symbols.
 
-    usage: sym.py <samples> <binary> [top]
+    Samples that landed in a shared library are attributed to that library, so
+    a profile does not silently lose the time spent in libc/libm.
+
+    usage: sym.py <samples> <binary> [top] [--exe <captured-exe-path>]
+
+    The capture marks its executable mappings (`MAP <start> <end> exe|lib
+    <path>`), so the histogram is correct even when <binary> is a copy kept
+    next to an archived profile. For captures made before that marker existed,
+    pass `--exe` with the executable path recorded in the capture.
 """
 import os
 import subprocess
@@ -33,10 +41,29 @@ def load_symbols(binary):
     return syms
 
 
+def parse_args(argv):
+    exe_override = None
+    rest = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--exe" and i + 1 < len(argv):
+            exe_override = argv[i + 1]
+            i += 2
+        elif a.startswith("--exe="):
+            exe_override = a.split("=", 1)[1]
+            i += 1
+        else:
+            rest.append(a)
+            i += 1
+    if len(rest) < 2:
+        sys.exit(__doc__.strip())
+    top = int(rest[2]) if len(rest) > 2 else 20
+    return rest[0], rest[1], top, exe_override
+
+
 def main():
-    samples = sys.argv[1]
-    binary = sys.argv[2]
-    top = int(sys.argv[3]) if len(sys.argv) > 3 else 20
+    samples, binary, top, exe_override = parse_args(sys.argv[1:])
     syms = load_symbols(binary)
     starts = [s[0] for s in syms]
     counts = Counter()
@@ -44,10 +71,12 @@ def main():
     unknown = 0
     base = 0
     maps = []
-    # A capture may name the binary through a symlink, and the mapping records
-    # the file it resolved to; compare whole real paths, not basenames, so a
-    # library that happens to share the executable's name is still a library.
-    exe_path = os.path.realpath(binary)
+    # `nm` can only name the executable's own symbols, so the question "is this
+    # mapping the executable" decides between symbol lookup and a library
+    # bucket. A capture answers it with the `exe` tag; for an untagged capture
+    # fall back to comparing paths, where `--exe` supplies the path recorded at
+    # capture time (which differs when the binary was archived elsewhere).
+    exe_path = os.path.realpath(exe_override) if exe_override else os.path.realpath(binary)
     for line in open(samples):
         line = line.strip()
         if not line:
@@ -59,19 +88,21 @@ def main():
             maps.clear()
             continue
         if line.startswith("MAP "):
-            _, start, end, path = line.split(" ", 3)
-            maps.append((int(start, 16), int(end, 16), path))
+            start, end, tail = line[4:].split(" ", 2)
+            tag = ""
+            if tail.startswith("exe ") or tail.startswith("lib "):
+                tag, tail = tail.split(" ", 1)
+            maps.append((int(start, 16), int(end, 16), tag, tail))
             continue
         ip = int(line, 16)
         total += 1
-        # `nm` can only name the executable's own symbols. A sample that landed
-        # in a shared library (libc's memcpy, the libm calls, ...) is still real
-        # work, so attribute it to that library instead of dropping it into the
-        # "outside any symbol" bucket.
-        owner = next((p for (lo, hi, p) in maps if lo <= ip < hi), None)
-        if owner is not None and os.path.realpath(owner) != exe_path:
-            counts[f"[{os.path.basename(owner)}]"] += 1
-            continue
+        owner = next((m for m in maps if m[0] <= ip < m[1]), None)
+        if owner is not None:
+            tag, path = owner[2], owner[3]
+            is_exe = tag == "exe" if tag else os.path.realpath(path) == exe_path
+            if not is_exe:
+                counts[f"[{os.path.basename(path)}]"] += 1
+                continue
         ip -= base
         i = bisect.bisect_right(starts, ip) - 1
         if i < 0:

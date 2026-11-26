@@ -137,6 +137,72 @@ mod tests {
         );
     }
 
+    /// The per-register rules of a frameless frame, checked against a real
+    /// prologue: `sub $0x68` (104 bytes = 72 bytes of fixed frame and stack
+    /// slots plus a 32 byte clobber area) with rbx/r12/r13 stored at
+    /// 0x48/0x50/0x58(%rsp). CFA is RSP+112, so the rules must be -40/-32/-24;
+    /// pairing a register with another register's slot would pass a
+    /// value-by-value check but fail here.
+    #[test]
+    fn test_frameless_save_reg_offsets() {
+        use crate::isa::unwind::UnwindInst;
+        use crate::isa::unwind::systemv::{
+            RegisterMapper, RegisterMappingError, create_unwind_info_from_insts,
+        };
+        use crate::isa::x64::inst::regs;
+
+        struct Mapper;
+        impl RegisterMapper<crate::machinst::Reg> for Mapper {
+            fn map(&self, reg: crate::machinst::Reg) -> Result<u16, RegisterMappingError> {
+                let real = reg.to_real_reg().expect("expected a real register");
+                Ok(real.hw_enc() as u16)
+            }
+            // x86-64 has a frame register, so a frame that never pushes it must
+            // not be described in terms of it.
+            fn fp(&self) -> Option<u16> {
+                Some(regs::rbp().to_real_reg().expect("real register").hw_enc() as u16)
+            }
+        }
+
+        let insts = vec![
+            (
+                0,
+                UnwindInst::DefineNewFrame {
+                    offset_upward_to_caller_sp: 8,
+                    offset_downward_to_clobbers: 32,
+                },
+            ),
+            (4, UnwindInst::StackAlloc { size: 104 }),
+            (
+                8,
+                UnwindInst::SaveReg {
+                    reg: regs::rbx().to_real_reg().expect("real register"),
+                    clobber_offset: 0,
+                },
+            ),
+            (
+                12,
+                UnwindInst::SaveReg {
+                    reg: regs::r12().to_real_reg().expect("real register"),
+                    clobber_offset: 8,
+                },
+            ),
+            (
+                16,
+                UnwindInst::SaveReg {
+                    reg: regs::r13().to_real_reg().expect("real register"),
+                    clobber_offset: 16,
+                },
+            ),
+        ];
+
+        let info = create_unwind_info_from_insts(&insts, 20, &Mapper).expect("unwind info");
+        assert_eq!(
+            format!("{:?}", info.to_fde(Address::Constant(0))),
+            "FrameDescriptionEntry { address: Constant(0), length: 20, lsda: None, instructions: [(4, CfaOffset(112)), (8, Offset(Register(3), -40)), (12, Offset(Register(12), -32)), (16, Offset(Register(13), -24))] }"
+        );
+    }
+
     /// A function compiled without a frame pointer must describe its CFA in
     /// terms of RSP: RBP still holds the *caller's* frame pointer, so an
     /// FP-relative rule would point the unwinder at the caller's frame and lose

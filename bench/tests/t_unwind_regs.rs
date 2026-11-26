@@ -40,13 +40,19 @@ extern "C" fn record(ctx: *mut Ctx, _arg: *mut u8) -> i32 {
         for (i, &gr) in [3, 12, 13, 14, 15].iter().enumerate() {
             regs[i] = _Unwind_GetGR(ctx, gr) as u64;
         }
-        let caller_values = regs.iter().filter(|&&v| v == A || v == B).count();
+        // Both values must be present in two *different* registers: counting
+        // matches would also accept two copies of A, which does not show that
+        // the second register was restored at all.
+        let a_pos = regs.iter().position(|&v| v == A);
+        let b_pos = regs.iter().position(|&v| v == B);
         let mid_values = regs
             .iter()
             .filter(|&&v| v == C || v == D || v == E || v == F)
             .count();
-        if caller_values == 2 && mid_values == 0 {
-            SEEN_CALLER = true;
+        if let (Some(a_pos), Some(b_pos)) = (a_pos, b_pos) {
+            if a_pos != b_pos && mid_values == 0 {
+                SEEN_CALLER = true;
+            }
         }
         if mid_values >= 2 {
             SEEN_CLOBBER = true;

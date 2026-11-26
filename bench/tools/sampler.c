@@ -96,12 +96,18 @@ __attribute__((constructor)) static void sampler_init(void) {
 }
 
 // Record the executable mappings so sym.py can tell executable samples from
-// library ones instead of counting the latter as "outside any symbol".
+// library ones instead of counting the latter as "outside any symbol". Each
+// mapping carries a tag: "exe" for the executable itself, "lib" for everything
+// else. The tag is what lets a profile be symbolized against a copy of the
+// binary (an archived run), where the captured path no longer exists.
 static void dump_maps(FILE *f) {
     FILE *m = fopen("/proc/self/maps", "r");
     if (!m) {
         return;
     }
+    char exe[4096];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    exe[n > 0 ? n : 0] = 0;
     char line[4096];
     while (fgets(line, sizeof(line), m)) {
         unsigned long long start, end;
@@ -113,7 +119,7 @@ static void dump_maps(FILE *f) {
         if (path[0] != '/' || !strchr(perms, 'x')) {
             continue;
         }
-        fprintf(f, "MAP %llx %llx %s\n", start, end, path);
+        fprintf(f, "MAP %llx %llx %s %s\n", start, end, strcmp(path, exe) == 0 ? "exe" : "lib", path);
     }
     fclose(m);
 }
@@ -167,6 +173,7 @@ static void write_profile_atomic(const char *path) {
     fchmod(fd, 0600);
     if (!write_profile_fd(fd)) {
         unlink(tmp);
+        fprintf(stderr, "sampler: write to %s failed, keeping the previous capture\n", path);
         return;
     }
     if (rename(tmp, path) != 0) {
@@ -199,6 +206,7 @@ __attribute__((destructor)) static void sampler_fini(void) {
         fchmod(fd, 0600);
         if (!write_profile_fd(fd)) {
             unlink(path);
+            fprintf(stderr, "sampler: write to %s failed\n", path);
             return;
         }
         fprintf(stderr, "sampler: wrote %s\n", path);

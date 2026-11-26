@@ -277,135 +277,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "rakit-assembler-x64"
-version = "0.137.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3307701abcb90554ee72fdb0db36ee0334a4abe380c4d87a5b04a6942613c3a"
-dependencies = [
- "rakit-assembler-x64-meta",
-]
-
-[[package]]
-name = "rakit-assembler-x64-meta"
-version = "0.137.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e62d0e19f9f5fa0c4243236df1ffdf139d207600b4402ac41ceba8dbe7ca0f3d"
-dependencies = [
- "rakit-srcgen",
-]
-
-[[package]]
-name = "rakit-bforest"
-version = "0.137.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47784bc3c4b57c0182bb8ff04aae5d5f5fc6bae8ba26b1212c9a659b90dab84e"
-dependencies = [
- "rakit-entity",
- "wasmtime-internal-core",
-]
-
-[[package]]
-name = "rakit-bitset"
+name = "cranelift-bitset"
 version = "0.137.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e13d120406f713dbce1940751e77bbb14daad1261379b7200c19285953e79a1d"
 dependencies = [
- "serde",
- "serde_derive",
  "wasmtime-internal-core",
 ]
-
-[[package]]
-name = "rakit-codegen"
-version = "0.137.0"
-dependencies = [
- "anyhow",
- "bumpalo",
- "capstone",
- "rakit-assembler-x64",
- "rakit-bforest",
- "rakit-bitset",
- "rakit-codegen-meta",
- "rakit-codegen-shared",
- "rakit-control",
- "rakit-entity",
- "rakit-isle",
- "criterion",
- "env_logger",
- "gimli",
- "hashbrown 0.17.0",
- "libm",
- "log",
- "mutatis",
- "postcard",
- "proptest",
- "pulley-interpreter",
- "regalloc2",
- "rustc-hash",
- "serde",
- "serde_derive",
- "sha2",
- "similar",
- "smallvec",
- "souper-ir",
- "target-lexicon",
- "wasmtime-internal-core",
-]
-
-[[package]]
-name = "rakit-codegen-meta"
-version = "0.137.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42295b38e9182954cb32a71812e3d64d66a90efc0a2ababb73e465ad4a1efccf"
-dependencies = [
- "rakit-assembler-x64-meta",
- "rakit-codegen-shared",
- "rakit-srcgen",
- "heck",
- "pulley-interpreter",
-]
-
-[[package]]
-name = "rakit-codegen-shared"
-version = "0.137.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5200fa877fb64cd30cabe0603f394333f88f69adf63e4db8d48a111d0c9d0dd"
-
-[[package]]
-name = "rakit-control"
-version = "0.137.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b86250e480795fbb4425ea703bca7b75282998458ce74f5360843a31949f2bbc"
-dependencies = [
- "arbitrary",
-]
-
-[[package]]
-name = "rakit-entity"
-version = "0.137.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "903c6592c7d600c251d20929f143543b7303ac70b072ad3394d65b29caf56f69"
-dependencies = [
- "rakit-bitset",
- "serde",
- "serde_derive",
- "wasmtime-internal-core",
-]
-
-[[package]]
-name = "rakit-isle"
-version = "0.137.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1c5809e8636a37e5a25ecc35242d33d6e7391c49b67488b83446e2898af2a2f"
-dependencies = [
- "codespan-reporting",
-]
-
-[[package]]
-name = "rakit-srcgen"
-version = "0.137.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d633ff621e7f31a943431da0d7dd37c4376766c60bd7171216de1c7ccabfb370"
 
 [[package]]
 name = "criterion"
@@ -861,7 +739,7 @@ version = "50.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6af498fa3ca312fe5a07178757781059b75a331f24d53aeb3706e51ad73317bd"
 dependencies = [
- "rakit-bitset",
+ "cranelift-bitset",
  "log",
  "pulley-macros",
 ]
@@ -897,6 +775,117 @@ name = "r-efi"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
+
+[[package]]
+name = "rakit-assembler-x64"
+version = "0.137.0"
+dependencies = [
+ "rakit-assembler-x64-meta",
+]
+
+[[package]]
+name = "rakit-assembler-x64-meta"
+version = "0.137.0"
+dependencies = [
+ "rakit-srcgen",
+]
+
+[[package]]
+name = "rakit-bforest"
+version = "0.137.0"
+dependencies = [
+ "rakit-entity",
+ "wasmtime-internal-core",
+]
+
+[[package]]
+name = "rakit-bitset"
+version = "0.137.0"
+dependencies = [
+ "serde",
+ "serde_derive",
+ "wasmtime-internal-core",
+]
+
+[[package]]
+name = "rakit-codegen"
+version = "0.137.0"
+dependencies = [
+ "anyhow",
+ "bumpalo",
+ "capstone",
+ "criterion",
+ "env_logger",
+ "gimli",
+ "hashbrown 0.17.0",
+ "libm",
+ "log",
+ "mutatis",
+ "postcard",
+ "proptest",
+ "pulley-interpreter",
+ "rakit-assembler-x64",
+ "rakit-bforest",
+ "rakit-bitset",
+ "rakit-codegen-meta",
+ "rakit-codegen-shared",
+ "rakit-control",
+ "rakit-entity",
+ "rakit-isle",
+ "regalloc2",
+ "rustc-hash",
+ "serde",
+ "serde_derive",
+ "sha2",
+ "similar",
+ "smallvec",
+ "souper-ir",
+ "target-lexicon",
+ "wasmtime-internal-core",
+]
+
+[[package]]
+name = "rakit-codegen-meta"
+version = "0.137.0"
+dependencies = [
+ "heck",
+ "pulley-interpreter",
+ "rakit-assembler-x64-meta",
+ "rakit-codegen-shared",
+ "rakit-srcgen",
+]
+
+[[package]]
+name = "rakit-codegen-shared"
+version = "0.137.0"
+
+[[package]]
+name = "rakit-control"
+version = "0.137.0"
+dependencies = [
+ "arbitrary",
+]
+
+[[package]]
+name = "rakit-entity"
+version = "0.137.0"
+dependencies = [
+ "rakit-bitset",
+ "serde",
+ "serde_derive",
+ "wasmtime-internal-core",
+]
+
+[[package]]
+name = "rakit-isle"
+version = "0.137.0"
+dependencies = [
+ "codespan-reporting",
+]
+
+[[package]]
+name = "rakit-srcgen"
+version = "0.137.0"
 
 [[package]]
 name = "rand"
