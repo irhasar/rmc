@@ -1,3 +1,343 @@
+## Session (2026-11-26, branch `rakit-exp15`) — review round: frameless CFI, sampler hardening
+
+A review of the frame-pointer work found a real regression: **frameless
+functions emitted frame-pointer-relative unwind info**, so every backtrace
+through them was wrong.
+
+- **Bug.** `gen_clobber_save` always emitted `UnwindInst::DefineNewFrame`, and
+  the System V encoder switched the CFA rule to RBP on it (`mr.fp()` is
+  `Some(RBP)` unconditionally for x64). Without a `push %rbp` that register
+  still holds the *caller's* frame pointer, so `readelf --debug-dump=frames-interp`
+  showed `CFA = rbp+8` for every function and the unwinder walked into the
+  caller's frame. Reproduced end-to-end with a `_Unwind_Backtrace` helper: the
+  old build stopped after one frame with a stack address as the next "return
+  address"; the fixed build walks `level3 -> level2 -> level1 -> main -> std ->
+  libc`.
+- **Fix (SP-relative CFI; the encoder already had the branch for it).**
+  1. `isa/unwind/systemv.rs`: the CFA rule only moves to the frame pointer when
+     the instruction stream actually contains `PushFrameRegs`
+     (`let fp = if has_frame_regs { mr.fp() } else { None }`). With `fp = None`,
+     `DefineNewFrame` emits no `CfaRegister` and `StackAlloc` adjusts
+     `cfa_offset` instead of ignoring the allocation.
+  2. `isa/x64/abi.rs`: `gen_clobber_save` emits `UnwindInst::StackAlloc` after
+     the `subq rsp, N` when the frame has no frame pointer.
+  3. The epilogue still emits no rule, exactly like the frame-pointer path: the
+     FDE describes the body of the function, not its teardown (pre-existing
+     simplification, unchanged).
+- **Verified.** `readelf --debug-dump=frames-interp` now shows `rsp+8` at entry
+  then `rsp+16`/`rsp+32`/`rsp+48` after each `sub`; `_Unwind_Backtrace` resolves
+  every frame; `-Cforce-frame-pointers=yes` output is unchanged.
+- **Tests.** The two vendored x64 unwind tests were **already failing** before
+  this round (they encode the FP-relative form while `preserve_frame_pointers`
+  defaults to false); they now request a frame pointer explicitly. New
+  `test_frameless_func_uses_sp_relative_cfa` pins `CfaOffset(80)` (64 B slot +
+  the 8 B alignment padding) and asserts no `CfaRegister`. `cargo test` in
+  `vendor/rakit-codegen` -> 204 passed / 0 failed. Note `./y.sh test` does not
+  run the vendored crate's tests; run them directly.
+- **Callee-save recovery is covered end to end** by
+  `bench/tests/t_unwind_regs.rs` (registered in `regressions.sh`, expected
+  `true true true true`). Chain: `main -> caller -> mid -> walk`, each frame
+  forced out of line through `black_box(fn)` (rakit's inliner ignores
+  `#[inline(never)]`). `caller` keeps two magic values in callee-saved registers
+  across its call; `mid` overwrites those registers with four magic values of
+  its own, so its prologue must save the caller's copies; `walk` starts
+  `_Unwind_Backtrace`. Frames are classified by **register content**, not by
+  address ranges (the first version used IP windows and both windows matched
+  every frame, because `caller` was inlined into `main`): the caller is "seen"
+  only when a frame reports both of its values and none of `mid`'s, and the
+  clobber is "seen" when a frame reports two or more of `mid`'s values. The
+  caller's two values must sit in two *different* registers (`position`, not a
+  match count, which would also accept `[A, A]`). With the old RBP-relative CFA
+  the test prints `false true false true`; the `true` in position 2 is the
+  non-vacuity check (mid really does clobber callee-saves).
+  A swap of two registers' save slots is invisible to a value-by-value check, so
+  `vendor/rakit-codegen/src/isa/x64/inst/unwind/systemv.rs` also has
+  `test_frameless_save_reg_offsets`, which *runs the prologue generator and the
+  emitter*: `gen_clobber_save` is called with a layout shaped like a real
+  frameless function (`sub $0x68`, clobber area 32, rbx/r12/r13 at 0/8/16), every
+  instruction it returns is emitted into a real `MachBuffer` through
+  `Inst::emit` — `Unwind` pseudo-ops included, so `emit.rs`'s `sink.add_unwind`
+  arm is what records the rules — and the rules are read back from the
+  finalized buffer. For each clobber it checks the store
+  (`Inst::External { inst: asm::Inst::movq_mr(..) }`, reading `rm64`'s
+  `Amode::ImmReg` and `r64`) against its `SaveReg` annotation: same register,
+  slot `0/8/16` in layout order, displacement `fixed + outgoing + slot`, and the
+  rule recorded at the offset its own store ends at. The rules then go through
+  `create_unwind_info_from_insts`; the asserted FDE is `[(4,
+  CfaOffset(112)), (9, Offset(Register(3), -40)), (14, Offset(Register(12),
+  -32)), (19, Offset(Register(13), -24))]` — 4 bytes of `sub`, then 5-byte
+  stores, so the rule offsets are *not* the slot offsets. Verified sensitive:
+  reversing the clobber loop fails it (`annotation out of order`, `left: p13i,
+  right: p3i`), moving only the store by 8 bytes fails it (`store and
+  annotation disagree for slot 0`, `left: (3, 80, 9) right: (3, 72, 9)`),
+  recording the rule before its store fails it (`left: (3, 72, 9) right: (3,
+  72, 4)`), dropping `sink.add_unwind` from the x64 emitter fails it
+  (`expected one SaveReg per clobbered register`, `left: 0 right: 3`), and
+  restoring RBP-based CFA fails it with `CfaRegister(Register(5))`.
+  Do not hand-place rules at invented offsets: `add_unwind` stamps
+  `cur_offset()`, so the test has to read the offsets the emitter produced.
+  The CFI arithmetic was also cross-checked against real machine code: for a
+  frameless function with a 64 B array and rbx/r12/r13 saved at
+  `0x48/0x50/0x58(%rsp)` with `CFA = rsp+112`, the FDE says `c-40/c-32/c-24`,
+  i.e. exactly `slot - CFA`.
+- **A `#[inline(never)]` callee can still be inlined by rakit**; to keep a frame
+  in a test, take the address of the function and call it through `black_box`.
+- **Profiling tools hardened** (same review, two rounds):
+  - `sampler.c` no longer defaults to `/tmp/sampler.out` (`fopen("w")` on a
+    predictable path = CWE-377). The default is now a `mkstemp` file in
+    `$TMPDIR`/`/tmp` with mode 0600, so neither an existing file nor a planted
+    symlink can be reused.
+  - **Nothing is opened in the constructor any more.** Truncating the
+    destination there meant a run killed before `sampler_fini` (Ctrl+C never
+    reaches the destructor) destroyed the previous profile and left an empty
+    file. Overwrite mode now writes a private `.sampler.XXXXXX` in the
+    destination directory and `rename`s it into place, so an interrupted or
+    failed capture leaves the last good profile intact; append mode opens with
+    `O_APPEND|O_NOFOLLOW|O_CLOEXEC` at exit, which cannot destroy earlier
+    content. Verified: SIGKILL mid-run keeps the old file, a completed run
+    replaces it, two append runs leave two `BASE` records, no temp files leak.
+  - **A failed write is detected before the temp file is renamed.**
+    `write_profile_fd` checks `ferror` *and* `fclose`: a buffered write that
+    fails mid-flush sets the stream error indicator, and a later `fclose` can
+    still return 0 when nothing is left to flush, so checking the close alone
+    can let a truncated capture replace a good one. A failure is never silent:
+    overwrite mode reports that the previous capture was kept, the other two
+    modes report the path. Verified with `ulimit -f 1` plus an inherited
+    `SIGXFSZ` ignore: the write fails, the destination keeps its previous
+    contents, the diagnostic appears on stderr and no `.sampler.*` file is left
+    behind. Honest caveat: on this glibc `fclose` also reports the EFBIG, so the
+    `ferror` check could not be shown to be the deciding one; it is required by
+    the C stream rules, not by an observed failure here.
+  - The destructor also writes `MAP <start> <end> <exe|lib> <path>` lines for
+    the executable mappings, and `sym.py` attributes samples that land in a
+    shared library to `[libc.so.6]`/`[libm.so.6]` instead of counting them as
+    "outside any symbol". First useful result: `p4_simd` is 18% libm, not
+    executable code.
+  - **A path is not an identity.** A capture can be appended to by a different
+    binary, and then the `exe` tag says "this was *a* main executable", not
+    "this is the binary whose symbols you loaded". Each capture therefore also
+    records `EXEID <size> <crc32>` of `/proc/self/exe` (content-based, so a copy
+    in an archive still matches, and it agrees with `zlib.crc32`). `sym.py`
+    compares it with the supplied binary and files mismatched samples under
+    `[other-exe]` plus a `N samples from a different executable (<id>)` line,
+    instead of resolving them against a symbol table they do not belong to.
+  - **Test the fallback, not the path that bypasses it.** `test_sym.py`'s
+    `capture(..., tag=None)` writes the pre-tag `MAP` format; the `--exe` and
+    symlink cases use it, and the `--exe` case first asserts that *without* the
+    override the sample lands in a library bucket, so the option is what makes
+    it resolve. The symlink case records the symlink in the capture and passes
+    the real file to the symbolizer, so only `realpath` on the map path works.
+    The appended-capture case gives the second run a mapping that covers the
+    first run's sample address: keeping the stale maps would then answer for
+    the second sample and hide a missing `maps.clear()`.
+  - **The tag is what survives archiving.** A capture names the path the binary
+    had when it ran, so symbolizing a saved profile against a *copy* of the
+    binary used to file every executable sample under `[prog]` (the path
+    comparison said "not the executable, must be a library"). `dump_maps` now
+    compares each mapping against `/proc/self/exe` and tags it, and `sym.py`
+    trusts the tag before any local path. Captures written before the tag exist,
+    so `sym.py` still accepts them and takes `--exe <captured path>` to say
+    which mapping was the executable. Verified end to end: capture from
+    `/tmp/fs_p4_simd`, symbolize against `/tmp/arch/prog_copy` → `main` and the
+    iterator `fold` are named, libm/libc bucketed.
+  - `sym.py` also decides "is this mapping the executable" by comparing whole
+    `realpath`s, not basenames (a binary named through a symlink was reported as
+    a library, and a library that shares the executable's basename bypassed
+    library attribution), and clears the mapping list on every `BASE` record
+    (appended captures have their own layout; an address could otherwise be
+    credited to the previous capture's library). `bench/tools/test_sym.py` pins
+    all three; it fails on any of the mutations.
+- **Full matrix** (`bench/allaxes.sh` CREPS=3 RREPS=7, 45/45 rows `ok`, every
+  output validated against LLVM; columns are compile wall/CPU/peak-RSS/size and
+  run wall/CPU/peak-RSS):
+
+| prog | bk | Cwall | Ccpu | Crss | size | Rwall | Rcpu | Rrss |
+|---|---|---|---|---|---|---|---|---|
+| h_arith | L | 122 | 152 | 117.1 | 4617128 | 2 | 2 | 10.9 |
+| h_arith | U | 95 | 125 | 118.4 | 5839120 | 3 | 2 | 10.9 |
+| h_arith | M | 112 | 141 | 119.5 | 4088464 | 2 | 2 | 11.0 |
+| h_branch | L | 122 | 147 | 117.1 | 4616832 | 2 | 2 | 10.9 |
+| h_branch | U | 94 | 125 | 118.3 | 5837264 | 3 | 2 | 11.0 |
+| h_branch | M | 107 | 136 | 119.5 | 4086800 | 2 | 2 | 10.9 |
+| h_calls | L | 122 | 151 | 117.8 | 4616872 | 2 | 2 | 11.0 |
+| h_calls | U | 94 | 123 | 118.6 | 5837792 | 3 | 2 | 11.1 |
+| h_calls | M | 107 | 139 | 119.9 | 4087176 | 2 | 2 | 10.9 |
+| h_float | L | 134 | 158 | 116.2 | 4637984 | 3 | 2 | 11.0 |
+| h_float | U | 94 | 124 | 117.8 | 5861024 | 3 | 3 | 11.0 |
+| h_float | M | 108 | 137 | 119.3 | 4127352 | 3 | 2 | 11.0 |
+| h_mem | L | 283 | 458 | 137.2 | 4646856 | 3 | 3 | 10.9 |
+| h_mem | U | 146 | 206 | 133.9 | 5959856 | 10 | 10 | 11.0 |
+| h_mem | M | 181 | 254 | 136.6 | 4174864 | 4 | 4 | 11.0 |
+| h_simd | L | 148 | 174 | 122.9 | 4617704 | 2 | 2 | 11.0 |
+| h_simd | U | 103 | 135 | 123.7 | 5843736 | 4 | 4 | 11.1 |
+| h_simd | M | 117 | 147 | 125.3 | 4090856 | 3 | 2 | 10.9 |
+| p1_arith | L | 89 | 109 | 105.0 | 4635232 | 81 | 81 | 10.9 |
+| p1_arith | U | 83 | 106 | 107.0 | 5877944 | 109 | 108 | 10.9 |
+| p1_arith | M | 90 | 115 | 108.5 | 4156256 | 103 | 102 | 11.0 |
+| p2_mem | L | 257 | 391 | 133.1 | 4639896 | 17 | 17 | 10.9 |
+| p2_mem | U | 136 | 182 | 130.3 | 5936144 | 157 | 157 | 11.0 |
+| p2_mem | M | 179 | 252 | 132.4 | 4152592 | 43 | 43 | 10.9 |
+| p3_calls | L | 104 | 128 | 114.9 | 4612368 | 38 | 37 | 10.9 |
+| p3_calls | U | 90 | 119 | 115.8 | 5820136 | 116 | 116 | 11.0 |
+| p3_calls | M | 100 | 129 | 117.3 | 4076952 | 56 | 56 | 11.0 |
+| p4_simd | L | 113 | 134 | 115.8 | 4636096 | 57 | 57 | 48.2 |
+| p4_simd | U | 98 | 121 | 116.2 | 5892376 | 158 | 160 | 49.5 |
+| p4_simd | M | 110 | 137 | 118.0 | 4162784 | 85 | 84 | 48.8 |
+| p5_inline | L | 84 | 105 | 104.1 | 4609368 | 58 | 57 | 10.9 |
+| p5_inline | U | 80 | 104 | 106.1 | 5813704 | 896 | 895 | 11.0 |
+| p5_inline | M | 87 | 113 | 107.1 | 4069928 | 7 | 6 | 10.9 |
+| p6_scalar | L | 86 | 105 | 100.6 | 4609368 | 58 | 58 | 11.0 |
+| p6_scalar | U | 79 | 101 | 102.1 | 5813688 | 907 | 906 | 10.9 |
+| p6_scalar | M | 87 | 111 | 103.5 | 4069928 | 7 | 6 | 10.9 |
+| p7_branchy | L | 88 | 109 | 104.6 | 4609520 | 43 | 43 | 11.0 |
+| p7_branchy | U | 82 | 104 | 106.0 | 5813800 | 101 | 101 | 11.0 |
+| p7_branchy | M | 88 | 112 | 107.2 | 4070088 | 36 | 35 | 11.0 |
+| p8_minmax | L | 86 | 107 | 104.6 | 4609544 | 18 | 18 | 11.0 |
+| p8_minmax | U | 81 | 105 | 105.8 | 5813752 | 39 | 38 | 11.0 |
+| p8_minmax | M | 89 | 113 | 107.1 | 4070088 | 21 | 20 | 10.9 |
+| p9_u64f32 | L | 97 | 116 | 109.9 | 4635448 | 31 | 30 | 17.8 |
+| p9_u64f32 | U | 89 | 113 | 111.8 | 5886872 | 77 | 77 | 18.9 |
+| p9_u64f32 | M | 100 | 129 | 113.6 | 4159824 | 34 | 34 | 18.2 |
+
+  Reading, compile: Rakit is clearly faster where the front end dominates
+  (`p2_mem` 257 -> 179, `h_mem` 283 -> 181, `h_float` 134 -> 108, `h_simd`
+  148 -> 117, `h_arith`/`h_branch`/`h_calls` 122 -> ~110) and **slightly slower
+  on five small programs** (`p1_arith` 89 -> 90, `p5_inline` 84 -> 87,
+  `p6_scalar` 86 -> 87, `p8_minmax` 86 -> 89, `p9_u64f32` 97 -> 100), where the
+  pass layer costs more than the front end saves; `p7_branchy` is a tie. Sizes
+  are 10-12% below LLVM everywhere. Reading, runtime: wins are `p5`/`p6` (8x),
+  `p7`, and the `h_*` programs (ties or better except `h_mem`); losses are
+  `p1` (1.24x), `p2` (2.5x), `p3` (1.5x), `p4` (1.5x), `p8` (1.17x), `p9`
+  (1.1x), all explained in the sessions below.
+
+## Session (2026-11-24, branch `rakit-exp15`) — the backend LICM never hoists a load (negative result)
+
+Tried to close p4/p9's remaining gap by hoisting the `Vec` header reloads
+(`ptr`, `len`) out of loops that also call out. Three findings, no win, all
+reverted.
+
+- **`Opcode::Load` is *not* trapping, so the trap gate is not the blocker.**
+  The metadata (`vendor/rakit-codegen-meta/src/shared/instructions.rs`, the
+  `load` entry) sets `can_load` only; `can_trap` is false. `hoist_from_loop`
+  therefore does reach its `op.can_load()` branch, and the load is rejected by
+  the two checks *after* it: the memflags test
+  (`readonly && notrap && can_move`) and the operand-availability test.
+  Measured with `RAKIT_LICM_DEBUG=1`: every hoist in `p4_simd` is `[Iconst]`,
+  and the loads that were instrumented reach `LOADCHECK` and then bail out on
+  availability -- their address operand is not available at the preheader.
+- **A loop-local escape analysis is NOT sufficient** and must not be used as
+  the safety argument: a call *before* the loop can retain the stack address
+  (a callee may stash it in a global), and a call *inside* the loop can then
+  write through it, so a hoisted load would miss the write. Any
+  `any_opaque_store` exemption needs a function-wide no-escape proof for the
+  slot (address never passed to a call, never stored anywhere but its own
+  loads/stores, never a branch argument), not a loop-local one. What *is*
+  established: seeding the analysis from the load/store bases (not from
+  `StackAddr` instructions) is required, because rakit computes the
+  `stack_addr` of a `Vec` header once, outside the loop; with that, slots 0/1
+  of `p4_simd`'s sin/cos loop do become "unescaped" (`local=true`), but the
+  loads still fail on availability.
+- **Measured**: interleaved A/B, 11 reps, min: `p1_arith` +0.3%, `p2_mem` -0.2%,
+  `p3_calls` -0.1%, `p4_simd` -0.4%, `p8_minmax` +0.5%, `p9_u64f32` +0.4%.
+  Nothing fires, nothing changes, binaries byte-identical. Reverted.
+
+Where to pick this up: either make the address available (hoist the
+`StackAddr`/`UnaryGlobalValue` too, and handle the case where the address is a
+block parameter), or do it at the CLIF level in `store_forward`, which already
+has the private-slot analysis. Verify with `RAKIT_LICM_DEBUG=1`: the pass
+prints the opcodes it hoists.
+
+Also learned while instrumenting: `p4_simd`'s sin/cos loop is
+`block2 -> 12 -> 14 -> 15 -> 16 -> 17 -> block2` (5 body blocks + 4 cold panic
+blocks), i.e. exactly the shape the multi-block unroller would need; and the
+`main` of `p4_simd` calls `sinf`/`cosf` through `call *%rax` (GOT-indirect),
+not a direct `call rel32` like LLVM's `call sinf@PLT`.
+
+### Direct `call rel32` to imports (also a wash, reverted)
+
+Follow-up on the GOT-indirect call: it *is* fixable and it works.
+`vendor/rakit-codegen/src/isa/x64/lower.isle` picks `call_known` only for
+`RelocDistance::Near`; everything else gets `load_ext_name` + `call_unknown`.
+The distance comes from `ExtFuncData.colocated` (`machinst/isle.rs`), so setting
+`colocated = true` on the ext-func of an import makes the call direct. Verified:
+`call sincosf@plt` and direct `__rust_dealloc` in `p4_simd` (set the flag in
+`src/abi/mod.rs` after `declare_func_in_func`, and in
+`rakit-opt/src/passes/sincos.rs` for the fused libcall). Gate it on
+`target.options.os == rustc_target::spec::Os::Linux`: Mach-O and COFF resolve
+imports through the GOT / `__imp_`, so the indirect form has to stay there.
+
+Measured as a same-backend A/B (min/median of 15 interleaved reps, both
+binaries from this tree, all four programs output-identical). That is the right
+method for a codegen change: the cross-backend matrix, which is what the repo
+rules require for a *result*, is the `allaxes.sh` table in the 2026-11-26
+session:
+
+| change | p3_calls | p4_simd |
+|---|---|---|
+| all imports direct | 47.1/47.7 -> 48.3/49.0 (+2.5%) | 83.2/84.4 -> 82.1/83.3 (-1.3%) |
+| `sincos` libcall only | 46.9/47.5 -> 47.1/47.3 | 84.0/85.5 -> 83.8/85.0 |
+
+So the extra GOT load per call costs nothing measurable (the OoO engine hides
+it) and the all-imports variant costs ~2.5% on `p3_calls`. Reverted both.
+Remaining indirect calls in `p4_simd`'s `main` are the cold panic paths
+(`panic_fmt`/`panic_bounds_check` through one GOT slot), not libm.
+
+Note: `target.is_like_osx` does not exist in this rustc; `Target::options.os` is
+an `Os` enum, and `is_like_windows` does exist on `Target`.
+
+## Session (2026-11-24, branch `rakit-exp15`) — x64 drops the frame pointer; `lea` for `x - c`
+
+- **Frame pointer omitted on x64** (`vendor/rakit-codegen/src/isa/x64/abi.rs`).
+  `setup_area_size` is 16 with a frame pointer (saved RBP + return address) and
+  8 without; `gen_prologue_frame_setup`/`gen_epilogue_frame_restore` emit
+  nothing in the 8-byte case (`gen_clobber_restore` already gives the frame
+  back). `FrameLayout::has_frame_pointer()` is `setup_area_size > 8`.
+  `-Cforce-frame-pointers=yes` restores the old shape.
+- **Why the two earlier attempts failed, and what makes it work now:**
+  1. **Alignment.** Without `push %rbp` only the return address is on the
+     stack, so `%rsp` is 8 mod 16 at a call. Reserve 8 bytes of padding — and
+     put it in the **layout** (`fixed_frame_storage_size`), not in the
+     prologue's `sub`: `frame_size()`, `sp_to_fp_offset()` and the slot offsets
+     must see the real frame.
+  2. **Incoming stack arguments are reached through RBP in two places**:
+     `SyntheticAmode::finalize` (`inst/args.rs`) and the asm-crate path
+     (`inst/external.rs` → `offsets::KEY_INCOMING_ARG`, base hardcoded to RBP).
+     Patching only `finalize` leaves the asm path reading `0x8(%rbp)` from a
+     frame that has no RBP → `HashMap`/`HashSet` code reads a garbage capacity
+     and aborts with `memory allocation of 4e14 bytes failed`. A one-line
+     `HashMap::new(); insert` program reproduces it at opt-level 0.
+     **Fix taken:** keep the frame pointer whenever the frame receives stack
+     arguments (`incoming_args_size > 0 || tail_args_size > 0`). Frames without
+     them (fib, most std code) still lose the prologue/epilogue.
+- **Debug recipe that found it:** diff the no-FP and `-Cforce-frame-pointers`
+  builds function-by-function (`nm -S` + `objdump`, drop frame instructions and
+  branch targets, compare per-function instruction multisets). The only real
+  difference was `resize_inner` reading `0x8(%rbp)`/`0x10(%rbp)` in the no-FP
+  build. Note a "huge allocation" abort from Rakit-built code is usually std's
+  *backtrace* machinery allocating a garbage size, not the original fault —
+  `LD_PRELOAD` malloc interception shows gimli frames on the stack.
+- **`rec_loop` builds `x - c` as `x + (-c)`** (`rakit-opt/src/passes/rec_loop.rs`).
+  The x64 backend folds an add of a constant into `lea -c(%x), %dst`
+  (`to_amode_add` → `amode_imm_reg`), so the recursive argument no longer needs
+  a copy into the destination register first: `mov %rbx,%rdi; sub $1,%rdi`
+  becomes `lea -1(%rbx),%rdi`.
+- **Result** (`allaxes.sh` CREPS=3 RREPS=7, L/M): `p3_calls` run 57 → **49 ms**
+  (L 38) and the `fib` body is 19 instructions vs LLVM's 17 (was 21 + a
+  frame-pointer prologue). Sizes shrink slightly everywhere (`p2_mem`
+  4154256 → 4152528, `p3_calls` 4077128 → 4076936). Compile unchanged.
+- **Verification:** `./y.sh test --sysroot rakit` → 65 suites, 0 failed, exit 0;
+  `bench/regressions.sh` exit 0; all 15 benchmark programs byte-identical to
+  LLVM in `allaxes.sh`; panic/`catch_unwind` behaviour unchanged (Rakit does
+  not catch, with or without the frame pointer — pre-existing).
+- **Profiling tooling** (`bench/tools/`): `sampler.c` (`LD_PRELOAD` +
+  `ITIMER_PROF`, writes `<count> <addr>`, subtracts the PIE base) and `sym.py`
+  (histogram via `nm -S`). `perf` is not installed in this image. First results:
+  `p3_calls` 66% in `fib`, `p4_simd` 68.7% in `main`, `p2_mem` 32.5% partition
+  + 27.5% hashbrown. With the frame pointer gone, `p3_calls` splits 32 ms of
+  recursion (1.04x of LLVM) and 16 ms of `format!` machinery (1.60x of LLVM),
+  so the historical note that p3 is really a `format!` benchmark is right after
+  all: the recursion was the fixable half.
+
 ## Session (2026-11-24, branch `rakit-exp12`) — store-forward address memoisation; write-once rule rejected
 
 ## Session (2026-11-25, branch `rakit-exp14`) — precise address keys, and what the all-axes matrix really says
@@ -2607,6 +2947,47 @@ cpu ms / peak RSS MB. All stdout matched LLVM.
   under interleaved A/B (p4 −0.7%, h_branch −2.1%, everything else ≤±0.4%, i.e.
   drift). The earlier apparent p4 −5.2% was measurement drift between runs, not
   the gate. Call-only stays the default; the `rotate_brif` knob was removed.
+
+## Session (2026-11-24) — where Rakit's compile time goes (`bench/passtime.sh`)
+
+- **New harness:** `bench/passtime.sh` compiles each program with
+  `RAKIT_PASS_TIME=1`, sums the per-CGU pass lines of the *fastest* of `REPS`
+  compiles, and prints the pass total next to the compile wall time. Read it as
+  a *lower bound* on what the pass layer costs, not as the Rakit-vs-upstream
+  gap: the passes rewrite the function, so everything downstream (egraph, ISel,
+  regalloc, emission) runs on different input, and the timer cannot see that
+  difference. The authoritative upstream comparison is the `allaxes.sh` compile
+  columns (wall/CPU/RSS), which is why every compile claim quotes those.
+- **Measured (REPS=1, one build):** `p2_mem` 161 ms wall / 31.6 ms passes (20%),
+  `h_mem` 170 / 35.3 (21%), `p1_arith` 81 / 0.5 (1%). The compile gap vs
+  upstream is concentrated in `store_forward` on allocation-heavy code and is
+  absent on arithmetic code.
+- **`store_forward` breakdown** (`RAKIT_SF_DEBUG=1`, h_mem cgu.1, 210 functions,
+  995 forwards): setup 6.6 ms, cross-block dataflow 8.2, forwarding 3.9,
+  dead-store removal 1.8. The dataflow is the largest single item.
+- **Attempted and not kept:** restricting the dataflow to keys a predecessor can
+  actually serve (ordered per-block detection folded into the existing key walk,
+  one clone per block instead of two). It halved the facts (6007 → 2777 on the
+  biggest function, its loop 364 → 230 us) but the detection walk costs what the
+  smaller maps save: `store_forward` 15.1 → 15.3 ms (median of 9), `p2_mem`
+  13.4 → 13.4, end-to-end wall within noise, sizes byte-identical. A neutral
+  change is not worth a commit.
+- **Negative — per-value provenance cache:** memoising `for_each_provenance_slot`
+  per value (Vec clone + hash insert) measured 15.4 → 16.7 ms. The walk is short
+  and reuses a thread-local scratch; the cache is pure overhead.
+- **Negative — coarse "loaded in >= 2 blocks" filter:** it excludes the classic
+  case (stored in one block, loaded in a single *other* block), so forwards fell
+  995 → 447 and binaries grew 117 KB. The precise test must be order-sensitive
+  within the block.
+- **`RAKIT_SF_CBE_MAX` sweep** (h_mem / p2_mem, size and pass cost): 200 →
+  4183000 B / 10.5 ms, 400 → 4180720 / 10.9, 800 → 4177600 / 12.9, 1600 →
+  4176736 / 15.0, 16384 (default) → 4176736 / 15.4. Size saturates at 1600 insts
+  and is identical at 1600 and 16384 on all 15 `progs/`. The default stays
+  16384: a heuristic budget that only holds for these workloads is not worth
+  0.4 ms.
+- **Measurement lesson:** single-rep pass timings on this box span 14.8 → 21.9 ms
+  for the same build. Use `REPS=9` and compare medians, and compare *per-phase*
+  numbers only within one build (the timers themselves cost time).
 
 ## Session (2026-11-23) — `rakit-ir` removed, `rakit-opt` kept
 - **Decision:** delete the separate RIR crate and its CLIF↔RIR bridge. Keep

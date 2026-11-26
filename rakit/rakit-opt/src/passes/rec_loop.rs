@@ -201,13 +201,16 @@ fn rewrite(func: &mut ir::Function, p: Pat) {
     }
     {
         let mut cur = FuncCursor::new(func).at_bottom(rec_blk);
-        let c1 = cur.ins().iconst(ir::types::I64, p.c1);
-        let n1 = cur.ins().isub(rn, c1);
+        // `x - c` as `x + (-c)`: the x64 backend folds an add of a constant
+        // into a `lea` with a displacement, so the argument is built without
+        // copying `x` into the argument register first.
+        let c1 = cur.ins().iconst(ir::types::I64, (p.c1 as i64).wrapping_neg());
+        let n1 = cur.ins().iadd(rn, c1);
         let call = cur.ins().call(p.func_ref, &[n1]);
         let t1 = *cur.func.dfg.inst_results(call).first().unwrap();
         let acc1 = cur.ins().iadd(racc, t1);
-        let c2 = cur.ins().iconst(ir::types::I64, p.c2);
-        let n2 = cur.ins().isub(rn, c2);
+        let c2 = cur.ins().iconst(ir::types::I64, (p.c2 as i64).wrapping_neg());
+        let n2 = cur.ins().iadd(rn, c2);
         cur.ins().jump(loop_blk, &[n2.into(), acc1.into()]);
     }
 

@@ -97,6 +97,7 @@ check t_simd_mask $'i8x8 eq [-1, 0, -1, 0, -1, 0, -1, 0]\ni64x8 lt [0, 0, 0, -1,
 check t_volatile_dead 'written'
 check t_sf_huge_index '0 0 1'
 check t_ptr_store_alias '7 0'
+check t_unwind_regs 'true true true true'
 check t_cast_escape '127'
 check t_cast_offset '127'
 check t_deep_cast_chain '127 127'
