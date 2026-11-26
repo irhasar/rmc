@@ -54,10 +54,11 @@ through them was wrong.
   `vendor/rakit-codegen/src/isa/x64/inst/unwind/systemv.rs` also has
   `test_frameless_save_reg_offsets`, which *runs the prologue generator and the
   emitter*: `gen_clobber_save` is called with a layout shaped like a real
-  frameless function (`sub $0x68`, clobber area 32, rbx/r12/r13 at 0/8/16), its
-  instructions are emitted into a real `MachBuffer` (stores go through
-  `Inst::emit`, `Unwind` pseudo-ops through `buffer.add_unwind`), and the rules
-  are read back from the finalized buffer. For each clobber it checks the store
+  frameless function (`sub $0x68`, clobber area 32, rbx/r12/r13 at 0/8/16), every
+  instruction it returns is emitted into a real `MachBuffer` through
+  `Inst::emit` — `Unwind` pseudo-ops included, so `emit.rs`'s `sink.add_unwind`
+  arm is what records the rules — and the rules are read back from the
+  finalized buffer. For each clobber it checks the store
   (`Inst::External { inst: asm::Inst::movq_mr(..) }`, reading `rm64`'s
   `Amode::ImmReg` and `r64`) against its `SaveReg` annotation: same register,
   slot `0/8/16` in layout order, displacement `fixed + outgoing + slot`, and the
@@ -70,7 +71,9 @@ through them was wrong.
   right: p3i`), moving only the store by 8 bytes fails it (`store and
   annotation disagree for slot 0`, `left: (3, 80, 9) right: (3, 72, 9)`),
   recording the rule before its store fails it (`left: (3, 72, 9) right: (3,
-  72, 4)`), and restoring RBP-based CFA fails it with `CfaRegister(Register(5))`.
+  72, 4)`), dropping `sink.add_unwind` from the x64 emitter fails it
+  (`expected one SaveReg per clobbered register`, `left: 0 right: 3`), and
+  restoring RBP-based CFA fails it with `CfaRegister(Register(5))`.
   Do not hand-place rules at invented offsets: `add_unwind` stamps
   `cur_offset()`, so the test has to read the offsets the emitter produced.
   The CFI arithmetic was also cross-checked against real machine code: for a

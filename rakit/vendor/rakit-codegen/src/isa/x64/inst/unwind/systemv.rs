@@ -199,33 +199,29 @@ mod tests {
         let mut state = EmitState::default();
         let mut stores = vec![];
         for inst in X64ABIMachineSpec::gen_clobber_save(isa::CallConv::SystemV, &flags, &layout) {
-            match &inst {
-                // The store is what the annotation describes, so a store to the
-                // wrong slot has to fail here and not only in the FDE.
-                Inst::External { inst: asm_inst } => {
-                    let mut store = None;
-                    if let asm::Inst::movq_mr(m) = asm_inst {
-                        let asm::GprMem::Mem(asm::Amode::ImmReg { base, simm32, .. }) = &m.rm64
-                        else {
-                            panic!("expected a store to a memory address");
-                        };
-                        assert_eq!(simm32.offset, None, "store offset is not a constant");
-                        assert_eq!(
-                            base.to_reg(),
-                            regs::rsp(),
-                            "clobber stores must be rsp-relative"
-                        );
-                        store = Some((m.r64.enc(), simm32.simm32.value()));
-                    }
-                    inst.emit(&mut buffer, &info, &mut state);
-                    if let Some((reg, disp)) = store {
-                        stores.push((reg, disp, buffer.cur_offset()));
-                    }
-                }
-                // `add_unwind` stamps the rule with the current emission
-                // offset, which is what the FDE will carry.
-                Inst::Unwind { inst } => buffer.add_unwind(inst.clone()),
-                _ => {}
+            // The store is what the annotation describes, so a store to the
+            // wrong slot has to fail here and not only in the FDE.
+            let mut store = None;
+            if let Inst::External { inst: asm_inst } = &inst
+                && let asm::Inst::movq_mr(m) = asm_inst
+            {
+                let asm::GprMem::Mem(asm::Amode::ImmReg { base, simm32, .. }) = &m.rm64 else {
+                    panic!("expected a store to a memory address");
+                };
+                assert_eq!(simm32.offset, None, "store offset is not a constant");
+                assert_eq!(
+                    base.to_reg(),
+                    regs::rsp(),
+                    "clobber stores must be rsp-relative"
+                );
+                store = Some((m.r64.enc(), simm32.simm32.value()));
+            }
+            // Every instruction goes through the emitter, `Unwind` pseudo-ops
+            // included: that is where the rules are recorded in production, and
+            // it stamps them with the offset the instruction stream reaches.
+            inst.emit(&mut buffer, &info, &mut state);
+            if let Some((reg, disp)) = store {
+                stores.push((reg, disp, buffer.cur_offset()));
             }
         }
         let finalized = buffer.finish(&VCodeConstants::default(), &mut ControlPlane::default());
