@@ -2608,6 +2608,44 @@ cpu ms / peak RSS MB. All stdout matched LLVM.
   drift). The earlier apparent p4 −5.2% was measurement drift between runs, not
   the gate. Call-only stays the default; the `rotate_brif` knob was removed.
 
+## Session (2026-11-24) — where Rakit's compile time goes (`bench/passtime.sh`)
+
+- **New harness:** `bench/passtime.sh` compiles each program with
+  `RAKIT_PASS_TIME=1`, sums the per-CGU pass lines of the *fastest* of `REPS`
+  compiles, and prints the pass total next to the compile wall time. The passes
+  are the whole difference between Rakit and upstream cg_clif, so every
+  compile-time claim needs this number.
+- **Measured (REPS=1, one build):** `p2_mem` 161 ms wall / 31.6 ms passes (20%),
+  `h_mem` 170 / 35.3 (21%), `p1_arith` 81 / 0.5 (1%). The compile gap vs
+  upstream is concentrated in `store_forward` on allocation-heavy code and is
+  absent on arithmetic code.
+- **`store_forward` breakdown** (`RAKIT_SF_DEBUG=1`, h_mem cgu.1, 210 functions,
+  995 forwards): setup 6.6 ms, cross-block dataflow 8.2, forwarding 3.9,
+  dead-store removal 1.8. The dataflow is the largest single item.
+- **Attempted and not kept:** restricting the dataflow to keys a predecessor can
+  actually serve (ordered per-block detection folded into the existing key walk,
+  one clone per block instead of two). It halved the facts (6007 → 2777 on the
+  biggest function, its loop 364 → 230 us) but the detection walk costs what the
+  smaller maps save: `store_forward` 15.1 → 15.3 ms (median of 9), `p2_mem`
+  13.4 → 13.4, end-to-end wall within noise, sizes byte-identical. A neutral
+  change is not worth a commit.
+- **Negative — per-value provenance cache:** memoising `for_each_provenance_slot`
+  per value (Vec clone + hash insert) measured 15.4 → 16.7 ms. The walk is short
+  and reuses a thread-local scratch; the cache is pure overhead.
+- **Negative — coarse "loaded in >= 2 blocks" filter:** it excludes the classic
+  case (stored in one block, loaded in a single *other* block), so forwards fell
+  995 → 447 and binaries grew 117 KB. The precise test must be order-sensitive
+  within the block.
+- **`RAKIT_SF_CBE_MAX` sweep** (h_mem / p2_mem, size and pass cost): 200 →
+  4183000 B / 10.5 ms, 400 → 4180720 / 10.9, 800 → 4177600 / 12.9, 1600 →
+  4176736 / 15.0, 16384 (default) → 4176736 / 15.4. Size saturates at 1600 insts
+  and is identical at 1600 and 16384 on all 15 `progs/`. The default stays
+  16384: a heuristic budget that only holds for these workloads is not worth
+  0.4 ms.
+- **Measurement lesson:** single-rep pass timings on this box span 14.8 → 21.9 ms
+  for the same build. Use `REPS=9` and compare medians, and compare *per-phase*
+  numbers only within one build (the timers themselves cost time).
+
 ## Session (2026-11-23) — `rakit-ir` removed, `rakit-opt` kept
 - **Decision:** delete the separate RIR crate and its CLIF↔RIR bridge. Keep
   `rakit-opt` as the production pass layer; it owns the passes that produce the
