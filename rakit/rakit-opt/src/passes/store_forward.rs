@@ -1181,8 +1181,14 @@ mod tests {
     use super::*;
 
     /// A function holding one 16-byte stack slot and a single load from
-    /// `stack_addr(slot) + displacement`, plus the load's address value.
-    fn load_at(displacement: i64, load_ty: types::Type) -> (ir::Function, StackSlot, Inst, Value) {
+    /// `stack_addr(slot) + displacement`, plus the load's address value. The
+    /// load carries its own `load_offset`, which `mem_key` adds to the folded
+    /// displacement.
+    fn load_at(
+        displacement: i64,
+        load_offset: i32,
+        load_ty: types::Type,
+    ) -> (ir::Function, StackSlot, Inst, Value) {
         let mut func = ir::Function::new();
         let slot = func.create_sized_stack_slot(ir::StackSlotData::new(
             ir::StackSlotKind::ExplicitSlot,
@@ -1196,7 +1202,8 @@ mod tests {
             let base = pos.ins().stack_addr(types::I64, slot, 0);
             let offset = pos.ins().iconst(types::I64, displacement);
             let addr = pos.ins().iadd(base, offset);
-            (pos.ins().load(load_ty, MemFlagsData::trusted(), addr, 0), addr)
+            let load = pos.ins().load(load_ty, MemFlagsData::trusted(), addr, load_offset);
+            (load, addr)
         };
         let ir::ValueDef::Result(inst, 0) = func.dfg.value_def(load) else {
             panic!("a load result is defined by its own instruction")
@@ -1212,39 +1219,69 @@ mod tests {
         mem_key(func, inst, addr, private).expect("a load always has a key")
     }
 
-    #[test]
-    fn folds_a_constant_displacement_that_stays_inside_the_slot() {
-        let (func, slot, inst, addr) = load_at(8, types::I64);
-        assert_eq!(key(&func, inst, addr, &private(&[slot])), (Base::Slot(slot), 8));
+    /// Runs `mem_key` on one access and reports whether it folded to a slot.
+    fn folded(displacement: i64, load_offset: i32, load_ty: types::Type) -> Option<Key> {
+        let (func, slot, inst, addr) = load_at(displacement, load_offset, load_ty);
+        let key = key(&func, inst, addr, &private(&[slot]));
+        matches!(key.0, Base::Slot(_)).then_some(key)
     }
 
-    /// The end of the range has to be representable and inside the slot. A
-    /// folded displacement of `i64::MAX` has no end at all, and the old
-    /// unchecked arithmetic wrapped it negative, which passed the upper-bound
-    /// test and keyed the access against bytes it never touches.
+    fn assert_kept(displacement: i64, load_offset: i32, load_ty: types::Type) {
+        let (func, slot, inst, addr) = load_at(displacement, load_offset, load_ty);
+        let key = key(&func, inst, addr, &private(&[slot]));
+        assert!(
+            matches!(key.0, Base::Ptr(_)),
+            "displacement {displacement} + offset {load_offset} of {} bytes folded to {key:?}",
+            load_ty.bytes()
+        );
+    }
+
     #[test]
-    fn keeps_the_pointer_key_when_the_range_does_not_fit() {
-        for (displacement, ty) in [
-            (i64::MAX, types::I8),
-            (i64::MAX - 7, types::I64),
-            (i64::MIN, types::I8),
-            (-8, types::I8),
-            (12, types::I64),
-            (16, types::I8),
-        ] {
-            let (func, slot, inst, addr) = load_at(displacement, ty);
-            let key = key(&func, inst, addr, &private(&[slot]));
-            assert!(
-                matches!(key.0, Base::Ptr(_)),
-                "displacement {displacement} of {} bytes folded to {key:?}",
-                ty.bytes()
-            );
-        }
+    fn folds_a_constant_displacement_that_stays_inside_the_slot() {
+        let (func, slot, inst, addr) = load_at(8, 0, types::I64);
+        assert_eq!(key(&func, inst, addr, &private(&[slot])), (Base::Slot(slot), 8));
+
+        // The folded displacement and the load's own offset are added, so a
+        // negative displacement is fine when the effective start is inside.
+        assert!(matches!(folded(-4, 8, types::I8), Some((Base::Slot(_), 4))));
+    }
+
+    /// The end of the range has to be representable and inside the slot.
+    #[test]
+    fn keeps_the_pointer_key_when_the_end_overflows() {
+        assert_kept(i64::MAX, 0, types::I8);
+        assert_kept(i64::MAX - 7, 0, types::I64);
+    }
+
+    /// The start is `folded displacement + load offset`, and that addition can
+    /// overflow on its own even when the displacement is not near the end.
+    #[test]
+    fn keeps_the_pointer_key_when_the_start_overflows() {
+        assert_kept(i64::MAX, 8, types::I8);
+        assert_kept(i64::MAX - 7, 8, types::I8);
+        assert_kept(i64::MIN, -1, types::I8);
+        assert_kept(i64::MIN, i32::MIN, types::I8);
+    }
+
+    /// A start before the slot must not fold, even though the arithmetic is
+    /// representable.
+    #[test]
+    fn keeps_the_pointer_key_when_the_start_is_negative() {
+        assert_kept(-8, 0, types::I8);
+        assert_kept(4, -8, types::I8);
+        assert_kept(i64::MIN, 0, types::I8);
+    }
+
+    #[test]
+    fn keeps_the_pointer_key_when_the_access_leaves_the_slot() {
+        assert_kept(12, 0, types::I64);
+        assert_kept(16, 0, types::I8);
+        assert_kept(8, 8, types::I8);
     }
 
     #[test]
     fn keeps_the_pointer_key_for_a_slot_the_pass_does_not_track() {
-        let (func, _slot, inst, addr) = load_at(8, types::I64);
+        let (func, _slot, inst, addr) = load_at(8, 0, types::I64);
         let key = key(&func, inst, addr, &FxHashSet::default());
         assert!(matches!(key.0, Base::Ptr(_)), "escaped slot folded to {key:?}");
     }

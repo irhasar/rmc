@@ -42,6 +42,17 @@
      expression and `RUSTFLAGS=-C overflow-checks=off` the test fails with
      `displacement 9223372036854775807 of 1 bytes folded to (Slot(ss0),
      9223372036854775807)`; with the fix it passes in both profiles.
+  5. **Start overflow needed its own cases.** The first unit tests only carried a
+     zero load offset, so they exercised `start + size` but never
+     `base_off + off`. `load_at` now takes the load's own offset: `i64::MAX` with
+     offset 8 and `i64::MAX - 7` with offset 8 overflow the start,
+     `i64::MIN` with offset -1 / `i32::MIN` overflow it downward, and `4` with
+     offset `-8` gives a negative start. Checked the same way: with the unchecked
+     expression and overflow checks off the start test fails with
+     `displacement 9223372036854775807 + offset 8 of 1 bytes folded to
+     (Slot(ss0), -9223372036854775801)`. One positive case also changed meaning:
+     the fix checks the *effective* start, so `-4` with offset 8 now folds to
+     `Slot(4)` where the old code rejected any negative displacement.
   2. Folding to a slot key the pass does not track lost same-block forwarding
      once any other address to that slot escaped. `mem_key` now takes the private
      set and keeps the pointer key for a non-private slot.
