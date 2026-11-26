@@ -1,3 +1,40 @@
+## Session (2026-11-24, branch `rakit-exp15`) — the backend LICM never hoists a load (negative result)
+
+Tried to close p4/p9's remaining gap by hoisting the `Vec` header reloads
+(`ptr`, `len`) out of loops that also call out. Three findings, no win, all
+reverted.
+
+- **The load path in `vendor/rakit-codegen/src/licm.rs` is unreachable.**
+  `hoist_from_loop` does `if op.can_trap() { continue; }` *before* the
+  `if op.can_load()` branch, and `Opcode::Load::can_trap()` is true (the opcode
+  is trapping; only the flags say otherwise). So no load has ever been hoisted
+  by this pass -- only `is_pure_for_egraph` instructions (measured: every hoist
+  in `p4_simd` is `[Iconst]`). Fixing the gate alone is not enough: the load
+  then fails the *availability* check, because its address operand is not
+  available at the preheader either.
+- **A loop-local escape analysis is the right safety argument** (a call cannot
+  write a stack slot whose address never escapes *inside the loop*, so
+  `any_opaque_store` must not block it). Seeding it from the load/store bases
+  (not from `StackAddr` instructions) is required -- rakit computes the
+  `stack_addr` of a `Vec` header once, outside the loop. With that, slots 0/1
+  of `p4_simd`'s sin/cos loop do become "unescaped" (`local=true`), but the
+  loads still fail on availability.
+- **Measured**: interleaved A/B, 11 reps, min: `p1_arith` +0.3%, `p2_mem` -0.2%,
+  `p3_calls` -0.1%, `p4_simd` -0.4%, `p8_minmax` +0.5%, `p9_u64f32` +0.4%.
+  Nothing fires, nothing changes, binaries byte-identical. Reverted.
+
+Where to pick this up: either make the address available (hoist the
+`StackAddr`/`UnaryGlobalValue` too, and handle the case where the address is a
+block parameter), or do it at the CLIF level in `store_forward`, which already
+has the private-slot analysis. Verify with `RAKIT_LICM_DEBUG=1`: the pass
+prints the opcodes it hoists.
+
+Also learned while instrumenting: `p4_simd`'s sin/cos loop is
+`block2 -> 12 -> 14 -> 15 -> 16 -> 17 -> block2` (5 body blocks + 4 cold panic
+blocks), i.e. exactly the shape the multi-block unroller would need; and the
+`main` of `p4_simd` calls `sinf`/`cosf` through `call *%rax` (GOT-indirect),
+not a direct `call rel32` like LLVM's `call sinf@PLT`.
+
 ## Session (2026-11-24, branch `rakit-exp15`) — x64 drops the frame pointer; `lea` for `x - c`
 
 - **Frame pointer omitted on x64** (`vendor/rakit-codegen/src/isa/x64/abi.rs`).
