@@ -127,6 +127,22 @@ static void write_profile(FILE *f) {
     }
 }
 
+// Returns 1 only when every byte reached the file. A failed buffered write sets
+// the stream's error indicator and can still let `fclose` succeed (there is
+// nothing left to flush), so both have to be checked before the temporary file
+// is allowed to replace a good capture.
+static int write_profile_fd(int fd) {
+    FILE *f = fdopen(fd, "w");
+    if (!f) {
+        close(fd);
+        return 0;
+    }
+    write_profile(f);
+    int write_failed = ferror(f) != 0;
+    int close_failed = fclose(f) != 0;
+    return !write_failed && !close_failed;
+}
+
 // Overwrite mode writes a private file next to the destination and renames it
 // into place, so an interrupted or failed capture leaves the previous profile
 // intact. `rename` replaces a symlink rather than following it, which is why
@@ -149,14 +165,7 @@ static void write_profile_atomic(const char *path) {
         return;
     }
     fchmod(fd, 0600);
-    FILE *f = fdopen(fd, "w");
-    if (!f) {
-        close(fd);
-        unlink(tmp);
-        return;
-    }
-    write_profile(f);
-    if (fclose(f) != 0) {
+    if (!write_profile_fd(fd)) {
         unlink(tmp);
         return;
     }
@@ -188,13 +197,10 @@ __attribute__((destructor)) static void sampler_fini(void) {
             return;
         }
         fchmod(fd, 0600);
-        FILE *f = fdopen(fd, "w");
-        if (!f) {
-            close(fd);
+        if (!write_profile_fd(fd)) {
+            unlink(path);
             return;
         }
-        write_profile(f);
-        fclose(f);
         fprintf(stderr, "sampler: wrote %s\n", path);
         return;
     }
@@ -206,13 +212,11 @@ __attribute__((destructor)) static void sampler_fini(void) {
             fprintf(stderr, "sampler: cannot open %s: %s\n", out_path, strerror(errno));
             return;
         }
-        FILE *f = fdopen(fd, "a");
-        if (!f) {
-            close(fd);
-            return;
+        // Appending cannot be undone, but a failed write must at least be
+        // reported rather than leaving a silently truncated tail.
+        if (!write_profile_fd(fd)) {
+            fprintf(stderr, "sampler: write to %s failed: %s\n", out_path, strerror(errno));
         }
-        write_profile(f);
-        fclose(f);
         return;
     }
     write_profile_atomic(out_path);

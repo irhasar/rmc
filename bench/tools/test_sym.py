@@ -69,7 +69,28 @@ def test_symlinked_binary_is_the_executable():
     assert "1 samples, 1 outside any symbol" in out, out
 
 
+def test_same_named_library_is_still_a_library():
+    with tempfile.TemporaryDirectory() as d:
+        exe_dir = os.path.join(d, "bin")
+        lib_dir = os.path.join(d, "lib")
+        os.makedirs(exe_dir)
+        os.makedirs(lib_dir)
+        exe = os.path.join(exe_dir, "prog")
+        lib = os.path.join(lib_dir, "prog")
+        open(exe, "w").close()
+        open(lib, "w").close()
+        out = symbolize([
+            "BASE 0",
+            f"MAP 1000 2000 {exe}",
+            f"MAP 3000 4000 {lib}",
+            "3100",
+        ], exe)
+    assert "[prog]" in out, out
+    assert "1 samples, 0 outside any symbol" in out, out
+
+
 if __name__ == "__main__":
     test_appended_captures_use_their_own_mappings()
     test_symlinked_binary_is_the_executable()
+    test_same_named_library_is_still_a_library()
     print("ok")

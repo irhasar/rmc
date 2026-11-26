@@ -45,9 +45,9 @@ def main():
     base = 0
     maps = []
     # A capture may name the binary through a symlink, and the mapping records
-    # the file it resolved to; compare real paths so the executable's own
-    # samples are not mistaken for a library's.
-    exe_name = os.path.basename(os.path.realpath(binary))
+    # the file it resolved to; compare whole real paths, not basenames, so a
+    # library that happens to share the executable's name is still a library.
+    exe_path = os.path.realpath(binary)
     for line in open(samples):
         line = line.strip()
         if not line:
@@ -69,7 +69,7 @@ def main():
         # work, so attribute it to that library instead of dropping it into the
         # "outside any symbol" bucket.
         owner = next((p for (lo, hi, p) in maps if lo <= ip < hi), None)
-        if owner is not None and os.path.basename(owner) != exe_name:
+        if owner is not None and os.path.realpath(owner) != exe_path:
             counts[f"[{os.path.basename(owner)}]"] += 1
             continue
         ip -= base

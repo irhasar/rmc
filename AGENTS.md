@@ -36,13 +36,18 @@ through them was wrong.
   run the vendored crate's tests; run them directly.
 - **Callee-save recovery is covered end to end** by
   `bench/tests/t_unwind_regs.rs` (registered in `regressions.sh`, expected
-  `true true true true true`). It calls `_Unwind_Backtrace` from inside a chain
-  `main -> top -> level -> walk` where each frame is forced out of line through
-  `black_box(fn)` (rakit's inliner ignores `#[inline(never)]`), and asserts
-  three things: the walk reaches at least four frames, `top`'s address appears
-  in a frame, and `_Unwind_GetGR` recovers the two magic values `level` keeps in
-  callee-saved registers. With the old RBP-relative CFA the frame chain stops
-  after `level` and the test prints `true true true false true`.
+  `true true true true`). Chain: `main -> caller -> mid -> walk`, each frame
+  forced out of line through `black_box(fn)` (rakit's inliner ignores
+  `#[inline(never)]`). `caller` keeps two magic values in callee-saved registers
+  across its call; `mid` overwrites those registers with four magic values of
+  its own, so its prologue must save the caller's copies; `walk` starts
+  `_Unwind_Backtrace`. Frames are classified by **register content**, not by
+  address ranges (the first version used IP windows and both windows matched
+  every frame, because `caller` was inlined into `main`): the caller is "seen"
+  only when a frame reports both of its values and none of `mid`'s, and the
+  clobber is "seen" when a frame reports two or more of `mid`'s values. With the
+  old RBP-relative CFA the test prints `false true false true`; the `true` in
+  position 2 is the non-vacuity check (mid really does clobber callee-saves).
   The CFI arithmetic was also cross-checked against real machine code: for a
   frameless function with a 64 B array and rbx/r12/r13 saved at
   `0x48/0x50/0x58(%rsp)` with `CFA = rsp+112`, the FDE says `c-40/c-32/c-24`,
@@ -63,15 +68,27 @@ through them was wrong.
     `O_APPEND|O_NOFOLLOW|O_CLOEXEC` at exit, which cannot destroy earlier
     content. Verified: SIGKILL mid-run keeps the old file, a completed run
     replaces it, two append runs leave two `BASE` records, no temp files leak.
+  - **A failed write is detected before the temp file is renamed.**
+    `write_profile_fd` checks `ferror` *and* `fclose`: a buffered write that
+    fails mid-flush sets the stream error indicator, and a later `fclose` can
+    still return 0 when nothing is left to flush, so checking the close alone
+    can let a truncated capture replace a good one. Verified with `ulimit -f 1`
+    plus an inherited `SIGXFSZ` ignore: the write fails, the destination keeps
+    its previous contents and no `.sampler.*` file is left behind. Honest
+    caveat: on this glibc `fclose` also reports the EFBIG, so the `ferror` check
+    could not be shown to be the deciding one; it is required by the C stream
+    rules, not by an observed failure here.
   - The destructor also writes `MAP <start> <end> <path>` lines for the
     executable mappings, and `sym.py` attributes samples that land in a shared
     library to `[libc.so.6]`/`[libm.so.6]` instead of counting them as "outside
     any symbol". First useful result: `p4_simd` is 18% libm, not executable code.
-  - `sym.py` also compares `realpath` when deciding whether a mapping is the
-    executable (a binary named through a symlink was reported as a library), and
-    clears the mapping list on every `BASE` record (appended captures have their
-    own layout; an address could otherwise be credited to the previous capture's
-    library). `bench/tools/test_sym.py` pins both; it fails on either mutation.
+  - `sym.py` also decides "is this mapping the executable" by comparing whole
+    `realpath`s, not basenames (a binary named through a symlink was reported as
+    a library, and a library that shares the executable's basename bypassed
+    library attribution), and clears the mapping list on every `BASE` record
+    (appended captures have their own layout; an address could otherwise be
+    credited to the previous capture's library). `bench/tools/test_sym.py` pins
+    all three; it fails on any of the mutations.
 - **Full matrix** (`bench/allaxes.sh` CREPS=3 RREPS=7, 45/45 rows `ok`, every
   output validated against LLVM; columns are compile wall/CPU/peak-RSS/size and
   run wall/CPU/peak-RSS):
