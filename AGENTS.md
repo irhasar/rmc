@@ -20,6 +20,17 @@
      and end are now `checked_add`ed, the start must be non-negative and the end
      must fit the slot. `bench/tests/t_sf_huge_index.rs` pins that a guarded
      `isize::MAX` index compiles and prints `0 0 1`.
+     **Reproduced, after one failed attempt:** the fold only sees a huge
+     displacement when the slice is a *temporary* over a local array
+     (`(&mut arr[..n])[isize::MAX as usize]`), which keeps the data pointer a
+     plain `stack_addr`. A slice held in a local loads its pointer, so nothing
+     folds and the first repro attempt (index passed as a function argument)
+     proved nothing. With the unchecked arithmetic and
+     `RAKIT_EXPENSIVE_CHECKS=1 ./y.sh build`, compiling that fixture panics in
+     `store_forward.rs` with `attempt to add with overflow`; with the checked
+     arithmetic the same compiler build compiles it and prints `0 0 1`. Without
+     overflow checks the old expression wrapped, the end came out negative, and
+     the access was keyed against `Slot + i64::MAX`.
   2. Folding to a slot key the pass does not track lost same-block forwarding
      once any other address to that slot escaped. `mem_key` now takes the private
      set and keeps the pointer key for a non-private slot.

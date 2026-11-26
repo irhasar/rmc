@@ -1,31 +1,30 @@
 //! A guarded access at a huge constant index must not crash the compiler.
 //!
 //! The length is a runtime value, so the bounds comparison cannot be folded and
-//! the load at `isize::MAX` survives into codegen as a displacement of
-//! `i64::MAX`. Store forwarding keys every access by its byte range, and the end
-//! of that range does not exist: the arithmetic must not overflow (the compiler
-//! is built with overflow checks), and an access that leaves its slot must keep
-//! its pointer key instead of being keyed against the slot.
+//! the load at `isize::MAX` survives into codegen. A temporary slice keeps its
+//! data pointer a plain `stack_addr`, so the load lands at
+//! `stack_addr + i64::MAX`: the end of that range does not exist. Store
+//! forwarding keys every access by its byte range, so it must not compute that
+//! end with wrapping arithmetic (the end would come out negative and pass the
+//! upper-bound test) nor with overflow checks on (the compiler would abort).
 //!
-//! At run time the branch is never taken, so the program must print `n` and exit
-//! zero.
+//! At run time the branch is never taken, so the program prints `0 0 1`.
 
 use std::hint::black_box;
 
-#[inline(never)]
-fn guarded(buf: &mut [u8], i: usize) -> u8 {
-    if i < buf.len() {
-        buf[i]
+fn main() {
+    let mut arr = [7u8; 4];
+    let n = black_box(std::env::args().count()).min(4);
+    let huge = isize::MAX as usize;
+    let a = if huge < (&mut arr[..n]).len() {
+        (&mut arr[..n])[huge]
     } else {
         0
-    }
-}
-
-fn main() {
-    let mut buf = [7u8; 4];
-    let n = black_box(std::env::args().count()).min(buf.len());
-    let i = isize::MAX as usize;
-    let a = guarded(&mut buf[..n], i);
-    let b = guarded(&mut buf[..n], i - 1);
+    };
+    let b = if huge - 1 < (&mut arr[..n]).len() {
+        (&mut arr[..n])[huge - 1]
+    } else {
+        0
+    };
     println!("{a} {b} {n}");
 }
