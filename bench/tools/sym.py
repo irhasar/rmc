@@ -10,6 +10,10 @@
 
     usage: sym.py <samples> <binary> [top] [--exe <captured-exe-path>]
 
+    Each capture records the size and CRC-32 of its executable (`EXEID`), so a
+    capture appended by a *different* binary is not symbolized against the
+    wrong symbol table: those samples are reported as `[other-exe]` instead.
+
     The capture marks its executable mappings (`MAP <start> <end> exe|lib
     <path>`), so the histogram is correct even when <binary> is a copy kept
     next to an archived profile. For captures made before that marker existed,
@@ -18,6 +22,7 @@
 import os
 import subprocess
 import sys
+import zlib
 import bisect
 from collections import Counter
 
@@ -39,6 +44,19 @@ def load_symbols(binary):
             continue
     syms.sort()
     return syms
+
+
+def file_id(path):
+    """Size and CRC-32 of the executable, as recorded by the sampler.
+
+    Content-based, so a copy kept next to an archived profile still matches.
+    """
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    return (len(data), zlib.crc32(data) & 0xFFFFFFFF)
 
 
 def parse_args(argv):
@@ -71,6 +89,10 @@ def main():
     unknown = 0
     base = 0
     maps = []
+    cur_id = None
+    binary_id = file_id(binary)
+    mismatched = 0
+    other_ids = set()
     # `nm` can only name the executable's own symbols, so the question "is this
     # mapping the executable" decides between symbol lookup and a library
     # bucket. A capture answers it with the `exe` tag; for an untagged capture
@@ -83,9 +105,14 @@ def main():
             continue
         if line.startswith("BASE "):
             base = int(line.split()[1], 16)
+            cur_id = None
             # Each appended capture has its own layout, so the mappings of the
             # previous one must not be used to attribute this one's addresses.
             maps.clear()
+            continue
+        if line.startswith("EXEID "):
+            _, size, crc = line.split()
+            cur_id = (int(size), int(crc, 16))
             continue
         if line.startswith("MAP "):
             start, end, tail = line[4:].split(" ", 2)
@@ -99,10 +126,20 @@ def main():
         owner = next((m for m in maps if m[0] <= ip < m[1]), None)
         if owner is not None:
             tag, path = owner[2], owner[3]
-            is_exe = tag == "exe" if tag else os.path.realpath(path) == exe_path
-            if not is_exe:
-                counts[f"[{os.path.basename(path)}]"] += 1
-                continue
+            if tag == "exe" and cur_id is not None and binary_id is not None:
+                # The capture knows which binary produced this run; if it is
+                # not the one whose symbols we were given, its offsets mean
+                # something else and must not be resolved against them.
+                if cur_id != binary_id:
+                    counts["[other-exe]"] += 1
+                    mismatched += 1
+                    other_ids.add(f"{cur_id[0]}/{cur_id[1]:08x}")
+                    continue
+            else:
+                is_exe = tag == "exe" if tag else os.path.realpath(path) == exe_path
+                if not is_exe:
+                    counts[f"[{os.path.basename(path)}]"] += 1
+                    continue
         ip -= base
         i = bisect.bisect_right(starts, ip) - 1
         if i < 0:
@@ -114,6 +151,8 @@ def main():
             continue
         counts[name] += 1
     print(f"{total} samples, {unknown} outside any symbol")
+    if mismatched:
+        print(f"{mismatched} samples from a different executable ({', '.join(sorted(other_ids))})")
     for name, n in counts.most_common(top):
         print(f"{100.0 * n / max(total, 1):6.1f}%  {n:6d}  {name}")
 

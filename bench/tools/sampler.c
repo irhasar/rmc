@@ -95,6 +95,48 @@ __attribute__((constructor)) static void sampler_init(void) {
     setitimer(ITIMER_PROF, &it, NULL);
 }
 
+// A capture can be appended to by a different binary, so a path (or an "exe"
+// tag) is not enough to know whether the symbol table the symbolizer was given
+// belongs to the run that produced a sample. Identify the executable by its
+// content instead: size plus CRC-32, which survives copying to an archive.
+static unsigned long crc_table[256];
+static void crc32_init(void) {
+    for (unsigned long i = 0; i < 256; i++) {
+        unsigned long c = i;
+        for (int k = 0; k < 8; k++) {
+            c = (c & 1) ? 0xEDB88320UL ^ (c >> 1) : (c >> 1);
+        }
+        crc_table[i] = c;
+    }
+}
+
+// Returns 0 when the file cannot be read; the symbolizer then falls back to
+// comparing paths.
+static int file_id(const char *path, unsigned long long *size, unsigned long *crc) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return 0;
+    }
+    crc32_init();
+    unsigned long c = 0xFFFFFFFFUL;
+    unsigned long long total = 0;
+    static unsigned char buf[65536];
+    ssize_t n;
+    while ((n = read(fd, buf, sizeof(buf))) > 0) {
+        for (ssize_t i = 0; i < n; i++) {
+            c = crc_table[(c ^ buf[i]) & 0xFF] ^ (c >> 8);
+        }
+        total += (unsigned long long)n;
+    }
+    close(fd);
+    if (n < 0) {
+        return 0;
+    }
+    *size = total;
+    *crc = (c ^ 0xFFFFFFFFUL) & 0xFFFFFFFFUL;
+    return 1;
+}
+
 // Record the executable mappings so sym.py can tell executable samples from
 // library ones instead of counting the latter as "outside any symbol". Each
 // mapping carries a tag: "exe" for the executable itself, "lib" for everything
@@ -108,6 +150,11 @@ static void dump_maps(FILE *f) {
     char exe[4096];
     ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
     exe[n > 0 ? n : 0] = 0;
+    unsigned long long exe_size = 0;
+    unsigned long exe_crc = 0;
+    if (file_id(exe, &exe_size, &exe_crc)) {
+        fprintf(f, "EXEID %llu %lx\n", exe_size, exe_crc);
+    }
     char line[4096];
     while (fgets(line, sizeof(line), m)) {
         unsigned long long start, end;

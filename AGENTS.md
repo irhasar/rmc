@@ -52,12 +52,16 @@ through them was wrong.
   non-vacuity check (mid really does clobber callee-saves).
   A swap of two registers' save slots is invisible to a value-by-value check, so
   `vendor/rakit-codegen/src/isa/x64/inst/unwind/systemv.rs` also has
-  `test_frameless_save_reg_offsets`, which feeds `create_unwind_info_from_insts`
-  the instruction list of a real prologue (`sub $0x68`, clobber area 32,
-  rbx/r12/r13 at 0/8/16) and asserts the whole FDE:
-  `[(4, CfaOffset(112)), (8, Offset(Register(3), -40)), (12, Offset(Register(12),
-  -32)), (16, Offset(Register(13), -24))]`. Its mapper reports a frame register,
-  so it also fails if the CFA rule goes back to RBP-based.
+  `test_frameless_save_reg_offsets`, which *runs the prologue generator*:
+  `gen_clobber_save` is called with a layout shaped like a real frameless
+  function (`sub $0x68`, clobber area 32, rbx/r12/r13 at 0/8/16), its `SaveReg`
+  entries are checked against the layout (slot 0/8/16 in register order), and
+  the same entries are fed to `create_unwind_info_from_insts`. The asserted FDE
+  is `[(4, CfaOffset(112)), (12, Offset(Register(3), -40)), (16,
+  Offset(Register(12), -32)), (20, Offset(Register(13), -24))]`. Verified
+  sensitive: reversing the clobber loop in `gen_clobber_save` fails it
+  (`left: p13i, right: p3i`), and restoring RBP-based CFA fails it with
+  `CfaRegister(Register(5))`.
   The CFI arithmetic was also cross-checked against real machine code: for a
   frameless function with a 64 B array and rbx/r12/r13 saved at
   `0x48/0x50/0x58(%rsp)` with `CFA = rsp+112`, the FDE says `c-40/c-32/c-24`,
@@ -95,6 +99,14 @@ through them was wrong.
     shared library to `[libc.so.6]`/`[libm.so.6]` instead of counting them as
     "outside any symbol". First useful result: `p4_simd` is 18% libm, not
     executable code.
+  - **A path is not an identity.** A capture can be appended to by a different
+    binary, and then the `exe` tag says "this was *a* main executable", not
+    "this is the binary whose symbols you loaded". Each capture therefore also
+    records `EXEID <size> <crc32>` of `/proc/self/exe` (content-based, so a copy
+    in an archive still matches, and it agrees with `zlib.crc32`). `sym.py`
+    compares it with the supplied binary and files mismatched samples under
+    `[other-exe]` plus a `N samples from a different executable (<id>)` line,
+    instead of resolving them against a symbol table they do not belong to.
   - **The tag is what survives archiving.** A capture names the path the binary
     had when it ran, so symbolizing a saved profile against a *copy* of the
     binary used to file every executable sample under `[prog]` (the path

@@ -137,19 +137,21 @@ mod tests {
         );
     }
 
-    /// The per-register rules of a frameless frame, checked against a real
-    /// prologue: `sub $0x68` (104 bytes = 72 bytes of fixed frame and stack
-    /// slots plus a 32 byte clobber area) with rbx/r12/r13 stored at
-    /// 0x48/0x50/0x58(%rsp). CFA is RSP+112, so the rules must be -40/-32/-24;
-    /// pairing a register with another register's slot would pass a
-    /// value-by-value check but fail here.
+    /// The per-register rules of a frameless frame, derived from the prologue
+    /// generator rather than from hand-written pairs: `gen_clobber_save` decides
+    /// which register goes in which clobber slot, and a wrong order there would
+    /// make the unwinder read the wrong slot.
     #[test]
     fn test_frameless_save_reg_offsets() {
         use crate::isa::unwind::UnwindInst;
         use crate::isa::unwind::systemv::{
             RegisterMapper, RegisterMappingError, create_unwind_info_from_insts,
         };
+        use crate::isa;
         use crate::isa::x64::inst::regs;
+        use crate::machinst::{ABIMachineSpec, FrameLayout, FunctionCalls, Writable};
+        use crate::settings::builder;
+        use crate::isa::x64::abi::X64ABIMachineSpec;
 
         struct Mapper;
         impl RegisterMapper<crate::machinst::Reg> for Mapper {
@@ -164,7 +166,27 @@ mod tests {
             }
         }
 
-        let insts = vec![
+        // Shape of a real frameless function: `sub $0x68` = 72 bytes of fixed
+        // frame and stack slots plus a 32 byte clobber area, with rbx/r12/r13
+        // saved at 0x48/0x50/0x58(%rsp).
+        let layout = FrameLayout {
+            incoming_args_size: 0,
+            tail_args_size: 0,
+            setup_area_size: 8,
+            clobber_size: 32,
+            fixed_frame_storage_size: 72,
+            stackslots_size: 64,
+            outgoing_args_size: 0,
+            clobbered_callee_saves: vec![
+                Writable::from_reg(regs::rbx().to_real_reg().expect("real register")),
+                Writable::from_reg(regs::r12().to_real_reg().expect("real register")),
+                Writable::from_reg(regs::r13().to_real_reg().expect("real register")),
+            ],
+            function_calls: FunctionCalls::Regular,
+            ..Default::default()
+        };
+        let flags = Flags::new(builder());
+        let mut insts = vec![
             (
                 0,
                 UnwindInst::DefineNewFrame {
@@ -173,33 +195,35 @@ mod tests {
                 },
             ),
             (4, UnwindInst::StackAlloc { size: 104 }),
-            (
-                8,
-                UnwindInst::SaveReg {
-                    reg: regs::rbx().to_real_reg().expect("real register"),
-                    clobber_offset: 0,
-                },
-            ),
-            (
-                12,
-                UnwindInst::SaveReg {
-                    reg: regs::r12().to_real_reg().expect("real register"),
-                    clobber_offset: 8,
-                },
-            ),
-            (
-                16,
-                UnwindInst::SaveReg {
-                    reg: regs::r13().to_real_reg().expect("real register"),
-                    clobber_offset: 16,
-                },
-            ),
         ];
+        // `clobber_offset` is the offset *within* the clobber area; the store
+        // itself goes to `fixed + outgoing + clobber_offset`.
+        let base = layout.fixed_frame_storage_size + layout.outgoing_args_size;
+        let mut next = 0;
+        let mut saved = vec![];
+        for inst in X64ABIMachineSpec::gen_clobber_save(isa::CallConv::SystemV, &flags, &layout) {
+            let crate::isa::x64::inst::Inst::Unwind { inst } = inst else {
+                continue;
+            };
+            let UnwindInst::SaveReg { clobber_offset, reg } = inst else {
+                continue;
+            };
+            // Every clobber is 8 bytes here, so the slots must run 0, 8, 16 in
+            // the order the layout lists the registers: a register paired with
+            // another register's slot is exactly what this catches.
+            assert_eq!(clobber_offset, next, "slot out of order for {reg:?}");
+            assert!(base + clobber_offset < layout.setup_area_size + 104);
+            assert_eq!(reg, layout.clobbered_callee_saves[saved.len()].to_reg());
+            next += 8;
+            saved.push(reg);
+            insts.push((8 + 4 * saved.len() as u32, UnwindInst::SaveReg { clobber_offset, reg }));
+        }
+        assert_eq!(saved.len(), 3, "expected one SaveReg per clobbered register");
 
         let info = create_unwind_info_from_insts(&insts, 20, &Mapper).expect("unwind info");
         assert_eq!(
             format!("{:?}", info.to_fde(Address::Constant(0))),
-            "FrameDescriptionEntry { address: Constant(0), length: 20, lsda: None, instructions: [(4, CfaOffset(112)), (8, Offset(Register(3), -40)), (12, Offset(Register(12), -32)), (16, Offset(Register(13), -24))] }"
+            "FrameDescriptionEntry { address: Constant(0), length: 20, lsda: None, instructions: [(4, CfaOffset(112)), (12, Offset(Register(3), -40)), (16, Offset(Register(12), -32)), (20, Offset(Register(13), -24))] }"
         );
     }
 
