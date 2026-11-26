@@ -1,4 +1,45 @@
 ## Session (2026-11-24, branch `rakit-exp12`) — store-forward address memoisation; write-once rule rejected
+## Session (2026-11-25, branch `rakit-exp14`) — precise address keys: the cross-block dataflow finally fires
+
+- **`mem_key` only recognised a bare `stack_addr`.** rakit indexes an aggregate
+  field as `iadd(stack_addr, imul(iconst, iconst))`, so every field access became
+  its own `Base::Ptr` and no store ever matched the load that read it back. That
+  is why the cross-block dataflow counted nothing on the shapes it exists for
+  (round 16) — not the meet, as that round concluded.
+- **Fix:** `const_addr` folds `stack_addr` + `iadd`/`imul` of constants into
+  `(slot, offset)`, and `mem_key` keys such an access as `Base::Slot` when the
+  whole access provably stays inside that slot. Exact constants only (a bound
+  cannot prove two accesses hit the same bytes), and only `tracked()` decides
+  whether the slot is private, so the escape rules are unchanged.
+- **Measured:** the counter goes from 0 to **21** cross-block forwards on
+  `t_sf_fuzz` with the dataflow on and stays **0** with `RAKIT_SF_NO_CBE=1`;
+  outputs identical. The post-pass IR of that fixture is byte-identical either
+  way — the forwards are redundant there — but the binaries shrink:
+  p1_arith 4,159,072 → 4,156,400 (−2,672 B), h_mem 4,179,440 → 4,176,752
+  (−2,688 B), same output. Runtime flat: p1 99.25 → 99.29 ms, h_mem 2.85 → 2.83 ms
+  (15 reps, min).
+- **Gate:** 65 suites / 25,368 passed / 0 failed; `regressions.sh` exit 0;
+  `allaxes` 45/45 `ok`, full matrix below (`L/U/M` per cell). M still wins
+  compile wall, size and RSS everywhere, and runtime on p5/p6 (~9.6x) and p7.
+
+| prog | Cwall | Ccpu | Crss | size | Rwall | Rcpu | Rrss |
+|---|---|---|---|---|---|---|---|
+| h_arith | 116ms/88ms/97ms | 140ms/114ms/125ms | 116.5M/118.1M/119.4M | 4,617,128/5,839,120/4,088,752 | 2ms/3ms/2ms | 2ms/2ms/2ms | 10.8M/10.8M/11.0M |
+| h_branch | 115ms/96ms/101ms | 140ms/122ms/131ms | 116.9M/118.3M/119.4M | 4,616,832/5,837,264/4,087,072 | 2ms/2ms/2ms | 2ms/2ms/2ms | 11.0M/11.1M/10.8M |
+| h_calls | 114ms/90ms/102ms | 138ms/123ms/132ms | 117.1M/118.4M/119.9M | 4,616,872/5,837,792/4,087,448 | 2ms/2ms/2ms | 2ms/2ms/2ms | 11.1M/10.8M/10.8M |
+| h_float | 123ms/91ms/97ms | 147ms/121ms/125ms | 115.7M/117.7M/118.7M | 4,637,984/5,861,024/4,127,640 | 2ms/3ms/2ms | 2ms/2ms/2ms | 10.8M/10.8M/10.8M |
+| h_mem | 264ms/134ms/165ms | 429ms/186ms/237ms | 136.1M/133.6M/135.9M | 4,646,856/5,959,856/4,176,752 | 3ms/9ms/4ms | 3ms/9ms/4ms | 10.8M/11.1M/11.0M |
+| h_simd | 141ms/95ms/108ms | 165ms/122ms/135ms | 122.5M/123.5M/125.0M | 4,617,704/5,843,736/4,091,160 | 2ms/4ms/2ms | 2ms/3ms/2ms | 10.8M/11.0M/10.8M |
+| p1_arith | 84ms/79ms/80ms | 103ms/101ms/104ms | 104.7M/107.0M/108.2M | 4,635,232/5,877,944/4,156,400 | 81ms/108ms/102ms | 81ms/108ms/101ms | 11.1M/11.0M/10.7M |
+| p2_mem | 246ms/130ms/167ms | 373ms/175ms/236ms | 132.6M/130.1M/132.2M | 4,639,896/5,936,144/4,154,272 | 17ms/156ms/42ms | 18ms/155ms/43ms | 10.8M/11.1M/11.0M |
+| p3_calls | 100ms/88ms/93ms | 125ms/115ms/121ms | 114.6M/115.5M/117.1M | 4,612,368/5,820,136/4,077,128 | 37ms/117ms/58ms | 37ms/117ms/58ms | 11.1M/11.0M/10.8M |
+| p4_simd | 108ms/95ms/103ms | 127ms/119ms/128ms | 115.4M/116.0M/117.5M | 4,636,096/5,892,376/4,163,024 | 56ms/158ms/84ms | 56ms/157ms/83ms | 48.2M/49.4M/48.8M |
+| p5_inline | 83ms/77ms/80ms | 104ms/102ms/106ms | 103.8M/105.6M/107.1M | 4,609,368/5,813,704/4,070,040 | 58ms/895ms/6ms | 58ms/894ms/6ms | 11.0M/11.0M/11.0M |
+| p6_scalar | 81ms/76ms/81ms | 99ms/99ms/102ms | 100.2M/102.1M/103.2M | 4,609,368/5,813,688/4,070,040 | 58ms/901ms/6ms | 57ms/900ms/6ms | 10.8M/10.8M/11.1M |
+| p7_branchy | 83ms/77ms/81ms | 104ms/98ms/103ms | 104.0M/105.6M/107.1M | 4,609,520/5,813,800/4,070,216 | 43ms/101ms/35ms | 42ms/100ms/35ms | 10.7M/11.1M/10.9M |
+| p8_minmax | 83ms/79ms/83ms | 103ms/101ms/106ms | 104.1M/105.6M/107.1M | 4,609,544/5,813,752/4,070,200 | 18ms/39ms/20ms | 18ms/39ms/20ms | 11.0M/10.7M/11.0M |
+| p9_u64f32 | 95ms/87ms/96ms | 115ms/111ms/121ms | 110.0M/111.9M/113.2M | 4,635,448/5,886,872/4,160,032 | 31ms/77ms/34ms | 31ms/76ms/34ms | 17.8M/18.8M/18.2M |
+
 ## Session (2026-11-25, branch `rakit-exp13`) — review round 17: skip messages are not a summary
 
 - **The deep-cast regression accepted bail messages as proof the pass ran.** It

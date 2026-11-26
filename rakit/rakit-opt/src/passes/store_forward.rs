@@ -336,15 +336,89 @@ fn slot_of_resolved(dfg: &ir::DataFlowGraph, arg: Value) -> Option<StackSlot> {
 /// If `addr` is a `stack_addr` of a known slot, or a tracked pointer base,
 /// return the base and the byte offset at which `inst` accesses it.
 fn mem_key(func: &ir::Function, inst: Inst, addr: Value) -> Option<Key> {
-    let addr = func.dfg.resolve_aliases(addr);
-    if let ir::ValueDef::Result(def_inst, 0) = func.dfg.value_def(addr) {
-        if let ir::InstructionData::StackAddr { stack_slot, offset, .. } = func.dfg.insts[def_inst]
-        {
-            let off = i64::from(offset) + offset_of(func, inst)?;
-            return Some((Base::Slot(stack_slot), off));
+    let off = offset_of(func, inst)?;
+    if let Some((slot, base_off)) = const_addr(func, addr, 8) {
+        // Only an access that stays inside its own slot may be keyed relative to
+        // it: past the end the neighbouring bytes belong to something else.
+        let size = i64::from(access_size(func, inst)?);
+        let fits = func
+            .sized_stack_slots
+            .get(slot)
+            .is_some_and(|data| base_off >= 0 && base_off + off + size <= i64::from(data.size));
+        if fits {
+            return Some((Base::Slot(slot), base_off + off));
         }
     }
-    Some((Base::Ptr(addr), offset_of(func, inst)?))
+    Some((Base::Ptr(func.dfg.resolve_aliases(addr)), off))
+}
+
+/// The number of bytes the access at `inst` reads or writes.
+fn access_size(func: &ir::Function, inst: Inst) -> Option<u32> {
+    let dfg = &func.dfg;
+    let value = match dfg.insts[inst] {
+        ir::InstructionData::Load { .. } => *dfg.inst_results(inst).first()?,
+        ir::InstructionData::Store { .. } => {
+            *dfg.insts[inst].arguments(&dfg.value_lists).first()?
+        }
+        _ => return None,
+    };
+    Some(dfg.value_type(value).bytes())
+}
+
+/// `(slot, byte offset)` when `value` is a constant expression over
+/// `stack_addr`: `stack_addr`, `iadd` and `imul` of constants.
+///
+/// rakit indexes aggregate fields as `iadd(stack_addr, imul(iconst, iconst))`, so
+/// without folding the chain each field access gets its own pointer base and no
+/// store matches the load that reads it back: the aggregate shape stays
+/// unforwarded. Exact constants only — a bound cannot say two accesses hit the
+/// same bytes.
+fn const_addr(func: &ir::Function, v: Value, depth: u32) -> Option<(StackSlot, i64)> {
+    if depth == 0 {
+        return None;
+    }
+    let dfg = &func.dfg;
+    let v = dfg.resolve_aliases(v);
+    let ir::ValueDef::Result(inst, 0) = dfg.value_def(v) else { return None };
+    match dfg.insts[inst] {
+        ir::InstructionData::StackAddr { stack_slot, offset, .. } => {
+            Some((stack_slot, i64::from(offset)))
+        }
+        ir::InstructionData::Binary { opcode: ir::Opcode::Iadd, .. } => {
+            let args = dfg.insts[inst].arguments(&dfg.value_lists);
+            let (a, b) = (*args.first()?, *args.get(1)?);
+            if let Some((slot, off)) = const_addr(func, a, depth - 1) {
+                return Some((slot, off.checked_add(const_int(func, b, 8)?)?));
+            }
+            let (slot, off) = const_addr(func, b, depth - 1)?;
+            Some((slot, off.checked_add(const_int(func, a, 8)?)?))
+        }
+        _ => None,
+    }
+}
+
+/// The value of `v` when it is built from `iconst`, `iadd` and `imul` only.
+fn const_int(func: &ir::Function, v: Value, depth: u32) -> Option<i64> {
+    if depth == 0 {
+        return None;
+    }
+    let dfg = &func.dfg;
+    let v = dfg.resolve_aliases(v);
+    let ir::ValueDef::Result(inst, 0) = dfg.value_def(v) else { return None };
+    match dfg.insts[inst] {
+        ir::InstructionData::UnaryImm { opcode: ir::Opcode::Iconst, imm, .. } => Some(imm.bits()),
+        ir::InstructionData::Binary { opcode, .. } => {
+            let args = dfg.insts[inst].arguments(&dfg.value_lists);
+            let a = const_int(func, *args.first()?, depth - 1)?;
+            let b = const_int(func, *args.get(1)?, depth - 1)?;
+            match opcode {
+                ir::Opcode::Iadd => a.checked_add(b),
+                ir::Opcode::Imul => a.checked_mul(b),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Is this key a location the pass is allowed to track?
