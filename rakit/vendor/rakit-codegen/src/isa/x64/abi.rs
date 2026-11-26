@@ -728,6 +728,16 @@ impl ABIMachineSpec for X64ABIMachineSpec {
             let stack_size = i32::try_from(stack_size)
                 .expect("`stack_size` is too large to fit in a 32-bit immediate");
             insts.push(Inst::subq_mi(rsp, stack_size));
+            if flags.unwind_info() && !frame_layout.has_frame_pointer() {
+                // Without a frame pointer the CFA is SP-relative, so the
+                // unwinder has to be told about the allocation. The epilogue
+                // emits no rule for the matching deallocation, exactly like the
+                // frame-pointer path: the FDE describes the body of the
+                // function, not its teardown.
+                insts.push(Inst::Unwind {
+                    inst: UnwindInst::StackAlloc { size: stack_size as u32 },
+                });
+            }
         }
 
         // Store each clobbered register in order at offsets from RSP,

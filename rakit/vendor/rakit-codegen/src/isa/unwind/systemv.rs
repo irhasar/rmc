@@ -171,6 +171,14 @@ pub(crate) fn create_unwind_info_from_insts<MR: RegisterMapper<Reg>>(
 ) -> CodegenResult<UnwindInfo> {
     let mut instructions = vec![];
 
+    // The frame-pointer-relative CFA is only meaningful once the prologue has
+    // saved the caller's frame pointer. A function compiled without one never
+    // pushes it, so RBP still holds the *caller's* value and the CFA has to stay
+    // SP-relative: `StackAlloc` then tracks every RSP adjustment instead.
+    let has_frame_regs =
+        insts.iter().any(|(_, inst)| matches!(inst, UnwindInst::PushFrameRegs { .. }));
+    let fp = if has_frame_regs { mr.fp() } else { None };
+
     let mut cfa_offset = 0;
     let mut clobber_offset_to_cfa = 0;
     for &(instruction_offset, ref inst) in insts {
@@ -213,9 +221,9 @@ pub(crate) fn create_unwind_info_from_insts<MR: RegisterMapper<Reg>>(
                 // Define CFA in terms of FP. Note that we assume it was already
                 // defined correctly in terms of the current SP, and FP has just
                 // been set to the current SP, so we do not need to change the
-                // offset, only the register.  (This is done only if the target
-                // defines a frame pointer register.)
-                if let Some(fp) = mr.fp() {
+                // offset, only the register.  (This is done only if the function
+                // actually saved its frame pointer.)
+                if let Some(fp) = fp {
                     instructions.push((instruction_offset, CallFrameInstruction::CfaRegister(fp)));
                 }
                 // Record initial CFA offset.  This will be used with later
@@ -228,7 +236,7 @@ pub(crate) fn create_unwind_info_from_insts<MR: RegisterMapper<Reg>>(
             &UnwindInst::StackAlloc { size } => {
                 // If we do not use a frame pointer, we need to update the
                 // CFA offset whenever the stack pointer changes.
-                if mr.fp().is_none() {
+                if fp.is_none() {
                     cfa_offset += size;
                     instructions.push((
                         instruction_offset,

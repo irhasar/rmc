@@ -99,15 +99,17 @@ mod tests {
         AbiParam, Function, InstBuilder, Signature, StackSlotData, StackSlotKind, types,
     };
     use crate::isa::{CallConv, lookup};
-    use crate::settings::{Flags, builder};
+    use crate::settings::{Configurable, Flags, builder};
     use gimli::write::Address;
     use target_lexicon::triple;
 
     #[test]
     fn test_simple_func() {
+        let mut b = builder();
+        b.set("preserve_frame_pointers", "true").unwrap();
         let isa = lookup(triple!("x86_64"))
             .expect("expect x86 ISA")
-            .finish(Flags::new(builder()))
+            .finish(Flags::new(b))
             .expect("expect backend creation to succeed");
 
         let mut context = Context::for_function(create_function(
@@ -135,6 +137,47 @@ mod tests {
         );
     }
 
+    /// A function compiled without a frame pointer must describe its CFA in
+    /// terms of RSP: RBP still holds the *caller's* frame pointer, so an
+    /// FP-relative rule would point the unwinder at the caller's frame and lose
+    /// every frame above it.
+    #[test]
+    fn test_frameless_func_uses_sp_relative_cfa() {
+        let mut b = builder();
+        b.set("preserve_frame_pointers", "false").unwrap();
+        let isa = lookup(triple!("x86_64"))
+            .expect("expect x86 ISA")
+            .finish(Flags::new(b))
+            .expect("expect backend creation to succeed");
+
+        let mut context = Context::for_function(create_function(
+            CallConv::SystemV,
+            Some(StackSlotData::new(StackSlotKind::ExplicitSlot, 64, 0)),
+        ));
+
+        let code = context
+            .compile(&*isa, &mut Default::default())
+            .expect("expected compilation");
+
+        let fde = match code
+            .create_unwind_info(isa.as_ref())
+            .expect("can create unwind info")
+        {
+            Some(crate::isa::unwind::UnwindInfo::SystemV(info)) => {
+                info.to_fde(Address::Constant(1234))
+            }
+            _ => panic!("expected unwind information"),
+        };
+        let fde = format!("{fde:?}");
+
+        assert!(!fde.contains("CfaRegister"), "CFA must stay SP-relative: {fde}");
+        // CFA is RSP+8 at entry, then RSP+80 once the frame is allocated: 64
+        // bytes of stack slot plus the 8 bytes of padding that keep the
+        // outgoing argument area 16 byte aligned. The return address is always
+        // at CFA-8, i.e. RSP+72.
+        assert!(fde.contains("CfaOffset(80)"), "stack allocation not recorded: {fde}");
+    }
+
     fn create_function(call_conv: CallConv, stack_slot: Option<StackSlotData>) -> Function {
         let mut func = Function::with_name_signature(Default::default(), Signature::new(call_conv));
 
@@ -152,9 +195,11 @@ mod tests {
 
     #[test]
     fn test_multi_return_func() {
+        let mut b = builder();
+        b.set("preserve_frame_pointers", "true").unwrap();
         let isa = lookup(triple!("x86_64"))
             .expect("expect x86 ISA")
-            .finish(Flags::new(builder()))
+            .finish(Flags::new(b))
             .expect("expect backend creation to succeed");
 
         let mut context = Context::for_function(create_multi_return_function(CallConv::SystemV));

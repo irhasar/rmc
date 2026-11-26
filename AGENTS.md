@@ -1,22 +1,137 @@
+## Session (2026-11-26, branch `rakit-exp15`) — review round: frameless CFI, sampler hardening
+
+A review of the frame-pointer work found a real regression: **frameless
+functions emitted frame-pointer-relative unwind info**, so every backtrace
+through them was wrong.
+
+- **Bug.** `gen_clobber_save` always emitted `UnwindInst::DefineNewFrame`, and
+  the System V encoder switched the CFA rule to RBP on it (`mr.fp()` is
+  `Some(RBP)` unconditionally for x64). Without a `push %rbp` that register
+  still holds the *caller's* frame pointer, so `readelf --debug-dump=frames-interp`
+  showed `CFA = rbp+8` for every function and the unwinder walked into the
+  caller's frame. Reproduced end-to-end with a `_Unwind_Backtrace` helper: the
+  old build stopped after one frame with a stack address as the next "return
+  address"; the fixed build walks `level3 -> level2 -> level1 -> main -> std ->
+  libc`.
+- **Fix (SP-relative CFI; the encoder already had the branch for it).**
+  1. `isa/unwind/systemv.rs`: the CFA rule only moves to the frame pointer when
+     the instruction stream actually contains `PushFrameRegs`
+     (`let fp = if has_frame_regs { mr.fp() } else { None }`). With `fp = None`,
+     `DefineNewFrame` emits no `CfaRegister` and `StackAlloc` adjusts
+     `cfa_offset` instead of ignoring the allocation.
+  2. `isa/x64/abi.rs`: `gen_clobber_save` emits `UnwindInst::StackAlloc` after
+     the `subq rsp, N` when the frame has no frame pointer.
+  3. The epilogue still emits no rule, exactly like the frame-pointer path: the
+     FDE describes the body of the function, not its teardown (pre-existing
+     simplification, unchanged).
+- **Verified.** `readelf --debug-dump=frames-interp` now shows `rsp+8` at entry
+  then `rsp+16`/`rsp+32`/`rsp+48` after each `sub`; `_Unwind_Backtrace` resolves
+  every frame; `-Cforce-frame-pointers=yes` output is unchanged.
+- **Tests.** The two vendored x64 unwind tests were **already failing** before
+  this round (they encode the FP-relative form while `preserve_frame_pointers`
+  defaults to false); they now request a frame pointer explicitly. New
+  `test_frameless_func_uses_sp_relative_cfa` pins `CfaOffset(80)` (64 B slot +
+  the 8 B alignment padding) and asserts no `CfaRegister`. `cargo test` in
+  `vendor/rakit-codegen` -> 204 passed / 0 failed. Note `./y.sh test` does not
+  run the vendored crate's tests; run them directly.
+- **Not separately exercised:** callee-save rules (`SaveReg`) in the frameless
+  path. The formula is unchanged (`clobber_offset - clobber_offset_to_cfa`, and
+  `DefineNewFrame` still sets `clobber_offset_to_cfa`), but the sampled programs
+  save no callee registers in a frameless frame (`readelf` shows `rbx = u`), so
+  a future change there needs its own test.
+- **Profiling tools hardened** (same review):
+  - `sampler.c` no longer defaults to `/tmp/sampler.out` (`fopen("w")` on a
+    predictable path = CWE-377). The default is now a `mkstemp` file in
+    `$TMPDIR`/`/tmp` with mode 0600, and an explicit `SAMPLER_OUT` is opened
+    with `O_NOFOLLOW|O_CLOEXEC`, so a planted symlink fails with ELOOP instead
+    of redirecting the write. Both paths verified.
+  - The destructor also writes `MAP <start> <end> <path>` lines for the
+    executable mappings, and `sym.py` attributes samples that land in a shared
+    library to `[libc.so.6]`/`[libm.so.6]` instead of counting them as "outside
+    any symbol". First useful result: `p4_simd` is 18% libm, not executable code.
+- **Full matrix** (`bench/allaxes.sh` CREPS=3 RREPS=7, 45/45 rows `ok`, every
+  output validated against LLVM; columns are compile wall/CPU/peak-RSS/size and
+  run wall/CPU/peak-RSS):
+
+| prog | bk | Cwall | Ccpu | Crss | size | Rwall | Rcpu | Rrss |
+|---|---|---|---|---|---|---|---|---|
+| h_arith | L | 122 | 152 | 117.1 | 4617128 | 2 | 2 | 10.9 |
+| h_arith | U | 95 | 125 | 118.4 | 5839120 | 3 | 2 | 10.9 |
+| h_arith | M | 112 | 141 | 119.5 | 4088464 | 2 | 2 | 11.0 |
+| h_branch | L | 122 | 147 | 117.1 | 4616832 | 2 | 2 | 10.9 |
+| h_branch | U | 94 | 125 | 118.3 | 5837264 | 3 | 2 | 11.0 |
+| h_branch | M | 107 | 136 | 119.5 | 4086800 | 2 | 2 | 10.9 |
+| h_calls | L | 122 | 151 | 117.8 | 4616872 | 2 | 2 | 11.0 |
+| h_calls | U | 94 | 123 | 118.6 | 5837792 | 3 | 2 | 11.1 |
+| h_calls | M | 107 | 139 | 119.9 | 4087176 | 2 | 2 | 10.9 |
+| h_float | L | 134 | 158 | 116.2 | 4637984 | 3 | 2 | 11.0 |
+| h_float | U | 94 | 124 | 117.8 | 5861024 | 3 | 3 | 11.0 |
+| h_float | M | 108 | 137 | 119.3 | 4127352 | 3 | 2 | 11.0 |
+| h_mem | L | 283 | 458 | 137.2 | 4646856 | 3 | 3 | 10.9 |
+| h_mem | U | 146 | 206 | 133.9 | 5959856 | 10 | 10 | 11.0 |
+| h_mem | M | 181 | 254 | 136.6 | 4174864 | 4 | 4 | 11.0 |
+| h_simd | L | 148 | 174 | 122.9 | 4617704 | 2 | 2 | 11.0 |
+| h_simd | U | 103 | 135 | 123.7 | 5843736 | 4 | 4 | 11.1 |
+| h_simd | M | 117 | 147 | 125.3 | 4090856 | 3 | 2 | 10.9 |
+| p1_arith | L | 89 | 109 | 105.0 | 4635232 | 81 | 81 | 10.9 |
+| p1_arith | U | 83 | 106 | 107.0 | 5877944 | 109 | 108 | 10.9 |
+| p1_arith | M | 90 | 115 | 108.5 | 4156256 | 103 | 102 | 11.0 |
+| p2_mem | L | 257 | 391 | 133.1 | 4639896 | 17 | 17 | 10.9 |
+| p2_mem | U | 136 | 182 | 130.3 | 5936144 | 157 | 157 | 11.0 |
+| p2_mem | M | 179 | 252 | 132.4 | 4152592 | 43 | 43 | 10.9 |
+| p3_calls | L | 104 | 128 | 114.9 | 4612368 | 38 | 37 | 10.9 |
+| p3_calls | U | 90 | 119 | 115.8 | 5820136 | 116 | 116 | 11.0 |
+| p3_calls | M | 100 | 129 | 117.3 | 4076952 | 56 | 56 | 11.0 |
+| p4_simd | L | 113 | 134 | 115.8 | 4636096 | 57 | 57 | 48.2 |
+| p4_simd | U | 98 | 121 | 116.2 | 5892376 | 158 | 160 | 49.5 |
+| p4_simd | M | 110 | 137 | 118.0 | 4162784 | 85 | 84 | 48.8 |
+| p5_inline | L | 84 | 105 | 104.1 | 4609368 | 58 | 57 | 10.9 |
+| p5_inline | U | 80 | 104 | 106.1 | 5813704 | 896 | 895 | 11.0 |
+| p5_inline | M | 87 | 113 | 107.1 | 4069928 | 7 | 6 | 10.9 |
+| p6_scalar | L | 86 | 105 | 100.6 | 4609368 | 58 | 58 | 11.0 |
+| p6_scalar | U | 79 | 101 | 102.1 | 5813688 | 907 | 906 | 10.9 |
+| p6_scalar | M | 87 | 111 | 103.5 | 4069928 | 7 | 6 | 10.9 |
+| p7_branchy | L | 88 | 109 | 104.6 | 4609520 | 43 | 43 | 11.0 |
+| p7_branchy | U | 82 | 104 | 106.0 | 5813800 | 101 | 101 | 11.0 |
+| p7_branchy | M | 88 | 112 | 107.2 | 4070088 | 36 | 35 | 11.0 |
+| p8_minmax | L | 86 | 107 | 104.6 | 4609544 | 18 | 18 | 11.0 |
+| p8_minmax | U | 81 | 105 | 105.8 | 5813752 | 39 | 38 | 11.0 |
+| p8_minmax | M | 89 | 113 | 107.1 | 4070088 | 21 | 20 | 10.9 |
+| p9_u64f32 | L | 97 | 116 | 109.9 | 4635448 | 31 | 30 | 17.8 |
+| p9_u64f32 | U | 89 | 113 | 111.8 | 5886872 | 77 | 77 | 18.9 |
+| p9_u64f32 | M | 100 | 129 | 113.6 | 4159824 | 34 | 34 | 18.2 |
+
+  Reading: Rakit compiles faster than LLVM everywhere except `p2_mem`/`h_mem`
+  (250 -> 179 ms) and is ~10-12% smaller; runtime wins are `p5`/`p6` (8x), `p7`,
+  `h_arith`/`h_branch`/`h_calls`/`h_simd`/`h_float` (ties or better) and the
+  remaining losses are `p1` (1.24x), `p2` (2.5x), `p3` (1.5x), `p4` (1.5x),
+  `p8` (1.17x), `p9` (1.1x), all explained in the sessions below.
+
 ## Session (2026-11-24, branch `rakit-exp15`) — the backend LICM never hoists a load (negative result)
 
 Tried to close p4/p9's remaining gap by hoisting the `Vec` header reloads
 (`ptr`, `len`) out of loops that also call out. Three findings, no win, all
 reverted.
 
-- **The load path in `vendor/rakit-codegen/src/licm.rs` is unreachable.**
-  `hoist_from_loop` does `if op.can_trap() { continue; }` *before* the
-  `if op.can_load()` branch, and `Opcode::Load::can_trap()` is true (the opcode
-  is trapping; only the flags say otherwise). So no load has ever been hoisted
-  by this pass -- only `is_pure_for_egraph` instructions (measured: every hoist
-  in `p4_simd` is `[Iconst]`). Fixing the gate alone is not enough: the load
-  then fails the *availability* check, because its address operand is not
-  available at the preheader either.
-- **A loop-local escape analysis is the right safety argument** (a call cannot
-  write a stack slot whose address never escapes *inside the loop*, so
-  `any_opaque_store` must not block it). Seeding it from the load/store bases
-  (not from `StackAddr` instructions) is required -- rakit computes the
-  `stack_addr` of a `Vec` header once, outside the loop. With that, slots 0/1
+- **`Opcode::Load` is *not* trapping, so the trap gate is not the blocker.**
+  The metadata (`vendor/rakit-codegen-meta/src/shared/instructions.rs`, the
+  `load` entry) sets `can_load` only; `can_trap` is false. `hoist_from_loop`
+  therefore does reach its `op.can_load()` branch, and the load is rejected by
+  the two checks *after* it: the memflags test
+  (`readonly && notrap && can_move`) and the operand-availability test.
+  Measured with `RAKIT_LICM_DEBUG=1`: every hoist in `p4_simd` is `[Iconst]`,
+  and the loads that were instrumented reach `LOADCHECK` and then bail out on
+  availability -- their address operand is not available at the preheader.
+- **A loop-local escape analysis is NOT sufficient** and must not be used as
+  the safety argument: a call *before* the loop can retain the stack address
+  (a callee may stash it in a global), and a call *inside* the loop can then
+  write through it, so a hoisted load would miss the write. Any
+  `any_opaque_store` exemption needs a function-wide no-escape proof for the
+  slot (address never passed to a call, never stored anywhere but its own
+  loads/stores, never a branch argument), not a loop-local one. What *is*
+  established: seeding the analysis from the load/store bases (not from
+  `StackAddr` instructions) is required, because rakit computes the
+  `stack_addr` of a `Vec` header once, outside the loop; with that, slots 0/1
   of `p4_simd`'s sin/cos loop do become "unescaped" (`local=true`), but the
   loads still fail on availability.
 - **Measured**: interleaved A/B, 11 reps, min: `p1_arith` +0.3%, `p2_mem` -0.2%,
@@ -48,7 +163,11 @@ The distance comes from `ExtFuncData.colocated` (`machinst/isle.rs`), so setting
 `target.options.os == rustc_target::spec::Os::Linux`: Mach-O and COFF resolve
 imports through the GOT / `__imp_`, so the indirect form has to stay there.
 
-Measured (min/median of 15 interleaved reps, all four programs byte-identical):
+Measured as a same-backend A/B (min/median of 15 interleaved reps, both
+binaries from this tree, all four programs output-identical). That is the right
+method for a codegen change: the cross-backend matrix, which is what the repo
+rules require for a *result*, is the `allaxes.sh` table in the 2026-11-26
+session:
 
 | change | p3_calls | p4_simd |
 |---|---|---|
@@ -2730,9 +2849,12 @@ cpu ms / peak RSS MB. All stdout matched LLVM.
 
 - **New harness:** `bench/passtime.sh` compiles each program with
   `RAKIT_PASS_TIME=1`, sums the per-CGU pass lines of the *fastest* of `REPS`
-  compiles, and prints the pass total next to the compile wall time. The passes
-  are the whole difference between Rakit and upstream cg_clif, so every
-  compile-time claim needs this number.
+  compiles, and prints the pass total next to the compile wall time. Read it as
+  a *lower bound* on what the pass layer costs, not as the Rakit-vs-upstream
+  gap: the passes rewrite the function, so everything downstream (egraph, ISel,
+  regalloc, emission) runs on different input, and the timer cannot see that
+  difference. The authoritative upstream comparison is the `allaxes.sh` compile
+  columns (wall/CPU/RSS), which is why every compile claim quotes those.
 - **Measured (REPS=1, one build):** `p2_mem` 161 ms wall / 31.6 ms passes (20%),
   `h_mem` 170 / 35.3 (21%), `p1_arith` 81 / 0.5 (1%). The compile gap vs
   upstream is concentrated in `store_forward` on allocation-heavy code and is

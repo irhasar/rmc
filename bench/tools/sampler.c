@@ -8,19 +8,22 @@
 // A signal-based sampler only sees running user code, which is exactly what a
 // tight benchmark loop needs: libc time shows up as the libc frame.
 #define _GNU_SOURCE
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <ucontext.h>
+#include <errno.h>
 #include <unistd.h>
 
 #define MAX_SAMPLES (1 << 22)
 
 static unsigned long long *samples;
 static volatile unsigned long n_samples;
-static const char *out_path;
+static int out_fd = -1;
 static unsigned long long load_base;
 
 // The target is a PIE, so the sampled instruction pointers are runtime
@@ -72,9 +75,34 @@ __attribute__((constructor)) static void sampler_init(void) {
     if (!samples) {
         return;
     }
-    out_path = getenv("SAMPLER_OUT");
-    if (!out_path) {
-        out_path = "/tmp/sampler.out";
+    const char *env = getenv("SAMPLER_OUT");
+    if (env) {
+        // An explicit path is the caller's choice, but never follow a symlink
+        // (a planted link would redirect the write to a file the caller owns)
+        // and keep the result private.
+        int flags = O_WRONLY | O_CREAT | O_CLOEXEC | O_NOFOLLOW;
+        flags |= getenv("SAMPLER_APPEND") ? O_APPEND : O_TRUNC;
+        out_fd = open(env, flags, 0600);
+        if (out_fd < 0) {
+            fprintf(stderr, "sampler: cannot open %s: %s\n", env, strerror(errno));
+        }
+    } else {
+        // Default: create a fresh private file with O_EXCL, so neither an
+        // existing file nor a symlink in the temp directory can be reused
+        // (CWE-377).
+        const char *dir = getenv("TMPDIR");
+        if (!dir || !*dir) {
+            dir = "/tmp";
+        }
+        char path[4096];
+        snprintf(path, sizeof(path), "%s/sampler.XXXXXX", dir);
+        out_fd = mkstemp(path);
+        if (out_fd >= 0) {
+            fchmod(out_fd, 0600);
+            fprintf(stderr, "sampler: writing %s\n", path);
+        } else {
+            fprintf(stderr, "sampler: cannot create a profile file in %s\n", dir);
+        }
     }
     load_base = executable_base();
     struct sigaction sa;
@@ -89,16 +117,43 @@ __attribute__((constructor)) static void sampler_init(void) {
     setitimer(ITIMER_PROF, &it, NULL);
 }
 
+// Record the executable mappings so sym.py can tell executable samples from
+// library ones instead of counting the latter as "outside any symbol".
+static void dump_maps(FILE *f) {
+    FILE *m = fopen("/proc/self/maps", "r");
+    if (!m) {
+        return;
+    }
+    char line[4096];
+    while (fgets(line, sizeof(line), m)) {
+        unsigned long long start, end;
+        char perms[8], path[4096];
+        path[0] = 0;
+        if (sscanf(line, "%llx-%llx %7s %*s %*s %*s %4095s", &start, &end, perms, path) < 3) {
+            continue;
+        }
+        if (path[0] != '/' || !strchr(perms, 'x')) {
+            continue;
+        }
+        fprintf(f, "MAP %llx %llx %s\n", start, end, path);
+    }
+    fclose(m);
+}
+
 __attribute__((destructor)) static void sampler_fini(void) {
     struct itimerval it;
     memset(&it, 0, sizeof(it));
     setitimer(ITIMER_PROF, &it, NULL);
-    int append = getenv("SAMPLER_APPEND") != NULL;
-    FILE *f = fopen(out_path, append ? "a" : "w");
+    if (out_fd < 0) {
+        return;
+    }
+    FILE *f = fdopen(out_fd, "w");
     if (!f) {
+        close(out_fd);
         return;
     }
     fprintf(f, "BASE %llx\n", load_base);
+    dump_maps(f);
     unsigned long n = n_samples < MAX_SAMPLES ? n_samples : MAX_SAMPLES;
     for (unsigned long i = 0; i < n; i++) {
         fprintf(f, "%llx\n", samples[i]);

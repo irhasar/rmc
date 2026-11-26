@@ -7,6 +7,7 @@
 
     usage: sym.py <samples> <binary> [top]
 """
+import os
 import subprocess
 import sys
 import bisect
@@ -42,6 +43,8 @@ def main():
     total = 0
     unknown = 0
     base = 0
+    maps = []
+    exe_name = os.path.basename(binary)
     for line in open(samples):
         line = line.strip()
         if not line:
@@ -49,8 +52,21 @@ def main():
         if line.startswith("BASE "):
             base = int(line.split()[1], 16)
             continue
-        ip = int(line, 16) - base
+        if line.startswith("MAP "):
+            _, start, end, path = line.split(" ", 3)
+            maps.append((int(start, 16), int(end, 16), path))
+            continue
+        ip = int(line, 16)
         total += 1
+        # `nm` can only name the executable's own symbols. A sample that landed
+        # in a shared library (libc's memcpy, the libm calls, ...) is still real
+        # work, so attribute it to that library instead of dropping it into the
+        # "outside any symbol" bucket.
+        owner = next((p for (lo, hi, p) in maps if lo <= ip < hi), None)
+        if owner is not None and os.path.basename(owner) != exe_name:
+            counts[f"[{os.path.basename(owner)}]"] += 1
+            continue
+        ip -= base
         i = bisect.bisect_right(starts, ip) - 1
         if i < 0:
             unknown += 1
