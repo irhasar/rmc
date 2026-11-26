@@ -35,6 +35,34 @@ blocks), i.e. exactly the shape the multi-block unroller would need; and the
 `main` of `p4_simd` calls `sinf`/`cosf` through `call *%rax` (GOT-indirect),
 not a direct `call rel32` like LLVM's `call sinf@PLT`.
 
+### Direct `call rel32` to imports (also a wash, reverted)
+
+Follow-up on the GOT-indirect call: it *is* fixable and it works.
+`vendor/rakit-codegen/src/isa/x64/lower.isle` picks `call_known` only for
+`RelocDistance::Near`; everything else gets `load_ext_name` + `call_unknown`.
+The distance comes from `ExtFuncData.colocated` (`machinst/isle.rs`), so setting
+`colocated = true` on the ext-func of an import makes the call direct. Verified:
+`call sincosf@plt` and direct `__rust_dealloc` in `p4_simd` (set the flag in
+`src/abi/mod.rs` after `declare_func_in_func`, and in
+`rakit-opt/src/passes/sincos.rs` for the fused libcall). Gate it on
+`target.options.os == rustc_target::spec::Os::Linux`: Mach-O and COFF resolve
+imports through the GOT / `__imp_`, so the indirect form has to stay there.
+
+Measured (min/median of 15 interleaved reps, all four programs byte-identical):
+
+| change | p3_calls | p4_simd |
+|---|---|---|
+| all imports direct | 47.1/47.7 -> 48.3/49.0 (+2.5%) | 83.2/84.4 -> 82.1/83.3 (-1.3%) |
+| `sincos` libcall only | 46.9/47.5 -> 47.1/47.3 | 84.0/85.5 -> 83.8/85.0 |
+
+So the extra GOT load per call costs nothing measurable (the OoO engine hides
+it) and the all-imports variant costs ~2.5% on `p3_calls`. Reverted both.
+Remaining indirect calls in `p4_simd`'s `main` are the cold panic paths
+(`panic_fmt`/`panic_bounds_check` through one GOT slot), not libm.
+
+Note: `target.is_like_osx` does not exist in this rustc; `Target::options.os` is
+an `Os` enum, and `is_like_windows` does exist on `Target`.
+
 ## Session (2026-11-24, branch `rakit-exp15`) — x64 drops the frame pointer; `lea` for `x - c`
 
 - **Frame pointer omitted on x64** (`vendor/rakit-codegen/src/isa/x64/abi.rs`).
