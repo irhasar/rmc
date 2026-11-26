@@ -1101,6 +1101,21 @@ else
     echo "[regression] t_vectorize_unit NO_LICM=1: objdump unavailable, skipping SIMD assertion" >&2
 fi
 
+# Unit tests for the decisions the end-to-end fixtures cannot observe. The
+# huge-index fixture keeps its huge branches untaken, so its output alone does not
+# show whether store forwarding rejected the folded range: with overflow checks
+# off, a wrapped end passes for an in-bounds access and the program still prints
+# the same line. These tests assert the key itself.
+if command -v cargo >/dev/null 2>&1; then
+    if ! ( cd "$ROOT/rakit" && cargo test -q -p rakit-opt >"$TMP/sf_unit.log" 2>&1 ); then
+        echo "[regression] rakit-opt unit tests failed" >&2
+        tail -20 "$TMP/sf_unit.log" >&2
+        fail=1
+    fi
+else
+    echo "[regression] cargo unavailable, skipping rakit-opt unit tests" >&2
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "[regression] all fixtures passed"
 fi

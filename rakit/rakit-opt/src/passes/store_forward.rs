@@ -1175,3 +1175,77 @@ fn drop_dead_stores(
         func.layout.remove_inst(inst);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A function holding one 16-byte stack slot and a single load from
+    /// `stack_addr(slot) + displacement`, plus the load's address value.
+    fn load_at(displacement: i64, load_ty: types::Type) -> (ir::Function, StackSlot, Inst, Value) {
+        let mut func = ir::Function::new();
+        let slot = func.create_sized_stack_slot(ir::StackSlotData::new(
+            ir::StackSlotKind::ExplicitSlot,
+            16,
+            0,
+        ));
+        let block = func.dfg.make_block();
+        func.layout.append_block(block);
+        let (load, addr) = {
+            let mut pos = FuncCursor::new(&mut func).at_bottom(block);
+            let base = pos.ins().stack_addr(types::I64, slot, 0);
+            let offset = pos.ins().iconst(types::I64, displacement);
+            let addr = pos.ins().iadd(base, offset);
+            (pos.ins().load(load_ty, MemFlagsData::trusted(), addr, 0), addr)
+        };
+        let ir::ValueDef::Result(inst, 0) = func.dfg.value_def(load) else {
+            panic!("a load result is defined by its own instruction")
+        };
+        (func, slot, inst, addr)
+    }
+
+    fn private(slots: &[StackSlot]) -> FxHashSet<StackSlot> {
+        slots.iter().copied().collect()
+    }
+
+    fn key(func: &ir::Function, inst: Inst, addr: Value, private: &FxHashSet<StackSlot>) -> Key {
+        mem_key(func, inst, addr, private).expect("a load always has a key")
+    }
+
+    #[test]
+    fn folds_a_constant_displacement_that_stays_inside_the_slot() {
+        let (func, slot, inst, addr) = load_at(8, types::I64);
+        assert_eq!(key(&func, inst, addr, &private(&[slot])), (Base::Slot(slot), 8));
+    }
+
+    /// The end of the range has to be representable and inside the slot. A
+    /// folded displacement of `i64::MAX` has no end at all, and the old
+    /// unchecked arithmetic wrapped it negative, which passed the upper-bound
+    /// test and keyed the access against bytes it never touches.
+    #[test]
+    fn keeps_the_pointer_key_when_the_range_does_not_fit() {
+        for (displacement, ty) in [
+            (i64::MAX, types::I8),
+            (i64::MAX - 7, types::I64),
+            (i64::MIN, types::I8),
+            (-8, types::I8),
+            (12, types::I64),
+            (16, types::I8),
+        ] {
+            let (func, slot, inst, addr) = load_at(displacement, ty);
+            let key = key(&func, inst, addr, &private(&[slot]));
+            assert!(
+                matches!(key.0, Base::Ptr(_)),
+                "displacement {displacement} of {} bytes folded to {key:?}",
+                ty.bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_the_pointer_key_for_a_slot_the_pass_does_not_track() {
+        let (func, _slot, inst, addr) = load_at(8, types::I64);
+        let key = key(&func, inst, addr, &FxHashSet::default());
+        assert!(matches!(key.0, Base::Ptr(_)), "escaped slot folded to {key:?}");
+    }
+}

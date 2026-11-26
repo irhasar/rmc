@@ -31,6 +31,17 @@
      arithmetic the same compiler build compiles it and prints `0 0 1`. Without
      overflow checks the old expression wrapped, the end came out negative, and
      the access was keyed against `Slot + i64::MAX`.
+  4. **The fixture alone does not gate the wrap.** Both huge branches stay
+     untaken, so the printed line is the same whether the range was rejected or
+     keyed at `i64::MAX`; with overflow checks off the wrap is silent. `mem_key`
+     now has unit tests (`cargo test -p rakit-opt`, wired into
+     `regressions.sh`) that assert the key itself: a displacement that stays
+     inside the slot folds to `Slot(slot), offset`, and `i64::MAX`,
+     `i64::MAX - 7`, `i64::MIN`, `-8`, `12` with an 8-byte load and `16` with a
+     byte load all keep their pointer key. Checked by A/B: with the unchecked
+     expression and `RUSTFLAGS=-C overflow-checks=off` the test fails with
+     `displacement 9223372036854775807 of 1 bytes folded to (Slot(ss0),
+     9223372036854775807)`; with the fix it passes in both profiles.
   2. Folding to a slot key the pass does not track lost same-block forwarding
      once any other address to that slot escaped. `mem_key` now takes the private
      set and keeps the pointer key for a non-private slot.
