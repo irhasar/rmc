@@ -1219,19 +1219,23 @@ mod tests {
         mem_key(func, inst, addr, private).expect("a load always has a key")
     }
 
-    /// Runs `mem_key` on one access and reports whether it folded to a slot.
+    /// Runs `mem_key` on one access and reports the key it folded to, if any.
     fn folded(displacement: i64, load_offset: i32, load_ty: types::Type) -> Option<Key> {
         let (func, slot, inst, addr) = load_at(displacement, load_offset, load_ty);
         let key = key(&func, inst, addr, &private(&[slot]));
         matches!(key.0, Base::Slot(_)).then_some(key)
     }
 
+    /// The access must keep its pointer key, and that key must still carry the
+    /// load's own offset: `forward_block` looks facts up by the full key, so a
+    /// fallback that dropped the offset would forward the wrong stored value.
     fn assert_kept(displacement: i64, load_offset: i32, load_ty: types::Type) {
         let (func, slot, inst, addr) = load_at(displacement, load_offset, load_ty);
         let key = key(&func, inst, addr, &private(&[slot]));
-        assert!(
-            matches!(key.0, Base::Ptr(_)),
-            "displacement {displacement} + offset {load_offset} of {} bytes folded to {key:?}",
+        assert_eq!(
+            key,
+            (Base::Ptr(func.dfg.resolve_aliases(addr)), i64::from(load_offset)),
+            "displacement {displacement} + offset {load_offset} of {} bytes",
             load_ty.bytes()
         );
     }
@@ -1281,8 +1285,102 @@ mod tests {
 
     #[test]
     fn keeps_the_pointer_key_for_a_slot_the_pass_does_not_track() {
-        let (func, _slot, inst, addr) = load_at(8, 0, types::I64);
-        let key = key(&func, inst, addr, &FxHashSet::default());
-        assert!(matches!(key.0, Base::Ptr(_)), "escaped slot folded to {key:?}");
+        let (func, _slot, inst, addr) = load_at(8, 4, types::I64);
+        assert_eq!(
+            key(&func, inst, addr, &FxHashSet::default()),
+            (Base::Ptr(func.dfg.resolve_aliases(addr)), 4)
+        );
+    }
+
+    /// A function with a pointer block parameter, one unrelated stack slot (the
+    /// pass bails on a function without one), stores at the given offsets and a
+    /// load at `load_offset`. Returns the function and the stored values.
+    fn pointer_access(
+        stores: &[i32],
+        load_offset: i32,
+    ) -> (ir::Function, Vec<Value>) {
+        let mut func = ir::Function::new();
+        func.create_sized_stack_slot(ir::StackSlotData::new(
+            ir::StackSlotKind::ExplicitSlot,
+            8,
+            0,
+        ));
+        let block = func.dfg.make_block();
+        func.layout.append_block(block);
+        let mut stored = Vec::new();
+        let mut pos = FuncCursor::new(&mut func).at_bottom(block);
+        let ptr = pos.func.dfg.append_block_param(block, types::I64);
+        for (i, &offset) in stores.iter().enumerate() {
+            let value = pos.ins().iconst(types::I64, 11 * (i as i64 + 1));
+            pos.ins().store(MemFlagsData::trusted(), value, ptr, offset);
+            stored.push(value);
+        }
+        let load = pos.ins().load(types::I64, MemFlagsData::trusted(), ptr, load_offset);
+        pos.ins().return_(&[load]);
+        (func, stored)
+    }
+
+    fn run_pass(func: &mut ir::Function) {
+        let mut analyses = crate::Analyses::default();
+        super::run(func, ir::Endianness::Little, &mut analyses);
+    }
+
+    fn load_insts(func: &ir::Function) -> Vec<Inst> {
+        func.layout
+            .blocks()
+            .flat_map(|block| func.layout.block_insts(block))
+            .filter(|&inst| func.dfg.insts[inst].opcode() == Opcode::Load)
+            .collect()
+    }
+
+    #[test]
+    fn forwards_a_pointer_access_at_a_nonzero_offset() {
+        let (mut func, _stored) = pointer_access(&[8], 8);
+        run_pass(&mut func);
+        assert!(load_insts(&func).is_empty(), "a load at the stored offset must be forwarded");
+    }
+
+    #[test]
+    fn does_not_forward_across_pointer_offsets() {
+        let (mut func, _stored) = pointer_access(&[0], 8);
+        run_pass(&mut func);
+        assert_eq!(
+            load_insts(&func).len(),
+            1,
+            "a load at offset 8 must not read the value stored at offset 0"
+        );
+    }
+
+    /// Two stores at different offsets, two loads at those offsets: each load has
+    /// to forward the value stored at its own offset, which only happens if the
+    /// key carries the offset.
+    #[test]
+    fn forwards_each_offset_from_its_own_store() {
+        let (mut func, stored) = pointer_access(&[0, 8], 0);
+        // Rebuild with one load per offset and add them.
+        let mut func = func;
+        let block = func.layout.blocks().next().unwrap();
+        let ptr = func.dfg.block_params(block)[0];
+        {
+            let mut pos = FuncCursor::new(&mut func).at_bottom(block);
+            let second = pos.ins().load(types::I64, MemFlagsData::trusted(), ptr, 8);
+            let sum = pos.ins().iadd(second, second);
+            pos.ins().return_(&[sum]);
+        }
+        run_pass(&mut func);
+        assert!(load_insts(&func).is_empty(), "both loads must be forwarded");
+
+        // The two loads returned the values stored at their own offsets.
+        let returned = func.layout.block_insts(block).last().unwrap();
+        assert_eq!(func.dfg.insts[returned].opcode(), Opcode::Return);
+        let sum = func.dfg.insts[returned].arguments(&func.dfg.value_lists)[0];
+        let sum = func.dfg.resolve_aliases(sum);
+        let ir::ValueDef::Result(sum_inst, 0) = func.dfg.value_def(sum) else {
+            panic!("the sum is an instruction result")
+        };
+        assert_eq!(func.dfg.insts[sum_inst].opcode(), Opcode::Iadd);
+        let args = func.dfg.insts[sum_inst].arguments(&func.dfg.value_lists).to_vec();
+        assert_eq!(func.dfg.resolve_aliases(args[0]), stored[1]);
+        assert_eq!(func.dfg.resolve_aliases(args[1]), stored[1]);
     }
 }

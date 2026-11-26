@@ -53,6 +53,17 @@
      (Slot(ss0), -9223372036854775801)`. One positive case also changed meaning:
      the fix checks the *effective* start, so `-4` with offset 8 now folds to
      `Slot(4)` where the old code rejected any negative displacement.
+  6. **The fallback key must keep the offset.** `assert_kept` only checked
+     `Base::Ptr(_)`, so a fallback returning `(Ptr, 0)` would have passed while
+     `forward_block` looks facts up by the full key: a load at `p + 8` would then
+     read the value stored at `p`. It now asserts the whole
+     `(Ptr(addr), load_offset)`, and three whole-pass tests drive
+     `store_forward::run` on a pointer block parameter: a load at the stored
+     offset is forwarded, a load at a different offset is not, and two stores at
+     0/8 with two loads forward each load its own value. Simulated the defect
+     (`(Ptr, 0)`) and the cross-offset test fails with
+     `a load at offset 8 must not read the value stored at offset 0: left 0,
+     right 1`, i.e. the load disappeared because it was forwarded.
   2. Folding to a slot key the pass does not track lost same-block forwarding
      once any other address to that slot escaped. `mem_key` now takes the private
      set and keeps the pointer key for a non-private slot.
