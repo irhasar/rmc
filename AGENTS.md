@@ -45,8 +45,11 @@
 - **Profiling tooling** (`bench/tools/`): `sampler.c` (`LD_PRELOAD` +
   `ITIMER_PROF`, writes `<count> <addr>`, subtracts the PIE base) and `sym.py`
   (histogram via `nm -S`). `perf` is not installed in this image. First results:
-  `p3_calls` 71.5% in `fib`, `p4_simd` 74.2% in `main`. The old note that p3's
-  gap is the `format!` machinery is wrong — it is the recursion itself.
+  `p3_calls` 66% in `fib`, `p4_simd` 68.7% in `main`, `p2_mem` 32.5% partition
+  + 27.5% hashbrown. With the frame pointer gone, `p3_calls` splits 32 ms of
+  recursion (1.04x of LLVM) and 16 ms of `format!` machinery (1.60x of LLVM),
+  so the historical note that p3 is really a `format!` benchmark is right after
+  all: the recursion was the fixable half.
 
 ## Session (2026-11-24, branch `rakit-exp12`) — store-forward address memoisation; write-once rule rejected
 
