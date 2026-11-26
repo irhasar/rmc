@@ -64,6 +64,17 @@
      (`(Ptr, 0)`) and the cross-offset test fails with
      `a load at offset 8 must not read the value stored at offset 0: left 0,
      right 1`, i.e. the load disappeared because it was forwarded.
+  7. **Two of those tests were masked.** The privacy case used displacement 8 +
+     offset 4 = start 12 with an 8-byte load, which the bounds check rejects on
+     its own, so it passed without the privacy guard; it now uses start 4 with a
+     private counterpart assertion (removing the guard fails it with
+     `left: (Slot(ss0), 4), right: (Ptr(v2), 4)`). And
+     `forwards_each_offset_from_its_own_store` appended `iadd(second, second)`
+     after `pointer_access` had already returned, so the offset-0 load was never
+     observed; `pointer_access` now takes the load offsets and sums every load,
+     and the assertions are per operand. Dropping the offset in the fallback now
+     fails it with `the load at offset 0 must forward the value stored at offset
+     0: left v2, right v1`.
   2. Folding to a slot key the pass does not track lost same-block forwarding
      once any other address to that slot escaped. `mem_key` now takes the private
      set and keeps the pointer key for a non-private slot.
