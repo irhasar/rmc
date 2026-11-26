@@ -52,20 +52,27 @@ through them was wrong.
   non-vacuity check (mid really does clobber callee-saves).
   A swap of two registers' save slots is invisible to a value-by-value check, so
   `vendor/rakit-codegen/src/isa/x64/inst/unwind/systemv.rs` also has
-  `test_frameless_save_reg_offsets`, which *runs the prologue generator*:
-  `gen_clobber_save` is called with a layout shaped like a real frameless
-  function (`sub $0x68`, clobber area 32, rbx/r12/r13 at 0/8/16), and for each
-  clobbered register it checks the emitted `movq %reg, off(%rsp)` (matched as
-  `Inst::External { inst: asm::Inst::movq_mr(..) }`, reading `rm64`'s
-  `Amode::ImmReg` and `r64`) against the `SaveReg` annotation: same register,
-  slot `0/8/16` in layout order, store displacement `fixed + outgoing + slot`.
-  The annotations are then fed to `create_unwind_info_from_insts`; the asserted
-  FDE is `[(4, CfaOffset(112)), (8, Offset(Register(3), -40)), (12,
-  Offset(Register(12), -32)), (16, Offset(Register(13), -24))]`. Verified
-  sensitive: reversing the clobber loop fails it (`left: p13i, right: p3i`),
-  moving only the store by 8 bytes fails it (`store and annotation disagree for
-  slot 0`, `left: (3, 80) right: (3, 72)`), and restoring RBP-based CFA fails it
-  with `CfaRegister(Register(5))`.
+  `test_frameless_save_reg_offsets`, which *runs the prologue generator and the
+  emitter*: `gen_clobber_save` is called with a layout shaped like a real
+  frameless function (`sub $0x68`, clobber area 32, rbx/r12/r13 at 0/8/16), its
+  instructions are emitted into a real `MachBuffer` (stores go through
+  `Inst::emit`, `Unwind` pseudo-ops through `buffer.add_unwind`), and the rules
+  are read back from the finalized buffer. For each clobber it checks the store
+  (`Inst::External { inst: asm::Inst::movq_mr(..) }`, reading `rm64`'s
+  `Amode::ImmReg` and `r64`) against its `SaveReg` annotation: same register,
+  slot `0/8/16` in layout order, displacement `fixed + outgoing + slot`, and the
+  rule recorded at the offset its own store ends at. The rules then go through
+  `create_unwind_info_from_insts`; the asserted FDE is `[(4,
+  CfaOffset(112)), (9, Offset(Register(3), -40)), (14, Offset(Register(12),
+  -32)), (19, Offset(Register(13), -24))]` — 4 bytes of `sub`, then 5-byte
+  stores, so the rule offsets are *not* the slot offsets. Verified sensitive:
+  reversing the clobber loop fails it (`annotation out of order`, `left: p13i,
+  right: p3i`), moving only the store by 8 bytes fails it (`store and
+  annotation disagree for slot 0`, `left: (3, 80, 9) right: (3, 72, 9)`),
+  recording the rule before its store fails it (`left: (3, 72, 9) right: (3,
+  72, 4)`), and restoring RBP-based CFA fails it with `CfaRegister(Register(5))`.
+  Do not hand-place rules at invented offsets: `add_unwind` stamps
+  `cur_offset()`, so the test has to read the offsets the emitter produced.
   The CFI arithmetic was also cross-checked against real machine code: for a
   frameless function with a 64 B array and rbx/r12/r13 saved at
   `0x48/0x50/0x58(%rsp)` with `CFA = rsp+112`, the FDE says `c-40/c-32/c-24`,
