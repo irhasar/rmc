@@ -54,14 +54,18 @@ through them was wrong.
   `vendor/rakit-codegen/src/isa/x64/inst/unwind/systemv.rs` also has
   `test_frameless_save_reg_offsets`, which *runs the prologue generator*:
   `gen_clobber_save` is called with a layout shaped like a real frameless
-  function (`sub $0x68`, clobber area 32, rbx/r12/r13 at 0/8/16), its `SaveReg`
-  entries are checked against the layout (slot 0/8/16 in register order), and
-  the same entries are fed to `create_unwind_info_from_insts`. The asserted FDE
-  is `[(4, CfaOffset(112)), (12, Offset(Register(3), -40)), (16,
-  Offset(Register(12), -32)), (20, Offset(Register(13), -24))]`. Verified
-  sensitive: reversing the clobber loop in `gen_clobber_save` fails it
-  (`left: p13i, right: p3i`), and restoring RBP-based CFA fails it with
-  `CfaRegister(Register(5))`.
+  function (`sub $0x68`, clobber area 32, rbx/r12/r13 at 0/8/16), and for each
+  clobbered register it checks the emitted `movq %reg, off(%rsp)` (matched as
+  `Inst::External { inst: asm::Inst::movq_mr(..) }`, reading `rm64`'s
+  `Amode::ImmReg` and `r64`) against the `SaveReg` annotation: same register,
+  slot `0/8/16` in layout order, store displacement `fixed + outgoing + slot`.
+  The annotations are then fed to `create_unwind_info_from_insts`; the asserted
+  FDE is `[(4, CfaOffset(112)), (8, Offset(Register(3), -40)), (12,
+  Offset(Register(12), -32)), (16, Offset(Register(13), -24))]`. Verified
+  sensitive: reversing the clobber loop fails it (`left: p13i, right: p3i`),
+  moving only the store by 8 bytes fails it (`store and annotation disagree for
+  slot 0`, `left: (3, 80) right: (3, 72)`), and restoring RBP-based CFA fails it
+  with `CfaRegister(Register(5))`.
   The CFI arithmetic was also cross-checked against real machine code: for a
   frameless function with a 64 B array and rbx/r12/r13 saved at
   `0x48/0x50/0x58(%rsp)` with `CFA = rsp+112`, the FDE says `c-40/c-32/c-24`,
@@ -107,6 +111,15 @@ through them was wrong.
     compares it with the supplied binary and files mismatched samples under
     `[other-exe]` plus a `N samples from a different executable (<id>)` line,
     instead of resolving them against a symbol table they do not belong to.
+  - **Test the fallback, not the path that bypasses it.** `test_sym.py`'s
+    `capture(..., tag=None)` writes the pre-tag `MAP` format; the `--exe` and
+    symlink cases use it, and the `--exe` case first asserts that *without* the
+    override the sample lands in a library bucket, so the option is what makes
+    it resolve. The symlink case records the symlink in the capture and passes
+    the real file to the symbolizer, so only `realpath` on the map path works.
+    The appended-capture case gives the second run a mapping that covers the
+    first run's sample address: keeping the stale maps would then answer for
+    the second sample and hide a missing `maps.clear()`.
   - **The tag is what survives archiving.** A capture names the path the binary
     had when it ran, so symbolizing a saved profile against a *copy* of the
     binary used to file every executable sample under `[prog]` (the path

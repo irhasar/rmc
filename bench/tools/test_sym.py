@@ -95,10 +95,14 @@ def symbolize(lines, binary, extra=()):
 
 
 def capture(binary, sample_offsets, tag="exe", path=None, with_id=True):
+    """One capture. `tag=None` writes the pre-tag MAP format."""
     lines = [f"BASE {BASE:x}"]
     if with_id:
         lines.append(exeid(binary))
-    lines.append(f"MAP {BASE:x} {BASE + SPAN:x} {tag} {path or binary}")
+    if tag is None:
+        lines.append(f"MAP {BASE:x} {BASE + SPAN:x} {path or binary}")
+    else:
+        lines.append(f"MAP {BASE:x} {BASE + SPAN:x} {tag} {path or binary}")
     lines += [f"{BASE + off:x}" for off in sample_offsets]
     return lines
 
@@ -127,7 +131,12 @@ def test_exe_override_for_untagged_capture():
     off = symbol_value(exe, "bench_marker")
     copy = os.path.join(FIXTURES["dir"], "archived_alpha2")
     shutil.copyfile(exe, copy)
-    out = symbolize(capture(exe, [off], with_id=False), copy, extra=["--exe", exe])
+    lines = capture(exe, [off], tag=None, with_id=False)
+    # Without the override the captured path and the supplied binary differ, so
+    # the mapping is treated as a library: that is what --exe has to change.
+    without = symbolize(lines, copy)
+    assert "[alpha]" in without, without
+    out = symbolize(lines, copy, extra=["--exe", exe])
     assert "bench_marker" in out, out
     assert "[" not in out, out
 
@@ -171,7 +180,9 @@ def test_symlinked_binary_is_the_executable():
     if os.path.lexists(link):
         os.unlink(link)
     os.symlink(exe, link)
-    out = symbolize(capture(exe, [off], with_id=False), link)
+    # The capture records the symlink and the symbolizer is given the real
+    # file, so only resolving both paths can recognize them as the same binary.
+    out = symbolize(capture(exe, [off], tag=None, path=link, with_id=False), exe)
     assert "bench_marker" in out, out
     assert "[" not in out, out
 
@@ -183,13 +194,16 @@ def test_appended_captures_use_their_own_mappings():
     os.makedirs(lib_dir, exist_ok=True)
     lib = os.path.join(lib_dir, "libfirst.so")
     shutil.copyfile(exe, lib)
+    # The second run's mapping covers the first run's sample address, so the
+    # first run's maps must be dropped: if they were kept, the stale `exe`
+    # mapping would answer for the second sample and hide the bug.
     lines = [
         f"BASE {BASE:x}",
         f"MAP {BASE:x} {BASE + SPAN:x} exe {exe}",
         f"{BASE + off:x}",
         f"BASE {BASE + SPAN:x}",
-        f"MAP {BASE + SPAN:x} {BASE + 2 * SPAN:x} lib {lib}",
-        f"{BASE + SPAN + 0x100:x}",
+        f"MAP 0 {1 << 40:x} lib {lib}",
+        f"{BASE + off:x}",
     ]
     out = symbolize(lines, exe)
     assert "bench_marker" in out, out

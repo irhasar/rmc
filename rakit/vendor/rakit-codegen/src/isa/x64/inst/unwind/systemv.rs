@@ -152,6 +152,7 @@ mod tests {
         use crate::machinst::{ABIMachineSpec, FrameLayout, FunctionCalls, Writable};
         use crate::settings::builder;
         use crate::isa::x64::abi::X64ABIMachineSpec;
+        use rakit_assembler_x64 as asm;
 
         struct Mapper;
         impl RegisterMapper<crate::machinst::Reg> for Mapper {
@@ -199,31 +200,64 @@ mod tests {
         // `clobber_offset` is the offset *within* the clobber area; the store
         // itself goes to `fixed + outgoing + clobber_offset`.
         let base = layout.fixed_frame_storage_size + layout.outgoing_args_size;
-        let mut next = 0;
+        let mut stores = vec![];
         let mut saved = vec![];
         for inst in X64ABIMachineSpec::gen_clobber_save(isa::CallConv::SystemV, &flags, &layout) {
-            let crate::isa::x64::inst::Inst::Unwind { inst } = inst else {
-                continue;
-            };
-            let UnwindInst::SaveReg { clobber_offset, reg } = inst else {
-                continue;
-            };
-            // Every clobber is 8 bytes here, so the slots must run 0, 8, 16 in
-            // the order the layout lists the registers: a register paired with
-            // another register's slot is exactly what this catches.
-            assert_eq!(clobber_offset, next, "slot out of order for {reg:?}");
-            assert!(base + clobber_offset < layout.setup_area_size + 104);
-            assert_eq!(reg, layout.clobbered_callee_saves[saved.len()].to_reg());
-            next += 8;
-            saved.push(reg);
-            insts.push((8 + 4 * saved.len() as u32, UnwindInst::SaveReg { clobber_offset, reg }));
+            match inst {
+                // The store is what the annotation describes, so a store to the
+                // wrong slot has to fail here and not only in the FDE.
+                crate::isa::x64::inst::Inst::External { inst } => {
+                    if let asm::Inst::movq_mr(m) = inst {
+                        let asm::GprMem::Mem(asm::Amode::ImmReg { base, simm32, .. }) = m.rm64
+                        else {
+                            panic!("expected a store to a memory address");
+                        };
+                        assert_eq!(simm32.offset, None, "store offset is not a constant");
+                        assert_eq!(
+                            base.to_reg(),
+                            regs::rsp(),
+                            "clobber stores must be rsp-relative"
+                        );
+                        stores.push((m.r64.enc(), simm32.simm32.value()));
+                    }
+                }
+                crate::isa::x64::inst::Inst::Unwind { inst } => {
+                    let UnwindInst::SaveReg { clobber_offset, reg } = inst else {
+                        continue;
+                    };
+                    saved.push((clobber_offset, reg));
+                }
+                _ => {}
+            }
         }
+        assert_eq!(stores.len(), 3, "expected one store per clobbered register");
         assert_eq!(saved.len(), 3, "expected one SaveReg per clobbered register");
+
+        // Every clobber is 8 bytes here, so the slots run 0, 8, 16 in the order
+        // the layout lists the registers. Each register must be stored to the
+        // slot its annotation names, and the annotation must be that slot.
+        for (i, (clobber_offset, reg)) in saved.iter().enumerate() {
+            let expected = layout.clobbered_callee_saves[i].to_reg();
+            assert_eq!(*reg, expected, "annotation out of order");
+            assert_eq!(*clobber_offset, 8 * i as u32, "slot out of order");
+            assert_eq!(
+                stores[i],
+                (expected.hw_enc(), (base + clobber_offset) as i32),
+                "store and annotation disagree for slot {i}"
+            );
+            insts.push((
+                8 + 4 * i as u32,
+                UnwindInst::SaveReg {
+                    clobber_offset: *clobber_offset,
+                    reg: *reg,
+                },
+            ));
+        }
 
         let info = create_unwind_info_from_insts(&insts, 20, &Mapper).expect("unwind info");
         assert_eq!(
             format!("{:?}", info.to_fde(Address::Constant(0))),
-            "FrameDescriptionEntry { address: Constant(0), length: 20, lsda: None, instructions: [(4, CfaOffset(112)), (12, Offset(Register(3), -40)), (16, Offset(Register(12), -32)), (20, Offset(Register(13), -24))] }"
+            "FrameDescriptionEntry { address: Constant(0), length: 20, lsda: None, instructions: [(4, CfaOffset(112)), (8, Offset(Register(3), -40)), (12, Offset(Register(12), -32)), (16, Offset(Register(13), -24))] }"
         );
     }
 
