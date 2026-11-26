@@ -34,21 +34,44 @@ through them was wrong.
   the 8 B alignment padding) and asserts no `CfaRegister`. `cargo test` in
   `vendor/rakit-codegen` -> 204 passed / 0 failed. Note `./y.sh test` does not
   run the vendored crate's tests; run them directly.
-- **Not separately exercised:** callee-save rules (`SaveReg`) in the frameless
-  path. The formula is unchanged (`clobber_offset - clobber_offset_to_cfa`, and
-  `DefineNewFrame` still sets `clobber_offset_to_cfa`), but the sampled programs
-  save no callee registers in a frameless frame (`readelf` shows `rbx = u`), so
-  a future change there needs its own test.
-- **Profiling tools hardened** (same review):
+- **Callee-save recovery is covered end to end** by
+  `bench/tests/t_unwind_regs.rs` (registered in `regressions.sh`, expected
+  `true true true true true`). It calls `_Unwind_Backtrace` from inside a chain
+  `main -> top -> level -> walk` where each frame is forced out of line through
+  `black_box(fn)` (rakit's inliner ignores `#[inline(never)]`), and asserts
+  three things: the walk reaches at least four frames, `top`'s address appears
+  in a frame, and `_Unwind_GetGR` recovers the two magic values `level` keeps in
+  callee-saved registers. With the old RBP-relative CFA the frame chain stops
+  after `level` and the test prints `true true true false true`.
+  The CFI arithmetic was also cross-checked against real machine code: for a
+  frameless function with a 64 B array and rbx/r12/r13 saved at
+  `0x48/0x50/0x58(%rsp)` with `CFA = rsp+112`, the FDE says `c-40/c-32/c-24`,
+  i.e. exactly `slot - CFA`.
+- **A `#[inline(never)]` callee can still be inlined by rakit**; to keep a frame
+  in a test, take the address of the function and call it through `black_box`.
+- **Profiling tools hardened** (same review, two rounds):
   - `sampler.c` no longer defaults to `/tmp/sampler.out` (`fopen("w")` on a
     predictable path = CWE-377). The default is now a `mkstemp` file in
-    `$TMPDIR`/`/tmp` with mode 0600, and an explicit `SAMPLER_OUT` is opened
-    with `O_NOFOLLOW|O_CLOEXEC`, so a planted symlink fails with ELOOP instead
-    of redirecting the write. Both paths verified.
+    `$TMPDIR`/`/tmp` with mode 0600, so neither an existing file nor a planted
+    symlink can be reused.
+  - **Nothing is opened in the constructor any more.** Truncating the
+    destination there meant a run killed before `sampler_fini` (Ctrl+C never
+    reaches the destructor) destroyed the previous profile and left an empty
+    file. Overwrite mode now writes a private `.sampler.XXXXXX` in the
+    destination directory and `rename`s it into place, so an interrupted or
+    failed capture leaves the last good profile intact; append mode opens with
+    `O_APPEND|O_NOFOLLOW|O_CLOEXEC` at exit, which cannot destroy earlier
+    content. Verified: SIGKILL mid-run keeps the old file, a completed run
+    replaces it, two append runs leave two `BASE` records, no temp files leak.
   - The destructor also writes `MAP <start> <end> <path>` lines for the
     executable mappings, and `sym.py` attributes samples that land in a shared
     library to `[libc.so.6]`/`[libm.so.6]` instead of counting them as "outside
     any symbol". First useful result: `p4_simd` is 18% libm, not executable code.
+  - `sym.py` also compares `realpath` when deciding whether a mapping is the
+    executable (a binary named through a symlink was reported as a library), and
+    clears the mapping list on every `BASE` record (appended captures have their
+    own layout; an address could otherwise be credited to the previous capture's
+    library). `bench/tools/test_sym.py` pins both; it fails on either mutation.
 - **Full matrix** (`bench/allaxes.sh` CREPS=3 RREPS=7, 45/45 rows `ok`, every
   output validated against LLVM; columns are compile wall/CPU/peak-RSS/size and
   run wall/CPU/peak-RSS):
@@ -101,11 +124,16 @@ through them was wrong.
 | p9_u64f32 | U | 89 | 113 | 111.8 | 5886872 | 77 | 77 | 18.9 |
 | p9_u64f32 | M | 100 | 129 | 113.6 | 4159824 | 34 | 34 | 18.2 |
 
-  Reading: Rakit compiles faster than LLVM everywhere except `p2_mem`/`h_mem`
-  (250 -> 179 ms) and is ~10-12% smaller; runtime wins are `p5`/`p6` (8x), `p7`,
-  `h_arith`/`h_branch`/`h_calls`/`h_simd`/`h_float` (ties or better) and the
-  remaining losses are `p1` (1.24x), `p2` (2.5x), `p3` (1.5x), `p4` (1.5x),
-  `p8` (1.17x), `p9` (1.1x), all explained in the sessions below.
+  Reading, compile: Rakit is clearly faster where the front end dominates
+  (`p2_mem` 257 -> 179, `h_mem` 283 -> 181, `h_float` 134 -> 108, `h_simd`
+  148 -> 117, `h_arith`/`h_branch`/`h_calls` 122 -> ~110) and **slightly slower
+  on five small programs** (`p1_arith` 89 -> 90, `p5_inline` 84 -> 87,
+  `p6_scalar` 86 -> 87, `p8_minmax` 86 -> 89, `p9_u64f32` 97 -> 100), where the
+  pass layer costs more than the front end saves; `p7_branchy` is a tie. Sizes
+  are 10-12% below LLVM everywhere. Reading, runtime: wins are `p5`/`p6` (8x),
+  `p7`, and the `h_*` programs (ties or better except `h_mem`); losses are
+  `p1` (1.24x), `p2` (2.5x), `p3` (1.5x), `p4` (1.5x), `p8` (1.17x), `p9`
+  (1.1x), all explained in the sessions below.
 
 ## Session (2026-11-24, branch `rakit-exp15`) — the backend LICM never hoists a load (negative result)
 

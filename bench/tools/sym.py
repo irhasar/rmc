@@ -44,13 +44,19 @@ def main():
     unknown = 0
     base = 0
     maps = []
-    exe_name = os.path.basename(binary)
+    # A capture may name the binary through a symlink, and the mapping records
+    # the file it resolved to; compare real paths so the executable's own
+    # samples are not mistaken for a library's.
+    exe_name = os.path.basename(os.path.realpath(binary))
     for line in open(samples):
         line = line.strip()
         if not line:
             continue
         if line.startswith("BASE "):
             base = int(line.split()[1], 16)
+            # Each appended capture has its own layout, so the mappings of the
+            # previous one must not be used to attribute this one's addresses.
+            maps.clear()
             continue
         if line.startswith("MAP "):
             _, start, end, path = line.split(" ", 3)

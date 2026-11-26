@@ -23,7 +23,7 @@
 
 static unsigned long long *samples;
 static volatile unsigned long n_samples;
-static int out_fd = -1;
+static const char *out_path;   // NULL: pick a private file at exit
 static unsigned long long load_base;
 
 // The target is a PIE, so the sampled instruction pointers are runtime
@@ -75,34 +75,12 @@ __attribute__((constructor)) static void sampler_init(void) {
     if (!samples) {
         return;
     }
+    // Nothing is opened here: an interrupted run (Ctrl+C and friends never
+    // reach the destructor) must not truncate the previous capture. The
+    // destination is only touched by sampler_fini.
     const char *env = getenv("SAMPLER_OUT");
-    if (env) {
-        // An explicit path is the caller's choice, but never follow a symlink
-        // (a planted link would redirect the write to a file the caller owns)
-        // and keep the result private.
-        int flags = O_WRONLY | O_CREAT | O_CLOEXEC | O_NOFOLLOW;
-        flags |= getenv("SAMPLER_APPEND") ? O_APPEND : O_TRUNC;
-        out_fd = open(env, flags, 0600);
-        if (out_fd < 0) {
-            fprintf(stderr, "sampler: cannot open %s: %s\n", env, strerror(errno));
-        }
-    } else {
-        // Default: create a fresh private file with O_EXCL, so neither an
-        // existing file nor a symlink in the temp directory can be reused
-        // (CWE-377).
-        const char *dir = getenv("TMPDIR");
-        if (!dir || !*dir) {
-            dir = "/tmp";
-        }
-        char path[4096];
-        snprintf(path, sizeof(path), "%s/sampler.XXXXXX", dir);
-        out_fd = mkstemp(path);
-        if (out_fd >= 0) {
-            fchmod(out_fd, 0600);
-            fprintf(stderr, "sampler: writing %s\n", path);
-        } else {
-            fprintf(stderr, "sampler: cannot create a profile file in %s\n", dir);
-        }
+    if (env && *env) {
+        out_path = strdup(env);
     }
     load_base = executable_base();
     struct sigaction sa;
@@ -140,23 +118,102 @@ static void dump_maps(FILE *f) {
     fclose(m);
 }
 
-__attribute__((destructor)) static void sampler_fini(void) {
-    struct itimerval it;
-    memset(&it, 0, sizeof(it));
-    setitimer(ITIMER_PROF, &it, NULL);
-    if (out_fd < 0) {
-        return;
-    }
-    FILE *f = fdopen(out_fd, "w");
-    if (!f) {
-        close(out_fd);
-        return;
-    }
+static void write_profile(FILE *f) {
     fprintf(f, "BASE %llx\n", load_base);
     dump_maps(f);
     unsigned long n = n_samples < MAX_SAMPLES ? n_samples : MAX_SAMPLES;
     for (unsigned long i = 0; i < n; i++) {
         fprintf(f, "%llx\n", samples[i]);
     }
-    fclose(f);
+}
+
+// Overwrite mode writes a private file next to the destination and renames it
+// into place, so an interrupted or failed capture leaves the previous profile
+// intact. `rename` replaces a symlink rather than following it, which is why
+// the destination itself never needs to be opened.
+static void write_profile_atomic(const char *path) {
+    char tmp[4096];
+    const char *slash = strrchr(path, '/');
+    if (slash) {
+        int dir_len = (int)(slash - path);
+        if (dir_len == 0) {
+            dir_len = 1;
+        }
+        snprintf(tmp, sizeof(tmp), "%.*s/.sampler.XXXXXX", dir_len, path);
+    } else {
+        snprintf(tmp, sizeof(tmp), ".sampler.XXXXXX");
+    }
+    int fd = mkstemp(tmp);
+    if (fd < 0) {
+        fprintf(stderr, "sampler: cannot create %s: %s\n", tmp, strerror(errno));
+        return;
+    }
+    fchmod(fd, 0600);
+    FILE *f = fdopen(fd, "w");
+    if (!f) {
+        close(fd);
+        unlink(tmp);
+        return;
+    }
+    write_profile(f);
+    if (fclose(f) != 0) {
+        unlink(tmp);
+        return;
+    }
+    if (rename(tmp, path) != 0) {
+        fprintf(stderr, "sampler: cannot replace %s: %s\n", path, strerror(errno));
+        unlink(tmp);
+    }
+}
+
+__attribute__((destructor)) static void sampler_fini(void) {
+    struct itimerval it;
+    memset(&it, 0, sizeof(it));
+    setitimer(ITIMER_PROF, &it, NULL);
+    if (!samples) {
+        return;
+    }
+    if (!out_path) {
+        // Default: a fresh private file, so neither an existing file nor a
+        // symlink in the temp directory can be reused (CWE-377).
+        const char *dir = getenv("TMPDIR");
+        if (!dir || !*dir) {
+            dir = "/tmp";
+        }
+        char path[4096];
+        snprintf(path, sizeof(path), "%s/sampler.XXXXXX", dir);
+        int fd = mkstemp(path);
+        if (fd < 0) {
+            fprintf(stderr, "sampler: cannot create a profile file in %s\n", dir);
+            return;
+        }
+        fchmod(fd, 0600);
+        FILE *f = fdopen(fd, "w");
+        if (!f) {
+            close(fd);
+            return;
+        }
+        write_profile(f);
+        fclose(f);
+        fprintf(stderr, "sampler: wrote %s\n", path);
+        return;
+    }
+    if (getenv("SAMPLER_APPEND")) {
+        // Appending cannot destroy what is already there, even if the run is
+        // interrupted halfway through the write.
+        int fd = open(out_path, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+        if (fd < 0) {
+            fprintf(stderr, "sampler: cannot open %s: %s\n", out_path, strerror(errno));
+            return;
+        }
+        FILE *f = fdopen(fd, "a");
+        if (!f) {
+            close(fd);
+            return;
+        }
+        write_profile(f);
+        fclose(f);
+        return;
+    }
+    write_profile_atomic(out_path);
 }
