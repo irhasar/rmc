@@ -335,16 +335,107 @@ fn slot_of_resolved(dfg: &ir::DataFlowGraph, arg: Value) -> Option<StackSlot> {
 
 /// If `addr` is a `stack_addr` of a known slot, or a tracked pointer base,
 /// return the base and the byte offset at which `inst` accesses it.
-fn mem_key(func: &ir::Function, inst: Inst, addr: Value) -> Option<Key> {
-    let addr = func.dfg.resolve_aliases(addr);
-    if let ir::ValueDef::Result(def_inst, 0) = func.dfg.value_def(addr) {
-        if let ir::InstructionData::StackAddr { stack_slot, offset, .. } = func.dfg.insts[def_inst]
-        {
-            let off = i64::from(offset) + offset_of(func, inst)?;
-            return Some((Base::Slot(stack_slot), off));
+fn mem_key(
+    func: &ir::Function,
+    inst: Inst,
+    addr: Value,
+    private: &FxHashSet<StackSlot>,
+) -> Option<Key> {
+    let off = offset_of(func, inst)?;
+    // A slot key is only usable when the slot is private: `tracked` rejects a
+    // slot it does not know, so folding an address to a slot the pass cannot
+    // track would lose the forwarding the pointer key still allows.
+    if let Some((slot, base_off)) = const_addr(func, addr, 8).filter(|&(s, _)| private.contains(&s)) {
+        // The effective range has to be representable and lie inside the slot.
+        // Unchecked arithmetic here wraps: a folded displacement of `i64::MAX`
+        // puts the end below zero, which passes the upper-bound test and keys the
+        // access against bytes it never touches. A negative displacement must not
+        // place the start before the slot either.
+        let size = access_size(func, inst).map(i64::from);
+        let start = base_off.checked_add(off).filter(|&start| start >= 0).zip(size).and_then(
+            |(start, size)| {
+                let end = start.checked_add(size)?;
+                let fits = func
+                    .sized_stack_slots
+                    .get(slot)
+                    .is_some_and(|data| end <= i64::from(data.size));
+                fits.then_some(start)
+            },
+        );
+        if let Some(start) = start {
+            return Some((Base::Slot(slot), start));
         }
     }
-    Some((Base::Ptr(addr), offset_of(func, inst)?))
+    Some((Base::Ptr(func.dfg.resolve_aliases(addr)), off))
+}
+
+/// The number of bytes the access at `inst` reads or writes.
+fn access_size(func: &ir::Function, inst: Inst) -> Option<u32> {
+    let dfg = &func.dfg;
+    let value = match dfg.insts[inst] {
+        ir::InstructionData::Load { .. } => *dfg.inst_results(inst).first()?,
+        ir::InstructionData::Store { .. } => {
+            *dfg.insts[inst].arguments(&dfg.value_lists).first()?
+        }
+        _ => return None,
+    };
+    Some(dfg.value_type(value).bytes())
+}
+
+/// `(slot, byte offset)` when `value` is a constant expression over
+/// `stack_addr`: `stack_addr`, `iadd` and `imul` of constants.
+///
+/// rakit indexes aggregate fields as `iadd(stack_addr, imul(iconst, iconst))`, so
+/// without folding the chain each field access gets its own pointer base and no
+/// store matches the load that reads it back: the aggregate shape stays
+/// unforwarded. Exact constants only — a bound cannot say two accesses hit the
+/// same bytes.
+fn const_addr(func: &ir::Function, v: Value, depth: u32) -> Option<(StackSlot, i64)> {
+    if depth == 0 {
+        return None;
+    }
+    let dfg = &func.dfg;
+    let v = dfg.resolve_aliases(v);
+    let ir::ValueDef::Result(inst, 0) = dfg.value_def(v) else { return None };
+    match dfg.insts[inst] {
+        ir::InstructionData::StackAddr { stack_slot, offset, .. } => {
+            Some((stack_slot, i64::from(offset)))
+        }
+        ir::InstructionData::Binary { opcode: ir::Opcode::Iadd, .. } => {
+            let args = dfg.insts[inst].arguments(&dfg.value_lists);
+            let (a, b) = (*args.first()?, *args.get(1)?);
+            if let Some((slot, off)) = const_addr(func, a, depth - 1) {
+                return Some((slot, off.checked_add(const_int(func, b, 8)?)?));
+            }
+            let (slot, off) = const_addr(func, b, depth - 1)?;
+            Some((slot, off.checked_add(const_int(func, a, 8)?)?))
+        }
+        _ => None,
+    }
+}
+
+/// The value of `v` when it is built from `iconst`, `iadd` and `imul` only.
+fn const_int(func: &ir::Function, v: Value, depth: u32) -> Option<i64> {
+    if depth == 0 {
+        return None;
+    }
+    let dfg = &func.dfg;
+    let v = dfg.resolve_aliases(v);
+    let ir::ValueDef::Result(inst, 0) = dfg.value_def(v) else { return None };
+    match dfg.insts[inst] {
+        ir::InstructionData::UnaryImm { opcode: ir::Opcode::Iconst, imm, .. } => Some(imm.bits()),
+        ir::InstructionData::Binary { opcode, .. } => {
+            let args = dfg.insts[inst].arguments(&dfg.value_lists);
+            let a = const_int(func, *args.first()?, depth - 1)?;
+            let b = const_int(func, *args.get(1)?, depth - 1)?;
+            match opcode {
+                ir::Opcode::Iadd => a.checked_add(b),
+                ir::Opcode::Imul => a.checked_mul(b),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Is this key a location the pass is allowed to track?
@@ -463,7 +554,7 @@ fn analyze(func: &ir::Function) -> Option<Bases> {
     // store it cannot see would make a forwarded fact stale. Such a slot is not
     // private.
     for (inst, addr) in stores.iter().chain(loads.iter()) {
-        let tracked_access = mem_key(func, *inst, *addr)
+        let tracked_access = mem_key(func, *inst, *addr, &slots)
             .map(|key| tracked(&key, &slots, &addr_only))
             .unwrap_or(false);
         if !tracked_access
@@ -479,7 +570,7 @@ fn analyze(func: &ir::Function) -> Option<Bases> {
 
     let mut loaded: FxHashSet<Key> = FxHashSet::default();
     for (inst, addr) in loads {
-        if let Some(key) = mem_key(func, inst, addr) {
+        if let Some(key) = mem_key(func, inst, addr, &slots) {
             if tracked(&key, &slots, &addr_only) {
                 loaded.insert(key);
             }
@@ -590,7 +681,7 @@ fn record_store(
     prov: &FxHashMap<Base, StackSlot>,
 ) -> Option<Key> {
     let ty = func.dfg.value_type(value);
-    let Some((base, off)) = mem_key(func, inst, addr).filter(|k| tracked(k, private, ptr_bases))
+    let Some((base, off)) = mem_key(func, inst, addr, private).filter(|k| tracked(k, private, ptr_bases))
     else {
         // Store through an address the pass does not track: it may alias any
         // tracked pointer base, so every pointer fact is invalidated. A private
@@ -738,7 +829,7 @@ fn forward_block(
             }
             let addr = func.dfg.insts[inst].arguments(&func.dfg.value_lists).first().copied();
             let Some(addr) = addr else { continue };
-            let Some(key) = mem_key(func, inst, addr) else { continue };
+            let Some(key) = mem_key(func, inst, addr, private) else { continue };
             if !tracked(&key, private, ptr_bases) {
                 continue;
             }
@@ -1052,7 +1143,7 @@ fn drop_dead_stores(
             }
             let args = func.dfg.insts[inst].arguments(&func.dfg.value_lists);
             let Some(addr) = args.get(1).copied() else { continue };
-            let Some(key) = mem_key(func, inst, addr) else { continue };
+            let Some(key) = mem_key(func, inst, addr, private) else { continue };
             let Some(&slot) = prov.get(&key.0) else { continue };
             if !private.contains(&slot) {
                 continue;
@@ -1082,5 +1173,227 @@ fn drop_dead_stores(
     }
     for inst in dead {
         func.layout.remove_inst(inst);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A function holding one 16-byte stack slot and a single load from
+    /// `stack_addr(slot) + displacement`, plus the load's address value. The
+    /// load carries its own `load_offset`, which `mem_key` adds to the folded
+    /// displacement.
+    fn load_at(
+        displacement: i64,
+        load_offset: i32,
+        load_ty: types::Type,
+    ) -> (ir::Function, StackSlot, Inst, Value) {
+        let mut func = ir::Function::new();
+        let slot = func.create_sized_stack_slot(ir::StackSlotData::new(
+            ir::StackSlotKind::ExplicitSlot,
+            16,
+            0,
+        ));
+        let block = func.dfg.make_block();
+        func.layout.append_block(block);
+        let (load, addr) = {
+            let mut pos = FuncCursor::new(&mut func).at_bottom(block);
+            let base = pos.ins().stack_addr(types::I64, slot, 0);
+            let offset = pos.ins().iconst(types::I64, displacement);
+            let addr = pos.ins().iadd(base, offset);
+            let load = pos.ins().load(load_ty, MemFlagsData::trusted(), addr, load_offset);
+            (load, addr)
+        };
+        let ir::ValueDef::Result(inst, 0) = func.dfg.value_def(load) else {
+            panic!("a load result is defined by its own instruction")
+        };
+        (func, slot, inst, addr)
+    }
+
+    fn private(slots: &[StackSlot]) -> FxHashSet<StackSlot> {
+        slots.iter().copied().collect()
+    }
+
+    fn key(func: &ir::Function, inst: Inst, addr: Value, private: &FxHashSet<StackSlot>) -> Key {
+        mem_key(func, inst, addr, private).expect("a load always has a key")
+    }
+
+    /// Runs `mem_key` on one access and reports the key it folded to, if any.
+    fn folded(displacement: i64, load_offset: i32, load_ty: types::Type) -> Option<Key> {
+        let (func, slot, inst, addr) = load_at(displacement, load_offset, load_ty);
+        let key = key(&func, inst, addr, &private(&[slot]));
+        matches!(key.0, Base::Slot(_)).then_some(key)
+    }
+
+    /// The access must keep its pointer key, and that key must still carry the
+    /// load's own offset: `forward_block` looks facts up by the full key, so a
+    /// fallback that dropped the offset would forward the wrong stored value.
+    fn assert_kept(displacement: i64, load_offset: i32, load_ty: types::Type) {
+        let (func, slot, inst, addr) = load_at(displacement, load_offset, load_ty);
+        let key = key(&func, inst, addr, &private(&[slot]));
+        assert_eq!(
+            key,
+            (Base::Ptr(func.dfg.resolve_aliases(addr)), i64::from(load_offset)),
+            "displacement {displacement} + offset {load_offset} of {} bytes",
+            load_ty.bytes()
+        );
+    }
+
+    #[test]
+    fn folds_a_constant_displacement_that_stays_inside_the_slot() {
+        let (func, slot, inst, addr) = load_at(8, 0, types::I64);
+        assert_eq!(key(&func, inst, addr, &private(&[slot])), (Base::Slot(slot), 8));
+
+        // The folded displacement and the load's own offset are added, so a
+        // negative displacement is fine when the effective start is inside.
+        assert!(matches!(folded(-4, 8, types::I8), Some((Base::Slot(_), 4))));
+    }
+
+    /// The end of the range has to be representable and inside the slot.
+    #[test]
+    fn keeps_the_pointer_key_when_the_end_overflows() {
+        assert_kept(i64::MAX, 0, types::I8);
+        assert_kept(i64::MAX - 7, 0, types::I64);
+    }
+
+    /// The start is `folded displacement + load offset`, and that addition can
+    /// overflow on its own even when the displacement is not near the end.
+    #[test]
+    fn keeps_the_pointer_key_when_the_start_overflows() {
+        assert_kept(i64::MAX, 8, types::I8);
+        assert_kept(i64::MAX - 7, 8, types::I8);
+        assert_kept(i64::MIN, -1, types::I8);
+        assert_kept(i64::MIN, i32::MIN, types::I8);
+    }
+
+    /// A start before the slot must not fold, even though the arithmetic is
+    /// representable.
+    #[test]
+    fn keeps_the_pointer_key_when_the_start_is_negative() {
+        assert_kept(-8, 0, types::I8);
+        assert_kept(4, -8, types::I8);
+        assert_kept(i64::MIN, 0, types::I8);
+    }
+
+    #[test]
+    fn keeps_the_pointer_key_when_the_access_leaves_the_slot() {
+        assert_kept(12, 0, types::I64);
+        assert_kept(16, 0, types::I8);
+        assert_kept(8, 8, types::I8);
+    }
+
+    /// The access is inside the slot (start 4, end 12 of 16), so only the
+    /// privacy guard can stop it from folding: a slot key the pass cannot track
+    /// would throw away the pointer key's forwarding.
+    #[test]
+    fn keeps_the_pointer_key_for_a_slot_the_pass_does_not_track() {
+        let (func, _slot, inst, addr) = load_at(0, 4, types::I64);
+        assert_eq!(
+            key(&func, inst, addr, &FxHashSet::default()),
+            (Base::Ptr(func.dfg.resolve_aliases(addr)), 4)
+        );
+        // The same access does fold once the slot is private, so the assertion
+        // above is about privacy and not about the bounds.
+        let (func, slot, inst, addr) = load_at(0, 4, types::I64);
+        assert_eq!(key(&func, inst, addr, &private(&[slot])), (Base::Slot(slot), 4));
+    }
+
+    /// A function with a pointer block parameter, one unrelated stack slot (the
+    /// pass bails on a function without one), a store at each of `stores`, a
+    /// load at each of `loads`, and a return of the sum of the loads. Returns
+    /// the function, the stored values and the load results.
+    fn pointer_access(
+        stores: &[i32],
+        loads: &[i32],
+    ) -> (ir::Function, Vec<Value>, Vec<Value>) {
+        let mut func = ir::Function::new();
+        func.create_sized_stack_slot(ir::StackSlotData::new(
+            ir::StackSlotKind::ExplicitSlot,
+            8,
+            0,
+        ));
+        let block = func.dfg.make_block();
+        func.layout.append_block(block);
+        let mut stored = Vec::new();
+        let mut loaded = Vec::new();
+        let mut pos = FuncCursor::new(&mut func).at_bottom(block);
+        let ptr = pos.func.dfg.append_block_param(block, types::I64);
+        for (i, &offset) in stores.iter().enumerate() {
+            let value = pos.ins().iconst(types::I64, 11 * (i as i64 + 1));
+            pos.ins().store(MemFlagsData::trusted(), value, ptr, offset);
+            stored.push(value);
+        }
+        for &offset in loads {
+            loaded.push(pos.ins().load(types::I64, MemFlagsData::trusted(), ptr, offset));
+        }
+        let mut sum = loaded[0];
+        for &value in &loaded[1..] {
+            sum = pos.ins().iadd(sum, value);
+        }
+        pos.ins().return_(&[sum]);
+        (func, stored, loaded)
+    }
+
+    fn run_pass(func: &mut ir::Function) {
+        let mut analyses = crate::Analyses::default();
+        super::run(func, ir::Endianness::Little, &mut analyses);
+    }
+
+    fn load_insts(func: &ir::Function) -> Vec<Inst> {
+        func.layout
+            .blocks()
+            .flat_map(|block| func.layout.block_insts(block))
+            .filter(|&inst| func.dfg.insts[inst].opcode() == Opcode::Load)
+            .collect()
+    }
+
+    #[test]
+    fn forwards_a_pointer_access_at_a_nonzero_offset() {
+        let (mut func, _stored, _loaded) = pointer_access(&[8], &[8]);
+        run_pass(&mut func);
+        assert!(load_insts(&func).is_empty(), "a load at the stored offset must be forwarded");
+    }
+
+    #[test]
+    fn does_not_forward_across_pointer_offsets() {
+        let (mut func, _stored, _loaded) = pointer_access(&[0], &[8]);
+        run_pass(&mut func);
+        assert_eq!(
+            load_insts(&func).len(),
+            1,
+            "a load at offset 8 must not read the value stored at offset 0"
+        );
+    }
+
+    /// Two stores at different offsets, two loads at those offsets, summed so
+    /// both loads are observed: each has to forward the value stored at its own
+    /// offset, which only happens if the key carries the offset.
+    #[test]
+    fn forwards_each_offset_from_its_own_store() {
+        let (mut func, stored, _loaded) = pointer_access(&[0, 8], &[0, 8]);
+        run_pass(&mut func);
+        assert!(load_insts(&func).is_empty(), "both loads must be forwarded");
+
+        let block = func.layout.blocks().next().unwrap();
+        let returned = func.layout.block_insts(block).last().unwrap();
+        assert_eq!(func.dfg.insts[returned].opcode(), Opcode::Return);
+        let sum = func.dfg.insts[returned].arguments(&func.dfg.value_lists)[0];
+        let sum = func.dfg.resolve_aliases(sum);
+        let ir::ValueDef::Result(sum_inst, 0) = func.dfg.value_def(sum) else {
+            panic!("the sum is an instruction result")
+        };
+        assert_eq!(func.dfg.insts[sum_inst].opcode(), Opcode::Iadd);
+        let args = func.dfg.insts[sum_inst].arguments(&func.dfg.value_lists).to_vec();
+        assert_eq!(
+            func.dfg.resolve_aliases(args[0]),
+            stored[0],
+            "the load at offset 0 must forward the value stored at offset 0"
+        );
+        assert_eq!(
+            func.dfg.resolve_aliases(args[1]),
+            stored[1],
+            "the load at offset 8 must forward the value stored at offset 8"
+        );
     }
 }

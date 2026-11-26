@@ -95,6 +95,7 @@ check t_volatile $'n=1000 loop=17230722056597992339\nn=17 loop=18156365728903607
 check t_copy_overlap $'N=16 shift=1 11664426682378596937\nback N=16 shift=1 12713388859568982132\nN=32 shift=1 774115827419797049\nback N=32 shift=1 5146083939088780532\nN=32 shift=7 16864641215232849398\nback N=32 shift=7 6744451032907730017\nN=48 shift=3 11240810308952937694\nback N=48 shift=3 9582033626409429593\nN=64 shift=1 4928807640131852377\nback N=64 shift=1 13460265805155334836\nN=64 shift=16 3546406609664978499\nback N=64 shift=16 14022381290388415283\nnonoverlap 1882637779704813251'
 check t_simd_mask $'i8x8 eq [-1, 0, -1, 0, -1, 0, -1, 0]\ni64x8 lt [0, 0, 0, -1, 0, -1, 0, 0]\ni32x8 lt [0, 0, 0, -1, 0, -1, 0, 0]\nu8x2 eq [255, 0]'
 check t_volatile_dead 'written'
+check t_sf_huge_index '0 0 1'
 check t_ptr_store_alias '7 0'
 check t_cast_escape '127'
 check t_cast_offset '127'
@@ -1098,6 +1099,21 @@ elif command -v objdump >/dev/null 2>&1; then
     fi
 else
     echo "[regression] t_vectorize_unit NO_LICM=1: objdump unavailable, skipping SIMD assertion" >&2
+fi
+
+# Unit tests for the decisions the end-to-end fixtures cannot observe. The
+# huge-index fixture keeps its huge branches untaken, so its output alone does not
+# show whether store forwarding rejected the folded range: with overflow checks
+# off, a wrapped end passes for an in-bounds access and the program still prints
+# the same line. These tests assert the key itself.
+if command -v cargo >/dev/null 2>&1; then
+    if ! ( cd "$ROOT/rakit" && cargo test -q -p rakit-opt >"$TMP/sf_unit.log" 2>&1 ); then
+        echo "[regression] rakit-opt unit tests failed" >&2
+        tail -20 "$TMP/sf_unit.log" >&2
+        fail=1
+    fi
+else
+    echo "[regression] cargo unavailable, skipping rakit-opt unit tests" >&2
 fi
 
 if [ "$fail" -eq 0 ]; then
