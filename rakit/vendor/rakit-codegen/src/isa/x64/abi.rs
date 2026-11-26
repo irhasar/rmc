@@ -541,10 +541,13 @@ impl ABIMachineSpec for X64ABIMachineSpec {
         _isa_flags: &x64_settings::Flags,
         frame_layout: &FrameLayout,
     ) -> SmallInstVec<Self::I> {
+        let mut insts = SmallVec::new();
+        if !frame_layout.has_frame_pointer() {
+            return insts;
+        }
         let r_rsp = Gpr::RSP;
         let r_rbp = Gpr::RBP;
         let w_rbp = Writable::from_reg(r_rbp);
-        let mut insts = SmallVec::new();
         // `push %rbp`
         // RSP before the call will be 0 % 16.  So here, it is 8 % 16.
         insts.push(Inst::External {
@@ -572,12 +575,16 @@ impl ABIMachineSpec for X64ABIMachineSpec {
         _call_conv: isa::CallConv,
         _flags: &settings::Flags,
         _isa_flags: &x64_settings::Flags,
-        _frame_layout: &FrameLayout,
+        frame_layout: &FrameLayout,
     ) -> SmallInstVec<Self::I> {
         let rbp = Gpr::RBP;
         let rsp = Gpr::RSP;
 
         let mut insts = SmallVec::new();
+        if !frame_layout.has_frame_pointer() {
+            // `gen_clobber_restore` already gave the whole frame back.
+            return insts;
+        }
         // `mov %rbp, %rsp`
         insts.push(Inst::External {
             inst: asm::inst::movq_mr::new(Writable::from_reg(rsp), rbp).into(),
@@ -951,8 +958,21 @@ impl ABIMachineSpec for X64ABIMachineSpec {
         // Compute clobber size.
         let clobber_size = compute_clobber_size(&regs);
 
-        // Compute setup area size.
-        let setup_area_size = 16; // RBP, return address
+        // Compute setup area size. With a frame pointer the setup area holds the
+        // saved RBP and the return address; without one only the return address
+        // is on the stack. A frame only needs a frame pointer when something
+        // actually addresses through RBP: incoming stack arguments (and the
+        // tail-call argument copy) are reached relative to it.
+        let needs_frame_pointer =
+            flags.preserve_frame_pointers() || incoming_args_size > 0 || tail_args_size > 0;
+        let setup_area_size = if needs_frame_pointer { 16 } else { 8 };
+        // Without a frame pointer only the return address is on the stack, which
+        // leaves %rsp 8 mod 16 at a call; reserve 8 bytes of padding so the
+        // outgoing argument area stays 16-byte aligned. The padding belongs in
+        // the layout rather than in the prologue's adjustment so that
+        // `frame_size` and the slot offsets describe the real frame.
+        let fixed_frame_storage_size =
+            fixed_frame_storage_size + if setup_area_size == 8 { 8 } else { 0 };
 
         // Return FrameLayout structure.
         FrameLayout {

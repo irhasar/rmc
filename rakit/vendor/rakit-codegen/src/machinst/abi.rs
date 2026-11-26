@@ -1126,6 +1126,13 @@ impl FrameLayout {
         (ints, floats)
     }
 
+    /// Whether `gen_prologue_frame_setup` sets up a frame pointer for this
+    /// frame: the setup area is 16 bytes with one (saved FP and return
+    /// address) and 8 without.
+    pub fn has_frame_pointer(&self) -> bool {
+        self.setup_area_size > 8
+    }
+
     /// The size of FP to SP while the frame is active (not during prologue
     /// setup or epilogue tear down).
     pub fn active_size(&self) -> u32 {

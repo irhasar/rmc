@@ -1,3 +1,53 @@
+## Session (2026-11-24, branch `rakit-exp15`) — x64 drops the frame pointer; `lea` for `x - c`
+
+- **Frame pointer omitted on x64** (`vendor/rakit-codegen/src/isa/x64/abi.rs`).
+  `setup_area_size` is 16 with a frame pointer (saved RBP + return address) and
+  8 without; `gen_prologue_frame_setup`/`gen_epilogue_frame_restore` emit
+  nothing in the 8-byte case (`gen_clobber_restore` already gives the frame
+  back). `FrameLayout::has_frame_pointer()` is `setup_area_size > 8`.
+  `-Cforce-frame-pointers=yes` restores the old shape.
+- **Why the two earlier attempts failed, and what makes it work now:**
+  1. **Alignment.** Without `push %rbp` only the return address is on the
+     stack, so `%rsp` is 8 mod 16 at a call. Reserve 8 bytes of padding — and
+     put it in the **layout** (`fixed_frame_storage_size`), not in the
+     prologue's `sub`: `frame_size()`, `sp_to_fp_offset()` and the slot offsets
+     must see the real frame.
+  2. **Incoming stack arguments are reached through RBP in two places**:
+     `SyntheticAmode::finalize` (`inst/args.rs`) and the asm-crate path
+     (`inst/external.rs` → `offsets::KEY_INCOMING_ARG`, base hardcoded to RBP).
+     Patching only `finalize` leaves the asm path reading `0x8(%rbp)` from a
+     frame that has no RBP → `HashMap`/`HashSet` code reads a garbage capacity
+     and aborts with `memory allocation of 4e14 bytes failed`. A one-line
+     `HashMap::new(); insert` program reproduces it at opt-level 0.
+     **Fix taken:** keep the frame pointer whenever the frame receives stack
+     arguments (`incoming_args_size > 0 || tail_args_size > 0`). Frames without
+     them (fib, most std code) still lose the prologue/epilogue.
+- **Debug recipe that found it:** diff the no-FP and `-Cforce-frame-pointers`
+  builds function-by-function (`nm -S` + `objdump`, drop frame instructions and
+  branch targets, compare per-function instruction multisets). The only real
+  difference was `resize_inner` reading `0x8(%rbp)`/`0x10(%rbp)` in the no-FP
+  build. Note a "huge allocation" abort from Rakit-built code is usually std's
+  *backtrace* machinery allocating a garbage size, not the original fault —
+  `LD_PRELOAD` malloc interception shows gimli frames on the stack.
+- **`rec_loop` builds `x - c` as `x + (-c)`** (`rakit-opt/src/passes/rec_loop.rs`).
+  The x64 backend folds an add of a constant into `lea -c(%x), %dst`
+  (`to_amode_add` → `amode_imm_reg`), so the recursive argument no longer needs
+  a copy into the destination register first: `mov %rbx,%rdi; sub $1,%rdi`
+  becomes `lea -1(%rbx),%rdi`.
+- **Result** (`allaxes.sh` CREPS=3 RREPS=7, L/M): `p3_calls` run 57 → **49 ms**
+  (L 38) and the `fib` body is 19 instructions vs LLVM's 17 (was 21 + a
+  frame-pointer prologue). Sizes shrink slightly everywhere (`p2_mem`
+  4154256 → 4152528, `p3_calls` 4077128 → 4076936). Compile unchanged.
+- **Verification:** `./y.sh test --sysroot rakit` → 65 suites, 0 failed, exit 0;
+  `bench/regressions.sh` exit 0; all 15 benchmark programs byte-identical to
+  LLVM in `allaxes.sh`; panic/`catch_unwind` behaviour unchanged (Rakit does
+  not catch, with or without the frame pointer — pre-existing).
+- **Profiling tooling** (`bench/tools/`): `sampler.c` (`LD_PRELOAD` +
+  `ITIMER_PROF`, writes `<count> <addr>`, subtracts the PIE base) and `sym.py`
+  (histogram via `nm -S`). `perf` is not installed in this image. First results:
+  `p3_calls` 71.5% in `fib`, `p4_simd` 74.2% in `main`. The old note that p3's
+  gap is the `format!` machinery is wrong — it is the recursion itself.
+
 ## Session (2026-11-24, branch `rakit-exp12`) — store-forward address memoisation; write-once rule rejected
 
 ## Session (2026-11-25, branch `rakit-exp14`) — precise address keys, and what the all-axes matrix really says

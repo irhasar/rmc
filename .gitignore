@@ -21,3 +21,4 @@ rakit/rakit-opt/Cargo.lock
 
 # rustc ICE dumps
 rustc-ice-*.txt
+bench/tools/*.so
