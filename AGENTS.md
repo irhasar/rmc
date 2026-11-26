@@ -1,5 +1,6 @@
 ## Session (2026-11-24, branch `rakit-exp12`) — store-forward address memoisation; write-once rule rejected
-## Session (2026-11-25, branch `rakit-exp14`) — precise address keys: the cross-block dataflow finally fires
+
+## Session (2026-11-25, branch `rakit-exp14`) — precise address keys, and what the all-axes matrix really says
 
 - **`mem_key` only recognised a bare `stack_addr`.** rakit indexes an aggregate
   field as `iadd(stack_addr, imul(iconst, iconst))`, so every field access became
@@ -7,38 +8,61 @@
   is why the cross-block dataflow counted nothing on the shapes it exists for
   (round 16) — not the meet, as that round concluded.
 - **Fix:** `const_addr` folds `stack_addr` + `iadd`/`imul` of constants into
-  `(slot, offset)`, and `mem_key` keys such an access as `Base::Slot` when the
-  whole access provably stays inside that slot. Exact constants only (a bound
-  cannot prove two accesses hit the same bytes), and only `tracked()` decides
-  whether the slot is private, so the escape rules are unchanged.
-- **Measured:** the counter goes from 0 to **21** cross-block forwards on
-  `t_sf_fuzz` with the dataflow on and stays **0** with `RAKIT_SF_NO_CBE=1`;
-  outputs identical. The post-pass IR of that fixture is byte-identical either
-  way — the forwards are redundant there — but the binaries shrink:
-  p1_arith 4,159,072 → 4,156,400 (−2,672 B), h_mem 4,179,440 → 4,176,752
-  (−2,688 B), same output. Runtime flat: p1 99.25 → 99.29 ms, h_mem 2.85 → 2.83 ms
-  (15 reps, min).
-- **Gate:** 65 suites / 25,368 passed / 0 failed; `regressions.sh` exit 0;
-  `allaxes` 45/45 `ok`, full matrix below (`L/U/M` per cell). M still wins
-  compile wall, size and RSS everywhere, and runtime on p5/p6 (~9.6x) and p7.
+  `(slot, offset)`; `mem_key` keys such an access as `Base::Slot` at
+  `start = base + displacement`, but only when the slot is **private** (a slot
+  key the pass cannot track would throw away the forwarding the pointer key still
+  allows) and only when the access provably stays inside the slot.
+- **Review round 1 (three findings, all fixed):**
+  1. `base_off + off + size` was unchecked. With overflow checks on
+     (`RAKIT_EXPENSIVE_CHECKS=1`) a folded displacement of `i64::MAX` aborts the
+     compiler; with them off (the default) the end wraps negative, passes the
+     upper-bound test and keys the access against bytes it never touches. Start
+     and end are now `checked_add`ed, the start must be non-negative and the end
+     must fit the slot. `bench/tests/t_sf_huge_index.rs` pins that a guarded
+     `isize::MAX` index compiles and prints `0 0 1`.
+  2. Folding to a slot key the pass does not track lost same-block forwarding
+     once any other address to that slot escaped. `mem_key` now takes the private
+     set and keeps the pointer key for a non-private slot.
+  3. The compile-time claim in the first version of this entry was wrong: the
+     matrix shows upstream compiling every workload faster than Rakit. Corrected
+     below.
+- **Measured:** the cross-block counter goes from 0 to **21** forwards on
+  `t_sf_fuzz` with the dataflow on and stays **0** with `RAKIT_SF_NO_CBE=1`,
+  outputs identical. The post-pass IR of that fixture is identical either way —
+  those forwards are redundant there — but the binaries shrink:
+  p1_arith 4,159,072 → 4,156,384 (−2,688 B), h_mem 4,179,440 → 4,176,736
+  (−2,704 B), same output (A/B: compiler rebuilt with the change stashed).
+  Runtime flat: p1 99.25 → 99.29 ms, h_mem 2.85 → 2.83 ms (15 reps, min).
+- **Gate:** 65 suites / 25,368 passed / 0 failed; `regressions.sh` exit 0
+  (including the new `t_sf_huge_index` check); `allaxes` 45/45 `ok`.
+- **Honest reading of the matrix** (L/U/M per cell, CREPS=3 RREPS=9):
+  - compile wall: M beats **LLVM** on 12/15 rows, but is slower than **upstream
+    cg_clif** on 15/15;
+  - compile peak RSS: M is never the lowest of the three and is higher than LLVM
+    on 13/15 rows;
+  - artifact size: M smallest on 15/15;
+  - runtime: M fastest on 3/15 (p5_inline, p6_scalar ~9.6x, p7_branchy).
+  So Rakit's wins today are size, LLVM-relative compile time, and those three
+  runtimes; beating upstream on compile time/RSS and LLVM on p1–p4/h_mem is
+  still open.
 
 | prog | Cwall | Ccpu | Crss | size | Rwall | Rcpu | Rrss |
 |---|---|---|---|---|---|---|---|
-| h_arith | 116ms/88ms/97ms | 140ms/114ms/125ms | 116.5M/118.1M/119.4M | 4,617,128/5,839,120/4,088,752 | 2ms/3ms/2ms | 2ms/2ms/2ms | 10.8M/10.8M/11.0M |
-| h_branch | 115ms/96ms/101ms | 140ms/122ms/131ms | 116.9M/118.3M/119.4M | 4,616,832/5,837,264/4,087,072 | 2ms/2ms/2ms | 2ms/2ms/2ms | 11.0M/11.1M/10.8M |
-| h_calls | 114ms/90ms/102ms | 138ms/123ms/132ms | 117.1M/118.4M/119.9M | 4,616,872/5,837,792/4,087,448 | 2ms/2ms/2ms | 2ms/2ms/2ms | 11.1M/10.8M/10.8M |
-| h_float | 123ms/91ms/97ms | 147ms/121ms/125ms | 115.7M/117.7M/118.7M | 4,637,984/5,861,024/4,127,640 | 2ms/3ms/2ms | 2ms/2ms/2ms | 10.8M/10.8M/10.8M |
-| h_mem | 264ms/134ms/165ms | 429ms/186ms/237ms | 136.1M/133.6M/135.9M | 4,646,856/5,959,856/4,176,752 | 3ms/9ms/4ms | 3ms/9ms/4ms | 10.8M/11.1M/11.0M |
-| h_simd | 141ms/95ms/108ms | 165ms/122ms/135ms | 122.5M/123.5M/125.0M | 4,617,704/5,843,736/4,091,160 | 2ms/4ms/2ms | 2ms/3ms/2ms | 10.8M/11.0M/10.8M |
-| p1_arith | 84ms/79ms/80ms | 103ms/101ms/104ms | 104.7M/107.0M/108.2M | 4,635,232/5,877,944/4,156,400 | 81ms/108ms/102ms | 81ms/108ms/101ms | 11.1M/11.0M/10.7M |
-| p2_mem | 246ms/130ms/167ms | 373ms/175ms/236ms | 132.6M/130.1M/132.2M | 4,639,896/5,936,144/4,154,272 | 17ms/156ms/42ms | 18ms/155ms/43ms | 10.8M/11.1M/11.0M |
-| p3_calls | 100ms/88ms/93ms | 125ms/115ms/121ms | 114.6M/115.5M/117.1M | 4,612,368/5,820,136/4,077,128 | 37ms/117ms/58ms | 37ms/117ms/58ms | 11.1M/11.0M/10.8M |
-| p4_simd | 108ms/95ms/103ms | 127ms/119ms/128ms | 115.4M/116.0M/117.5M | 4,636,096/5,892,376/4,163,024 | 56ms/158ms/84ms | 56ms/157ms/83ms | 48.2M/49.4M/48.8M |
-| p5_inline | 83ms/77ms/80ms | 104ms/102ms/106ms | 103.8M/105.6M/107.1M | 4,609,368/5,813,704/4,070,040 | 58ms/895ms/6ms | 58ms/894ms/6ms | 11.0M/11.0M/11.0M |
-| p6_scalar | 81ms/76ms/81ms | 99ms/99ms/102ms | 100.2M/102.1M/103.2M | 4,609,368/5,813,688/4,070,040 | 58ms/901ms/6ms | 57ms/900ms/6ms | 10.8M/10.8M/11.1M |
-| p7_branchy | 83ms/77ms/81ms | 104ms/98ms/103ms | 104.0M/105.6M/107.1M | 4,609,520/5,813,800/4,070,216 | 43ms/101ms/35ms | 42ms/100ms/35ms | 10.7M/11.1M/10.9M |
-| p8_minmax | 83ms/79ms/83ms | 103ms/101ms/106ms | 104.1M/105.6M/107.1M | 4,609,544/5,813,752/4,070,200 | 18ms/39ms/20ms | 18ms/39ms/20ms | 11.0M/10.7M/11.0M |
-| p9_u64f32 | 95ms/87ms/96ms | 115ms/111ms/121ms | 110.0M/111.9M/113.2M | 4,635,448/5,886,872/4,160,032 | 31ms/77ms/34ms | 31ms/76ms/34ms | 17.8M/18.8M/18.2M |
+| h_arith | 116ms/91ms/98ms | 140ms/117ms/126ms | 116.5M/118.0M/119.4M | 4,617,128/5,839,120/4,088,736 | 3ms/2ms/2ms | 2ms/2ms/2ms | 10.6M/10.8M/10.5M |
+| h_branch | 116ms/88ms/98ms | 141ms/116ms/128ms | 116.7M/118.4M/119.5M | 4,616,832/5,837,264/4,087,056 | 2ms/2ms/2ms | 2ms/2ms/2ms | 10.6M/10.8M/10.8M |
+| h_calls | 117ms/93ms/100ms | 140ms/123ms/131ms | 117.3M/118.6M/119.7M | 4,616,872/5,837,792/4,087,432 | 2ms/2ms/2ms | 2ms/2ms/2ms | 10.8M/10.8M/10.8M |
+| h_float | 126ms/89ms/103ms | 149ms/116ms/128ms | 115.9M/117.6M/118.8M | 4,637,984/5,861,024/4,127,624 | 2ms/3ms/2ms | 2ms/2ms/2ms | 10.8M/10.8M/10.8M |
+| h_mem | 266ms/132ms/166ms | 428ms/181ms/237ms | 136.8M/133.5M/135.7M | 4,646,856/5,959,856/4,176,736 | 3ms/9ms/4ms | 3ms/9ms/4ms | 10.8M/10.8M/10.8M |
+| h_simd | 142ms/98ms/109ms | 165ms/127ms/138ms | 122.6M/123.7M/125.1M | 4,617,704/5,843,736/4,091,160 | 2ms/4ms/2ms | 2ms/3ms/2ms | 10.8M/10.9M/10.9M |
+| p1_arith | 84ms/77ms/83ms | 103ms/100ms/105ms | 104.8M/107.0M/108.3M | 4,635,232/5,877,944/4,156,384 | 81ms/108ms/102ms | 81ms/108ms/100ms | 10.9M/10.6M/10.8M |
+| p2_mem | 242ms/126ms/156ms | 373ms/169ms/215ms | 132.1M/129.8M/131.9M | 4,639,896/5,936,144/4,154,256 | 16ms/155ms/42ms | 16ms/155ms/41ms | 10.6M/10.9M/10.9M |
+| p3_calls | 97ms/85ms/93ms | 119ms/110ms/121ms | 114.6M/115.4M/117.1M | 4,612,368/5,820,136/4,077,128 | 37ms/117ms/58ms | 36ms/116ms/58ms | 10.6M/10.6M/10.8M |
+| p4_simd | 106ms/93ms/102ms | 126ms/117ms/127ms | 115.2M/115.9M/117.7M | 4,636,096/5,892,376/4,163,008 | 57ms/157ms/83ms | 56ms/157ms/85ms | 48.2M/49.4M/48.8M |
+| p5_inline | 80ms/76ms/81ms | 101ms/100ms/105ms | 103.8M/105.8M/107.0M | 4,609,368/5,813,704/4,070,040 | 58ms/894ms/6ms | 57ms/894ms/6ms | 10.8M/10.5M/10.6M |
+| p6_scalar | 80ms/77ms/80ms | 99ms/96ms/102ms | 100.2M/102.1M/103.0M | 4,609,368/5,813,688/4,070,040 | 58ms/903ms/6ms | 57ms/902ms/6ms | 10.6M/10.8M/10.6M |
+| p7_branchy | 83ms/77ms/82ms | 102ms/99ms/105ms | 104.0M/105.7M/107.2M | 4,609,520/5,813,800/4,070,200 | 43ms/100ms/35ms | 42ms/99ms/35ms | 10.8M/10.8M/10.7M |
+| p8_minmax | 84ms/78ms/81ms | 101ms/101ms/105ms | 104.2M/105.8M/106.9M | 4,609,544/5,813,752/4,070,184 | 18ms/38ms/20ms | 18ms/38ms/20ms | 10.6M/10.6M/10.5M |
+| p9_u64f32 | 93ms/86ms/95ms | 111ms/110ms/115ms | 109.9M/111.8M/113.1M | 4,635,448/5,886,872/4,160,016 | 30ms/77ms/33ms | 29ms/76ms/32ms | 17.8M/18.8M/18.2M |
 
 ## Session (2026-11-25, branch `rakit-exp13`) — review round 17: skip messages are not a summary
 

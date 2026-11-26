@@ -335,18 +335,35 @@ fn slot_of_resolved(dfg: &ir::DataFlowGraph, arg: Value) -> Option<StackSlot> {
 
 /// If `addr` is a `stack_addr` of a known slot, or a tracked pointer base,
 /// return the base and the byte offset at which `inst` accesses it.
-fn mem_key(func: &ir::Function, inst: Inst, addr: Value) -> Option<Key> {
+fn mem_key(
+    func: &ir::Function,
+    inst: Inst,
+    addr: Value,
+    private: &FxHashSet<StackSlot>,
+) -> Option<Key> {
     let off = offset_of(func, inst)?;
-    if let Some((slot, base_off)) = const_addr(func, addr, 8) {
-        // Only an access that stays inside its own slot may be keyed relative to
-        // it: past the end the neighbouring bytes belong to something else.
-        let size = i64::from(access_size(func, inst)?);
-        let fits = func
-            .sized_stack_slots
-            .get(slot)
-            .is_some_and(|data| base_off >= 0 && base_off + off + size <= i64::from(data.size));
-        if fits {
-            return Some((Base::Slot(slot), base_off + off));
+    // A slot key is only usable when the slot is private: `tracked` rejects a
+    // slot it does not know, so folding an address to a slot the pass cannot
+    // track would lose the forwarding the pointer key still allows.
+    if let Some((slot, base_off)) = const_addr(func, addr, 8).filter(|&(s, _)| private.contains(&s)) {
+        // The effective range has to be representable and lie inside the slot.
+        // Unchecked arithmetic here wraps: a folded displacement of `i64::MAX`
+        // puts the end below zero, which passes the upper-bound test and keys the
+        // access against bytes it never touches. A negative displacement must not
+        // place the start before the slot either.
+        let size = access_size(func, inst).map(i64::from);
+        let start = base_off.checked_add(off).filter(|&start| start >= 0).zip(size).and_then(
+            |(start, size)| {
+                let end = start.checked_add(size)?;
+                let fits = func
+                    .sized_stack_slots
+                    .get(slot)
+                    .is_some_and(|data| end <= i64::from(data.size));
+                fits.then_some(start)
+            },
+        );
+        if let Some(start) = start {
+            return Some((Base::Slot(slot), start));
         }
     }
     Some((Base::Ptr(func.dfg.resolve_aliases(addr)), off))
@@ -537,7 +554,7 @@ fn analyze(func: &ir::Function) -> Option<Bases> {
     // store it cannot see would make a forwarded fact stale. Such a slot is not
     // private.
     for (inst, addr) in stores.iter().chain(loads.iter()) {
-        let tracked_access = mem_key(func, *inst, *addr)
+        let tracked_access = mem_key(func, *inst, *addr, &slots)
             .map(|key| tracked(&key, &slots, &addr_only))
             .unwrap_or(false);
         if !tracked_access
@@ -553,7 +570,7 @@ fn analyze(func: &ir::Function) -> Option<Bases> {
 
     let mut loaded: FxHashSet<Key> = FxHashSet::default();
     for (inst, addr) in loads {
-        if let Some(key) = mem_key(func, inst, addr) {
+        if let Some(key) = mem_key(func, inst, addr, &slots) {
             if tracked(&key, &slots, &addr_only) {
                 loaded.insert(key);
             }
@@ -664,7 +681,7 @@ fn record_store(
     prov: &FxHashMap<Base, StackSlot>,
 ) -> Option<Key> {
     let ty = func.dfg.value_type(value);
-    let Some((base, off)) = mem_key(func, inst, addr).filter(|k| tracked(k, private, ptr_bases))
+    let Some((base, off)) = mem_key(func, inst, addr, private).filter(|k| tracked(k, private, ptr_bases))
     else {
         // Store through an address the pass does not track: it may alias any
         // tracked pointer base, so every pointer fact is invalidated. A private
@@ -812,7 +829,7 @@ fn forward_block(
             }
             let addr = func.dfg.insts[inst].arguments(&func.dfg.value_lists).first().copied();
             let Some(addr) = addr else { continue };
-            let Some(key) = mem_key(func, inst, addr) else { continue };
+            let Some(key) = mem_key(func, inst, addr, private) else { continue };
             if !tracked(&key, private, ptr_bases) {
                 continue;
             }
@@ -1126,7 +1143,7 @@ fn drop_dead_stores(
             }
             let args = func.dfg.insts[inst].arguments(&func.dfg.value_lists);
             let Some(addr) = args.get(1).copied() else { continue };
-            let Some(key) = mem_key(func, inst, addr) else { continue };
+            let Some(key) = mem_key(func, inst, addr, private) else { continue };
             let Some(&slot) = prov.get(&key.0) else { continue };
             if !private.contains(&slot) {
                 continue;
