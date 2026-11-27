@@ -1,3 +1,80 @@
+## Session (2026-11-24, branch `rakit-exp16`) — LICM hoists loads (soundly)
+
+- **Symptom:** in `p4_simd::main` LICM moved only `iconst`s. `RAKIT_LICM_DEBUG=1`
+  showed every candidate load either `readonly=false` (rakit emits `load.i64
+  notrap` with no `readonly`/`can_move`) or rejected as "not available".
+- **Four causes, all in `vendor/rakit-codegen/src/licm.rs`:**
+  1. `ensure_preheader` only split the idom edge and returned `None` when the
+     header had a second *outside* predecessor. Now it inserts one block and
+     redirects every outside entry through it, forwarding each edge's args into
+     new block params. **Validate every edge first, mutate after**: rewriting as
+     you go leaves a dangling branch (pointing outside the layout) when a later
+     entry is a jump table (`build_jump_table` emits brif *and* table edges to
+     the same default block).
+  2. `do_licm` created the preheader and then asked the **stale** dominator tree
+     `block_dominates(operand_block, preheader)`; the new block is unknown to
+     that tree, so every answer was false. Rebuild cfg/domtree/loops after
+     creating one, and **restart the round** — a later header looked up in the
+     old CFG panics in `succ_iter` (block index outside its range).
+  3. `stack_addr` must be hoistable (it only "has side effects" because it reads
+     the frame layout). Loads can only leave the loop once their address is
+     available in the preheader, and rakit loads always go through `stack_addr`.
+  4. A load from a **private** stack slot can be hoisted past opaque stores, but
+     "private" must be a *function-wide* fact with real address tracking:
+     - track which values may point into which slots, through arithmetic and
+       block params (rakit threads stack addresses through phis constantly), and
+       mark a slot escaped only where the address reaches a call / a stored
+       value / a return / a trapping op. A branch argument is not an escape by
+       itself (treating it as one kills the rule on real code);
+     - and the converse: a store inside the loop may hit the slot through a
+       derived address (`addr+8`) or a phi, so look stores up in the *same*
+       address map, not just by their literal `addr_base`.
+- **The one that bit:** the first version scanned escape uses only in the loop's
+  blocks and matched stores only by `addr_base`. It hoisted a load above a store
+  to the same slot and miscompiled `LineWriterShim` in std (`panicked: mid >
+  len`). **`bench/regressions.sh` is the gate for this** — and it only shows up
+  after `rm -rf build/stdlib_target`, because std itself is compiled by the
+  pass under test. Rebuilding just the `.so` + test target keeps the old std.
+- **Same trap, second form:** the earlier "pre-existing" `num::bignum::
+  test_bit_length` failure was **mine**, not pre-existing. I "proved" it was
+  pre-existing with a clean compiler but a `build/stdlib_target` built by the
+  unsound pass. After rebuilding std from the fixed source: **65 suites, 25,368
+  tests, 0 failures**.
+- **`atomic_load` also has `can_load()`** — it must never be hoisted (it is
+  sequentially consistent). Restrict the load branch to `op == Opcode::Load`.
+- **`try_call`/`try_call_indirect` are calls *and* branches** (`.call().branches()`
+  in `rakit-codegen-meta/src/shared/instructions.rs`). The SSA builder appends
+  live variables to their successor arguments, so a stack address can reach a
+  block parameter without ever appearing in the call's argument list. The escape
+  branch must not `continue` before successor propagation, or a store through
+  that parameter looks harmless and a load hoists above it. Regression:
+  `licm_keeps_a_load_when_an_unwinding_call_forwards_the_address`.
+- **Fixtures must pass the real verifier.** Each one calls
+  `verifier::verify_function(func, &settings::Flags::new(settings::builder()))`
+  plus `ssa_dominates` before `do_licm`. Three fixtures were silently invalid
+  and the layout assertions still "passed": a `return v` in a function whose
+  signature declares no returns, a `br_table` index typed `i64` (must be `i32`),
+  and a `try_call` whose callee used `CallConv::Fast` (only `Tail`/`SystemV`/
+  `Winch`/`PreserveAll`/`AppleAarch64` support exceptions). `ssa_dominates`
+  alone also misses unreachable blocks — a fixture whose second path had no
+  predecessor proved nothing.
+- **A `try_call` fixture needs both successors.** Normal-return args are
+  `BlockArg::Value` (live vars); a catch handler's are the exception payload
+  first (`BlockArg::TryCallExn(0..n)`, two `i64` for SystemV) and *then* the
+  live vars, so its block carries payload params before the address parameter.
+  Covering only the normal destination passes even when cleanup-handler
+  forwarding is dropped.
+- **Measured (allaxes, CREPS=3 RREPS=7):** neutral-to-slightly-positive — p2
+  42→40 ms, p3 57→55, p4 86→85, p9 35→34, others flat; compile 84→83 / 165→167 /
+  95→90 ms. Size 4.07–4.17 MB (L 4.61–4.64, U 5.81–5.94). `p2_mem`/`h_mem` hoist
+  ~24 loads each; `p4_simd` hoists none because its `Vec` headers reach
+  `push(&mut c)`.
+- **Where the remaining p1–p4/p8/p9 gap is:** not LICM. `p4_simd::main` is bound
+  by the loop-carried accumulator's 16-byte `movdqu` round-trip
+  (`0x3b0(%rsp)` store + reload per iteration) plus 3 bounds-check branches that
+  also stop the vectorizer from widening the body.
+- **PR #27** (`rakit-exp16` → `replace-main-with-cgclif-experiments`).
+
 ## Session (2026-11-26, branch `rakit-exp15`) — review round: frameless CFI, sampler hardening
 
 A review of the frame-pointer work found a real regression: **frameless
